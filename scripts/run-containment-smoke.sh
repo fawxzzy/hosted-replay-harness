@@ -193,8 +193,8 @@ record failure.detail str preterminal-state
 
 python3 -B -m unittest discover -s "$ROOT/tests" -v >"$RAW/unit-tests.log" 2>&1 || block CONTRACT_TEST_FAILED
 
-os_id="$(awk -F= '$1=="ID"{gsub(/\"/,"",$2); print $2}' /etc/os-release)"
-os_version="$(awk -F= '$1=="VERSION_ID"{gsub(/\"/,"",$2); print $2}' /etc/os-release)"
+os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2}' /etc/os-release)"
+os_version="$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); print $2}' /etc/os-release)"
 arch="$(uname -m)"
 kernel="$(uname -r)"
 record runner.image_capture str github-actions-set-up-job-log
@@ -288,6 +288,8 @@ record network.internal bool true
 record network.ipv6 bool false
 record network.host_binding_ipv4 str 127.0.0.1
 record network.gateway_mode_ipv4 str isolated
+ipam_gateway="$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' "$NETWORK_ID")"
+record network.ipam_gateway str "${ipam_gateway:-none}"
 
 [[ "$(docker network inspect --format '{{.Id}}' "$NETWORK_ID")" == "$NETWORK_ID" ]] || block NETWORK_ID_MISMATCH
 [[ "$(docker network inspect --format '{{.Driver}}' "$NETWORK_ID")" == "bridge" ]] || block NETWORK_DRIVER_MISMATCH
@@ -321,14 +323,26 @@ docker run --rm --pull=never \
     ! timeout 5 getent ahostsv4 example.com >/dev/null 2>&1 || exit 13
     ! timeout 3 bash -c "</dev/tcp/1.1.1.1/443" >/dev/null 2>&1 || exit 14
     ! timeout 3 bash -c "</dev/tcp/169.254.169.254/80" >/dev/null 2>&1 || exit 15
-    ! ping -c 1 -W 1 "$1" >/dev/null 2>&1 || exit 16
+    if test -n "$1"; then
+      ! ping -c 1 -W 1 "$1" >/dev/null 2>&1 || exit 16
+    fi
     for address in $2; do
       ! ping -c 1 -W 1 "$address" >/dev/null 2>&1 || exit 17
     done
-  ' -- "$SUBNET_GATEWAY" "$host_ips" >"$RAW/prestart-canary.log" 2>&1
+  ' -- "$ipam_gateway" "$host_ips" >"$RAW/prestart-canary.log" 2>&1
 canary_rc="$?"
 set -e
-[[ "$canary_rc" == "0" ]] || block PRESTART_EGRESS_CANARY_FAILED "canary-exit-${canary_rc}"
+case "$canary_rc" in
+  0) ;;
+  11) block DEFAULT_ROUTE_PRESENT ;;
+  12) block IPV6_DEFAULT_ROUTE_PRESENT ;;
+  13) block EXTERNAL_DNS_SUCCEEDED ;;
+  14) block LITERAL_IP_EGRESS_SUCCEEDED ;;
+  15) block METADATA_EGRESS_SUCCEEDED ;;
+  16) block PACKET_GATEWAY_REACHABLE ;;
+  17) block HOST_ADDRESS_REACHABLE ;;
+  *) block PRESTART_EGRESS_CANARY_FAILED "canary-exit-${canary_rc}" ;;
+esac
 record canaries.prestart.no_default_route bool true
 record canaries.prestart.external_dns_failed bool true
 record canaries.prestart.literal_ip_failed bool true

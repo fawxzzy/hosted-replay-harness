@@ -22,7 +22,7 @@ No application repository, application migration, source data, Auth row, provide
 
 ## Fail-closed result
 
-Every failure maps to a stable uppercase code. Raw command output remains transient and is never uploaded. A failed gate does not cause a broader network, another runner label, an unpinned image, a remote Supabase path, or an application replay.
+Every failure maps to a stable uppercase code. A reachable daemon-reported packet gateway is `PACKET_GATEWAY_REACHABLE`. Raw command output remains transient and is never uploaded. A failed gate does not cause a broader network, another runner label, an unpinned image, a remote Supabase path, or an application replay.
 
 ## Known compatibility probe
 

@@ -117,6 +117,8 @@ class RunnerStaticContractTests(unittest.TestCase):
             '--network-id "$NETWORK_ID"',
         ):
             self.assertIn(fragment, self.runner)
+        self.assertIn("record network.ipam_gateway", self.runner)
+        self.assertIn("16) block PACKET_GATEWAY_REACHABLE", self.runner)
 
     def test_prohibited_operations_are_absent(self) -> None:
         prohibited = (
