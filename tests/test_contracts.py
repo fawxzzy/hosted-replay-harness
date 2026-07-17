@@ -134,6 +134,10 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner,
         )
         self.assertIn('block SUPABASE_DB_START_TIMEOUT', self.runner)
+        self.assertLess(
+            self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
+            self.runner.index('project_network_count="$(docker network ls'),
+        )
 
     def test_prohibited_operations_are_absent(self) -> None:
         prohibited = (

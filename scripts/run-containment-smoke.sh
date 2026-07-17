@@ -71,6 +71,11 @@ version_at_least() {
 stop_watcher() {
   if [[ -n "$WATCH_PID" ]] && kill -0 "$WATCH_PID" 2>/dev/null; then
     kill "$WATCH_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "$WATCH_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$WATCH_PID" 2>/dev/null || true
     wait "$WATCH_PID" 2>/dev/null || true
   fi
   WATCH_PID=""
@@ -418,6 +423,7 @@ cli_rc="$?"
 set -e
 sleep 1
 stop_watcher
+[[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 
 project_network_count="$(docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" | awk 'NF' | wc -l)"
 record network.correlated_count_after_cli int "$project_network_count"
@@ -428,7 +434,6 @@ if [[ -s "$VIOLATION_FILE" ]]; then
   first_violation="$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["violations"][0])' "$VIOLATION_FILE" 2>/dev/null || printf UNKNOWN)"
   block CONTAINER_AUDIT_REJECTED "$first_violation"
 fi
-[[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 [[ "$cli_rc" == "0" ]] || block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 
 database_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
