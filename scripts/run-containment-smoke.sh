@@ -4,18 +4,27 @@ umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MODE="${1:-run}"
+RESULT_PROFILE="${RESULT_PROFILE:-}"
 [[ "$#" -le 1 ]] || exit 2
 case "$MODE" in
-  run|cleanup-only) ;;
+  run|direct-port|cleanup-only) ;;
   *) exit 2 ;;
 esac
-PACKET="FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001"
+case "$RESULT_PROFILE" in
+  ""|direct-docker-port-v1) ;;
+  *) exit 2 ;;
+esac
+CONTAINMENT_PACKET="FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001"
+DIRECT_PACKET="FP-HOSTED-REPLAY-DIRECT-PORT-DIAG-001"
+PACKET="$CONTAINMENT_PACKET"
+[[ "$MODE" != "direct-port" ]] || PACKET="$DIRECT_PACKET"
 PROJECT="fp-hosted-replay-ro-001"
 NETWORK_NAME="fp-hosted-replay-ro-001-net"
 SUBNET="172.31.253.0/24"
 SUBNET_GATEWAY="172.31.253.1"
 DB_NAME="supabase_db_${PROJECT}"
 DB_VOLUME="$DB_NAME"
+DIRECT_DB_NAME="${PROJECT}-direct-postgres"
 DB_PORT="56422"
 RUNTIME="$ROOT/.smoke-runtime"
 RUNTIME_HOME="$RUNTIME/home"
@@ -87,7 +96,8 @@ cleanup_exact() {
 
   mapfile -t container_ids < <(
     {
-      docker ps -aq --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null || true
+      docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
+      docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
       docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -95,14 +105,15 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker inspect --format '{{index .Config.Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker inspect --format '{{index .Config.Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
     fi
   done
 
   mapfile -t volume_names < <(
     {
-      docker volume ls -q --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null || true
+      docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
+      docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
       docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -110,14 +121,15 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker volume inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker volume inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
     fi
   done
 
   mapfile -t network_ids < <(
     {
-      docker network ls -q --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null || true
+      docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
+      docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
       docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -125,18 +137,18 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
     fi
   done
 
-  count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.containers_remaining int "$count"
   container_count="$count"
-  count="$({ docker volume ls -q --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null; docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.volumes_remaining int "$count"
   volume_count="$count"
-  count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.networks_remaining int "$count"
   listener_count="$(ss -H -ltn "sport = :${DB_PORT}" 2>/dev/null | awk 'NF' | wc -l)"
   record cleanup.listeners_remaining int "$listener_count"
@@ -160,8 +172,13 @@ finalize() {
     record failure.code str CLEANUP_RESIDUE
     record failure.detail str exact-packet-resource-remains
   elif [[ "$SMOKE_PASSED" == "1" && "$original_rc" == "0" ]]; then
-    record status str CONTAINMENT_SMOKE_PASS
-    final_status=CONTAINMENT_SMOKE_PASS
+    if [[ "$MODE" == "direct-port" ]]; then
+      record status str DIRECT_DOCKER_PORT_PATH_PASS
+      final_status=DIRECT_DOCKER_PORT_PATH_PASS
+    else
+      record status str CONTAINMENT_SMOKE_PASS
+      final_status=CONTAINMENT_SMOKE_PASS
+    fi
     final_rc=0
   else
     if ! grep -q $'^status\tstr\tBLOCKED$' "$STATE_FILE" 2>/dev/null; then
@@ -175,11 +192,11 @@ finalize() {
     --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_FILE" \
     >"$RAW/result-writer.log" 2>&1
 
-  if [[ "$final_status" != "CONTAINMENT_SMOKE_PASS" ]]; then
+  if [[ "$final_status" == "BLOCKED" ]]; then
     failure_code="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("failure") or {}).get("code","UNKNOWN"))' "$RESULT_FILE" 2>/dev/null || printf UNKNOWN)"
     printf 'BLOCKED: %s\n' "$failure_code"
   else
-    printf 'CONTAINMENT_SMOKE_PASS\n'
+    printf '%s\n' "$final_status"
   fi
 
   rm -f -- "$STATE_FILE"
@@ -203,6 +220,9 @@ cleanup_only() {
     record failure.detail str exact-packet-resource-remains
     cleanup_rc=1
   elif [[ ! -f "$RESULT_FILE" ]]; then
+    if [[ "$RESULT_PROFILE" == "direct-docker-port-v1" ]]; then
+      record result.profile str direct-docker-port-v1
+    fi
     record status str BLOCKED
     record failure.code str HARNESS_INTERRUPTED
     record failure.detail str cleanup-step-recovered-interrupted-run
@@ -221,6 +241,69 @@ cleanup_only() {
   exit 0
 }
 
+run_direct_port_probe() {
+  local db_password db_id create_rc correlated_count probe_rc failure_code
+  local probe_state="$RUNTIME/direct-port-probe.tsv"
+
+  record diagnostic.timing.started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  db_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" || block DIRECT_CREDENTIAL_GENERATION_FAILED
+  [[ -n "$db_password" ]] || block DIRECT_CREDENTIAL_GENERATION_FAILED
+  printf '::add-mask::%s\n' "$db_password"
+  export POSTGRES_PASSWORD="$db_password"
+
+  set +e
+  db_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
+    --pull=never \
+    --platform linux/amd64 \
+    --name "$DIRECT_DB_NAME" \
+    --label "io.fawxzzy.packet=${DIRECT_PACKET}" \
+    --label "io.fawxzzy.role=direct-postgres" \
+    --label "com.supabase.cli.project=${PROJECT}" \
+    --label "com.docker.compose.project=${PROJECT}" \
+    --network "$NETWORK_ID" \
+    --publish "${DB_PORT}:5432" \
+    --tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=1g" \
+    --restart=no \
+    --health-cmd='pg_isready -U postgres -h 127.0.0.1' \
+    --health-interval=1s \
+    --health-timeout=2s \
+    --health-start-period=30s \
+    --health-retries=30 \
+    --env POSTGRES_PASSWORD \
+    "$POSTGRES_PULL" 2>"$RAW/direct-container-create.log")"
+  create_rc="$?"
+  set -e
+  unset POSTGRES_PASSWORD db_password
+  [[ "$create_rc" != "124" ]] || block DIRECT_CONTAINER_CREATE_TIMEOUT
+  [[ "$create_rc" == "0" && -n "$db_id" ]] || block DIRECT_CONTAINER_CREATE_FAILED "docker-exit-${create_rc}"
+
+  correlated_count="$(docker ps -q \
+    --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" \
+    --filter "label=io.fawxzzy.role=direct-postgres" | awk 'NF' | wc -l)"
+  [[ "$correlated_count" == "1" ]] || block DIRECT_CONTAINER_COUNT_MISMATCH
+
+  set +e
+  python3 -B "$ROOT/scripts/direct_port_probe.py" \
+    --container-id "$db_id" \
+    --network-id "$NETWORK_ID" \
+    --image-id "$POSTGRES_IMAGE_ID" \
+    --image-reference "$POSTGRES_PULL" \
+    --health-timeout-seconds 120 \
+    --stable-seconds 10 >"$probe_state" 2>"$RAW/direct-port-probe.log"
+  probe_rc="$?"
+  set -e
+  [[ -f "$probe_state" ]] || block DIRECT_PROBE_RESULT_MISSING
+  cat "$probe_state" >>"$STATE_FILE"
+  if [[ "$probe_rc" != "0" ]]; then
+    failure_code="$(awk -F '\t' '$1=="diagnostic.probe.failure_code"{print $3; exit}' "$probe_state")"
+    [[ "$failure_code" =~ ^[A-Z0-9_]+$ ]] || failure_code=DIRECT_PROBE_FAILED
+    block "$failure_code"
+  fi
+
+  record diagnostic.timing.completed_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  SMOKE_PASSED=1
+}
+
 if [[ "$MODE" == "cleanup-only" ]]; then
   cleanup_only
 fi
@@ -235,6 +318,9 @@ record started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 record status str BLOCKED
 record failure.code str HARNESS_INTERRUPTED
 record failure.detail str preterminal-state
+if [[ "$MODE" == "direct-port" ]]; then
+  record result.profile str direct-docker-port-v1
+fi
 
 python3 -B -m unittest discover -s "$ROOT/tests" -v >"$RAW/unit-tests.log" 2>&1 || block CONTRACT_TEST_FAILED
 
@@ -268,40 +354,46 @@ record runner.free_disk_bytes int "$disk_bytes"
 (( ram_bytes >= 8589934592 )) || block RUNNER_RAM_BELOW_8_GIB
 (( disk_bytes >= 10737418240 )) || block RUNNER_DISK_BELOW_10_GIB
 
-curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
-  --output "$RUNTIME/$CLI_ASSET" "$CLI_URL" >"$RAW/cli-download.log" 2>&1 || block CLI_DOWNLOAD_FAILED
-actual_cli_sha="$(sha256sum "$RUNTIME/$CLI_ASSET" | awk '{print $1}')"
-record supabase_cli.version str "$CLI_VERSION"
-record supabase_cli.source_commit str "$CLI_COMMIT"
-record supabase_cli.asset_sha256 str "$actual_cli_sha"
-[[ "$actual_cli_sha" == "$CLI_SHA" ]] || block CLI_ASSET_DIGEST_MISMATCH
-mkdir -p "$RUNTIME/bin"
-tar -xzf "$RUNTIME/$CLI_ASSET" -C "$RUNTIME/bin" supabase >"$RAW/cli-extract.log" 2>&1 || block CLI_EXTRACTION_FAILED
-chmod 0555 "$RUNTIME/bin/supabase"
-reported_cli_version="$($RUNTIME/bin/supabase --version 2>"$RAW/cli-version.log")" || block CLI_VERSION_FAILED
-[[ "$reported_cli_version" == "$CLI_VERSION" ]] || block CLI_VERSION_MISMATCH
+if [[ "$MODE" == "run" ]]; then
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+    --output "$RUNTIME/$CLI_ASSET" "$CLI_URL" >"$RAW/cli-download.log" 2>&1 || block CLI_DOWNLOAD_FAILED
+  actual_cli_sha="$(sha256sum "$RUNTIME/$CLI_ASSET" | awk '{print $1}')"
+  record supabase_cli.version str "$CLI_VERSION"
+  record supabase_cli.source_commit str "$CLI_COMMIT"
+  record supabase_cli.asset_sha256 str "$actual_cli_sha"
+  [[ "$actual_cli_sha" == "$CLI_SHA" ]] || block CLI_ASSET_DIGEST_MISMATCH
+  mkdir -p "$RUNTIME/bin"
+  tar -xzf "$RUNTIME/$CLI_ASSET" -C "$RUNTIME/bin" supabase >"$RAW/cli-extract.log" 2>&1 || block CLI_EXTRACTION_FAILED
+  chmod 0555 "$RUNTIME/bin/supabase"
+  reported_cli_version="$($RUNTIME/bin/supabase --version 2>"$RAW/cli-version.log")" || block CLI_VERSION_FAILED
+  [[ "$reported_cli_version" == "$CLI_VERSION" ]] || block CLI_VERSION_MISMATCH
+fi
 
 docker pull --platform linux/amd64 "$POSTGRES_PULL" >"$RAW/postgres-pull.log" 2>&1 || block POSTGRES_PULL_FAILED
-docker pull --platform linux/amd64 "$GOTRUE_PULL" >"$RAW/gotrue-pull.log" 2>&1 || block GOTRUE_PULL_FAILED
-
 postgres_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$POSTGRES_PULL")" || block POSTGRES_INSPECT_FAILED
-gotrue_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$GOTRUE_PULL")" || block GOTRUE_INSPECT_FAILED
-[[ "$postgres_platform" == "linux/amd64" && "$gotrue_platform" == "linux/amd64" ]] || block IMAGE_PLATFORM_MISMATCH
+[[ "$postgres_platform" == "linux/amd64" ]] || block IMAGE_PLATFORM_MISMATCH
 docker image inspect --format '{{json .RepoDigests}}' "$POSTGRES_PULL" | grep -Fq "${POSTGRES_TAG%:*}@${POSTGRES_DIGEST}" || block POSTGRES_REPODIGEST_MISMATCH
-docker image inspect --format '{{json .RepoDigests}}' "$GOTRUE_PULL" | grep -Fq "${GOTRUE_TAG%:*}@${GOTRUE_DIGEST}" || block GOTRUE_REPODIGEST_MISMATCH
 POSTGRES_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$POSTGRES_PULL")"
-GOTRUE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$GOTRUE_PULL")"
-docker tag "$POSTGRES_PULL" "$POSTGRES_EXPECTED" || block POSTGRES_RETAG_FAILED
-docker tag "$GOTRUE_PULL" "$GOTRUE_EXPECTED" || block GOTRUE_RETAG_FAILED
-[[ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_EXPECTED")" == "$POSTGRES_IMAGE_ID" ]] || block POSTGRES_RETAG_ID_MISMATCH
-[[ "$(docker image inspect --format '{{.Id}}' "$GOTRUE_EXPECTED")" == "$GOTRUE_IMAGE_ID" ]] || block GOTRUE_RETAG_ID_MISMATCH
 record images.postgres.digest str "$POSTGRES_DIGEST"
 record images.postgres.image_id str "$POSTGRES_IMAGE_ID"
 record images.postgres.platform str "$postgres_platform"
-record images.gotrue.digest str "$GOTRUE_DIGEST"
-record images.gotrue.image_id str "$GOTRUE_IMAGE_ID"
-record images.gotrue.platform str "$gotrue_platform"
-record images.pull_count int 2
+if [[ "$MODE" == "run" ]]; then
+  docker pull --platform linux/amd64 "$GOTRUE_PULL" >"$RAW/gotrue-pull.log" 2>&1 || block GOTRUE_PULL_FAILED
+  gotrue_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$GOTRUE_PULL")" || block GOTRUE_INSPECT_FAILED
+  [[ "$gotrue_platform" == "linux/amd64" ]] || block IMAGE_PLATFORM_MISMATCH
+  docker image inspect --format '{{json .RepoDigests}}' "$GOTRUE_PULL" | grep -Fq "${GOTRUE_TAG%:*}@${GOTRUE_DIGEST}" || block GOTRUE_REPODIGEST_MISMATCH
+  GOTRUE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$GOTRUE_PULL")"
+  docker tag "$POSTGRES_PULL" "$POSTGRES_EXPECTED" || block POSTGRES_RETAG_FAILED
+  docker tag "$GOTRUE_PULL" "$GOTRUE_EXPECTED" || block GOTRUE_RETAG_FAILED
+  [[ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_EXPECTED")" == "$POSTGRES_IMAGE_ID" ]] || block POSTGRES_RETAG_ID_MISMATCH
+  [[ "$(docker image inspect --format '{{.Id}}' "$GOTRUE_EXPECTED")" == "$GOTRUE_IMAGE_ID" ]] || block GOTRUE_RETAG_ID_MISMATCH
+  record images.gotrue.digest str "$GOTRUE_DIGEST"
+  record images.gotrue.image_id str "$GOTRUE_IMAGE_ID"
+  record images.gotrue.platform str "$gotrue_platform"
+  record images.pull_count int 2
+else
+  record images.pull_count int 1
+fi
 
 mapfile -t existing_prefixes < <(
   {
@@ -351,6 +443,8 @@ if ip -4 -o addr show dev "$bridge_name" | grep -q ' inet '; then
 fi
 
 host_ips="$(hostname -I 2>/dev/null | xargs)"
+canary_image="$POSTGRES_EXPECTED"
+[[ "$MODE" != "direct-port" ]] || canary_image="$POSTGRES_PULL"
 set +e
 docker run --rm --pull=never \
   --name "${PROJECT}-canary" \
@@ -358,7 +452,7 @@ docker run --rm --pull=never \
   --label "io.fawxzzy.role=prestart-canary" \
   --network "$NETWORK_ID" \
   --add-host host.docker.internal:host-gateway \
-  "$POSTGRES_EXPECTED" bash -ceu '
+  "$canary_image" bash -ceu '
     command -v ip >/dev/null
     command -v getent >/dev/null
     command -v ping >/dev/null
@@ -393,6 +487,11 @@ record canaries.prestart.external_dns_failed bool true
 record canaries.prestart.literal_ip_failed bool true
 record canaries.prestart.metadata_failed bool true
 record canaries.prestart.host_gateway_failed bool true
+
+if [[ "$MODE" == "direct-port" ]]; then
+  run_direct_port_probe
+  exit 0
+fi
 
 cp "$ROOT/supabase/config.toml" "$PROJECT_DIR/supabase/config.toml"
 [[ ! -e "$PROJECT_DIR/supabase/migrations" ]] || block APPLICATION_MIGRATIONS_PRESENT

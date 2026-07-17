@@ -24,6 +24,7 @@ def load_module(name: str, relative: str):
 watch = load_module("container_watch", "scripts/container_watch.py")
 subnets = load_module("check_subnet", "scripts/check_subnet.py")
 db_start_log = load_module("classify_db_start_log", "scripts/classify_db_start_log.py")
+direct_port = load_module("direct_port_probe", "scripts/direct_port_probe.py")
 
 
 class PinContractTests(unittest.TestCase):
@@ -84,6 +85,12 @@ class WorkflowContractTests(unittest.TestCase):
             r"run-containment-smoke\.sh cleanup-only\s+- name: Upload sanitized receipt",
         )
 
+    def test_existing_manual_workflow_selects_only_the_direct_diagnostic_mode(self) -> None:
+        self.assertIn("Hosted replay direct Docker port diagnostic", self.workflow)
+        self.assertEqual(self.workflow.count("run-containment-smoke.sh direct-port"), 1)
+        self.assertEqual(self.workflow.count("run-containment-smoke.sh cleanup-only"), 1)
+        self.assertEqual(self.workflow.count("RESULT_PROFILE=direct-docker-port-v1"), 1)
+
 
 class SupabaseProfileTests(unittest.TestCase):
     @classmethod
@@ -112,9 +119,42 @@ class RunnerStaticContractTests(unittest.TestCase):
         cls.runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
 
     def test_exactly_two_digest_pulls(self) -> None:
-        pulls = re.findall(r"(?m)^docker pull --platform linux/amd64 ", self.runner)
+        pulls = re.findall(r"(?m)^\s*docker pull --platform linux/amd64 ", self.runner)
         self.assertEqual(len(pulls), 2)
         self.assertNotRegex(self.runner, r"(?m)^\s*docker (build|compose pull|image pull)\b")
+
+    def test_direct_mode_isolated_from_cli_and_uses_one_exact_target(self) -> None:
+        self.assertIn('run|direct-port|cleanup-only', self.runner)
+        self.assertRegex(self.runner, r'(?s)if \[\[ "\$MODE" == "direct-port" \]\]; then\s+run_direct_port_probe\s+exit 0\s+fi')
+        self.assertLess(
+            self.runner.index('run_direct_port_probe\n  exit 0'),
+            self.runner.index('db start >"$RAW/supabase-db-start.log"'),
+        )
+        direct_function = self.runner[
+            self.runner.index("run_direct_port_probe() {") : self.runner.index(
+                'if [[ "$MODE" == "cleanup-only" ]]'
+            )
+        ]
+        self.assertEqual(direct_function.count("docker run -d"), 1)
+        self.assertIn("--pull=never", direct_function)
+        self.assertIn("--platform linux/amd64", direct_function)
+        self.assertIn('--network "$NETWORK_ID"', direct_function)
+        self.assertIn('--publish "${DB_PORT}:5432"', direct_function)
+        self.assertNotIn("0.0.0.0:", direct_function)
+        self.assertNotIn(":::", direct_function)
+        self.assertNotIn("$RUNTIME/bin/supabase", direct_function)
+        self.assertNotIn("db start", direct_function)
+
+    def test_direct_credential_is_masked_before_env_only_use(self) -> None:
+        mask = "printf '::add-mask::%s\\n' \"$db_password\""
+        export = 'export POSTGRES_PASSWORD="$db_password"'
+        env_only = "--env POSTGRES_PASSWORD"
+        self.assertIn(mask, self.runner)
+        self.assertIn(export, self.runner)
+        self.assertIn(env_only, self.runner)
+        self.assertLess(self.runner.index(mask), self.runner.index(export))
+        self.assertLess(self.runner.index(export), self.runner.index(env_only))
+        self.assertNotRegex(self.runner, r"record\s+\S+\s+\S+\s+\"?\$db_password")
 
     def test_contract_tests_do_not_leave_bytecode(self) -> None:
         self.assertIn('python3 -B -m unittest discover', self.runner)
@@ -174,9 +214,79 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn('20s docker rm -f "$id"', self.runner)
         self.assertIn('20s docker volume rm "$id"', self.runner)
         self.assertIn('20s docker network rm "$id"', self.runner)
+        self.assertGreaterEqual(self.runner.count('label=io.fawxzzy.packet=${DIRECT_PACKET}'), 4)
+        self.assertIn('[[ "$listener_count" == "0" ]] || return 1', self.runner)
+        self.assertRegex(
+            self.runner,
+            r'(?s)elif \[\[ ! -f "\$RESULT_FILE" \]\]; then\s+if \[\[ "\$RESULT_PROFILE" == "direct-docker-port-v1" \]\]; then\s+record result.profile str direct-docker-port-v1',
+        )
 
 
 class ResultWriterTests(unittest.TestCase):
+    def test_direct_result_is_strictly_allowlisted_and_cleanup_merge_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text(
+                "result.profile\tstr\tdirect-docker-port-v1\n"
+                "status\tstr\tDIRECT_DOCKER_PORT_PATH_PASS\n"
+                "failure.code\tstr\tSHOULD_BE_REMOVED\n"
+                "diagnostic.binding.class\tstr\tloopback-ipv4-only\n"
+                "runner.kernel\tstr\tMUST_NOT_LEAK\n"
+                "images.postgres.image_id\tstr\tMUST_NOT_LEAK\n",
+                encoding="utf-8",
+            )
+            audit.write_text('{"container_id":"MUST_NOT_LEAK"}\n', encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(result), {"schema", "packet", "status", "failure", "diagnostic", "cleanup"}
+            )
+            self.assertEqual(result["status"], "DIRECT_DOCKER_PORT_PATH_PASS")
+            self.assertIsNone(result["failure"])
+            self.assertEqual(result["diagnostic"]["binding"]["class"], "loopback-ipv4-only")
+            self.assertNotIn("MUST_NOT_LEAK", output.read_text(encoding="utf-8"))
+
+            state.write_text("cleanup.containers_remaining\tint\t0\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                    "--merge-existing",
+                ],
+                check=True,
+            )
+            merged = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(merged["status"], "DIRECT_DOCKER_PORT_PATH_PASS")
+            self.assertEqual(merged["cleanup"]["containers_remaining"], 0)
+            self.assertNotIn("container_audit", merged)
+
     def test_cleanup_merge_preserves_existing_sanitized_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -390,6 +500,131 @@ class ContainerAuditTests(unittest.TestCase):
         self.assertIn("NETWORK_ATTACHMENT_MISMATCH", violations)
         self.assertIn("ADDED_CAPABILITY_REJECTED", violations)
         self.assertIn("DOCKER_SOCKET_REJECTED", violations)
+
+
+def direct_inspection() -> dict:
+    network_id = "a" * 64
+    return {
+        "schema_version": 1,
+        "id": "b" * 64,
+        "name": "/fp-hosted-replay-ro-001-direct-postgres",
+        "image_id": "sha256:postgres",
+        "config_image": "supabase/postgres@sha256:pinned",
+        "labels": {
+            "io.fawxzzy.packet": "FP-HOSTED-REPLAY-DIRECT-PORT-DIAG-001",
+            "io.fawxzzy.role": "direct-postgres",
+            "com.supabase.cli.project": "fp-hosted-replay-ro-001",
+            "com.docker.compose.project": "fp-hosted-replay-ro-001",
+        },
+        "network_mode": network_id,
+        "privileged": False,
+        "pid_mode": "",
+        "ipc_mode": "private",
+        "binds": [],
+        "tmpfs": {
+            "/var/lib/postgresql/data": "rw,nosuid,nodev,noexec,size=1073741824"
+        },
+        "devices": [],
+        "device_requests": [],
+        "cap_add": [],
+        "security_opt": [],
+        "extra_hosts": [],
+        "port_bindings": {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]},
+        "restart_policy": {"Name": "no", "MaximumRetryCount": 0},
+        "mounts": [
+            {
+                "Type": "tmpfs",
+                "Source": "",
+                "Destination": "/var/lib/postgresql/data",
+                "RW": True,
+            }
+        ],
+        "networks": {"packet": {"NetworkID": network_id}},
+        "published_ports": {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}]},
+        "restart_count": 0,
+        "state": {
+            "Status": "running",
+            "Running": True,
+            "Restarting": False,
+            "OOMKilled": False,
+        },
+        "health": {"Status": "healthy", "FailingStreak": 0},
+    }
+
+
+class DirectPortProbeTests(unittest.TestCase):
+    def validate(self, data: dict) -> list[str]:
+        return direct_port.validate_inspection(
+            data,
+            "a" * 64,
+            "sha256:postgres",
+            "supabase/postgres@sha256:pinned",
+        )
+
+    def test_accepts_only_exact_loopback_direct_container(self) -> None:
+        self.assertEqual(self.validate(direct_inspection()), [])
+        self.assertRegex(direct_port.identity_digest("opaque"), r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn("Config.Env", direct_port.INSPECT_TEMPLATE)
+        self.assertNotIn("__ENV__", direct_port.INSPECT_TEMPLATE)
+
+    def test_unknown_or_corrupt_inspection_schema_fails_closed(self) -> None:
+        self.assertEqual(self.validate({}), ["DIRECT_INSPECTION_SCHEMA_INVALID"])
+        data = direct_inspection()
+        data["schema_version"] = 2
+        self.assertEqual(self.validate(data), ["DIRECT_INSPECTION_SCHEMA_INVALID"])
+        data = direct_inspection()
+        data["mounts"] = ["corrupt"]
+        data["restart_policy"] = "corrupt"
+        violations = self.validate(data)
+        self.assertIn("DIRECT_MOUNT_CONTRACT_MISMATCH", violations)
+        self.assertIn("DIRECT_RESTART_POLICY_MISMATCH", violations)
+
+    def test_rejects_privilege_namespaces_devices_capabilities_and_socket(self) -> None:
+        data = direct_inspection()
+        data.update(privileged=True, pid_mode="host", ipc_mode="host")
+        data["devices"] = [{"PathOnHost": "/dev/kvm"}]
+        data["cap_add"] = ["NET_ADMIN"]
+        data["binds"] = ["/var/run/docker.sock:/var/run/docker.sock"]
+        violations = self.validate(data)
+        self.assertIn("DIRECT_PRIVILEGED_MODE_REJECTED", violations)
+        self.assertIn("DIRECT_PID_MODE_REJECTED", violations)
+        self.assertIn("DIRECT_IPC_MODE_REJECTED", violations)
+        self.assertIn("DIRECT_DEVICE_ACCESS_REJECTED", violations)
+        self.assertIn("DIRECT_ADDED_CAPABILITY_REJECTED", violations)
+        self.assertIn("DIRECT_BIND_MOUNT_REJECTED", violations)
+
+    def test_rejects_extra_network_or_any_nonloopback_or_second_binding(self) -> None:
+        for binding in (
+            [{"HostIp": "0.0.0.0", "HostPort": "56422"}],
+            [{"HostIp": "::", "HostPort": "56422"}],
+            [
+                {"HostIp": "127.0.0.1", "HostPort": "56422"},
+                {"HostIp": "0.0.0.0", "HostPort": "56422"},
+            ],
+        ):
+            with self.subTest(binding=binding):
+                data = direct_inspection()
+                data["published_ports"]["5432/tcp"] = binding
+                self.assertIn("DIRECT_PORT_BINDING_MISMATCH", self.validate(data))
+        data = direct_inspection()
+        data["networks"]["extra"] = {"NetworkID": "c" * 64}
+        self.assertIn("DIRECT_NETWORK_ATTACHMENT_MISMATCH", self.validate(data))
+
+    def test_rejects_explicit_host_ip_request_health_restart_oom_and_extra_mount(self) -> None:
+        data = direct_inspection()
+        data["port_bindings"]["5432/tcp"][0]["HostIp"] = "127.0.0.1"
+        data["health"] = {"Status": "unhealthy", "FailingStreak": 3}
+        data["restart_count"] = 1
+        data["state"]["OOMKilled"] = True
+        data["mounts"].append(
+            {"Type": "bind", "Source": "/tmp", "Destination": "/extra", "RW": True}
+        )
+        violations = self.validate(data)
+        self.assertIn("DIRECT_PORT_REQUEST_MISMATCH", violations)
+        self.assertIn("DIRECT_CONTAINER_NOT_HEALTHY", violations)
+        self.assertIn("DIRECT_RESTART_COUNT_NONZERO", violations)
+        self.assertIn("DIRECT_CONTAINER_OOM_KILLED", violations)
+        self.assertIn("DIRECT_MOUNT_CONTRACT_MISMATCH", violations)
 
 
 class SubnetTests(unittest.TestCase):
