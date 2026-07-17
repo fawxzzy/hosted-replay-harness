@@ -27,6 +27,14 @@ jobs:
           HOME="$(pwd)/.smoke-runtime/home"
           ./scripts/run-containment-smoke.sh
 
+      - name: Cleanup exact packet resources
+        if: always()
+        run: >-
+          env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME="$(pwd)/.smoke-runtime/home"
+          ./scripts/run-containment-smoke.sh cleanup-only
+
       - name: Upload sanitized receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
