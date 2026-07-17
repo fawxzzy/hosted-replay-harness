@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -70,8 +73,15 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(len(uses), 2)
 
     def test_harness_gets_no_inherited_environment(self) -> None:
-        self.assertIn("env -i", self.workflow)
+        self.assertEqual(self.workflow.count("env -i"), 2)
         self.assertNotRegex(self.workflow, r"(?m)^\s*env:\s*$")
+
+    def test_cleanup_is_an_explicit_always_step(self) -> None:
+        self.assertRegex(
+            self.workflow,
+            r"(?ms)- name: Cleanup exact packet resources\s+if: always\(\).*"
+            r"run-containment-smoke\.sh cleanup-only\s+- name: Upload sanitized receipt",
+        )
 
 
 class SupabaseProfileTests(unittest.TestCase):
@@ -119,6 +129,11 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.assertIn(fragment, self.runner)
         self.assertIn("record network.ipam_gateway", self.runner)
         self.assertIn("16) block PACKET_GATEWAY_REACHABLE", self.runner)
+        self.assertIn(
+            'timeout --signal=TERM --kill-after=10s 600s "$RUNTIME/bin/supabase"',
+            self.runner,
+        )
+        self.assertIn('block SUPABASE_DB_START_TIMEOUT', self.runner)
 
     def test_prohibited_operations_are_absent(self) -> None:
         prohibited = (
@@ -137,6 +152,42 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn('label=io.fawxzzy.packet=${PACKET}', self.runner)
         self.assertNotIn("docker rm -f $(docker ps", self.runner)
         self.assertNotIn("supabase stop", self.runner)
+        self.assertIn('if [[ "$MODE" == "cleanup-only" ]]', self.runner)
+
+
+class ResultWriterTests(unittest.TestCase):
+    def test_cleanup_merge_preserves_existing_sanitized_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text("cleanup.containers_remaining\tint\t0\n", encoding="utf-8")
+            audit.write_text("", encoding="utf-8")
+            output.write_text(
+                json.dumps({"status": "BLOCKED", "failure": {"code": "ORIGINAL"}}),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                    "--merge-existing",
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["failure"]["code"], "ORIGINAL")
+            self.assertEqual(result["cleanup"]["containers_remaining"], 0)
 
 
 def base_inspection() -> dict:

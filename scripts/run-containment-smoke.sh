@@ -3,6 +3,12 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+MODE="${1:-run}"
+[[ "$#" -le 1 ]] || exit 2
+case "$MODE" in
+  run|cleanup-only) ;;
+  *) exit 2 ;;
+esac
 PACKET="FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001"
 PROJECT="fp-hosted-replay-ro-001"
 NETWORK_NAME="fp-hosted-replay-ro-001-net"
@@ -40,11 +46,6 @@ GOTRUE_TAG="supabase/gotrue:v2.192.0"
 GOTRUE_DIGEST="sha256:288d880ebc80a1cb5ad52dc7d12328f76e9c90127003306864a270118bba00a8"
 GOTRUE_PULL="supabase/gotrue@${GOTRUE_DIGEST}"
 GOTRUE_EXPECTED="public.ecr.aws/supabase/gotrue:v2.192.0"
-
-mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
-: >"$STATE_FILE"
-: >"$AUDIT_FILE"
-: >"$VIOLATION_FILE"
 
 record() {
   local key="$1" kind="$2" value="$3"
@@ -184,6 +185,45 @@ finalize() {
   exit "$final_rc"
 }
 
+cleanup_only() {
+  local cleanup_rc=0
+  mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
+  STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
+  : >"$STATE_FILE"
+  [[ -e "$AUDIT_FILE" ]] || : >"$AUDIT_FILE"
+
+  if ! cleanup_exact; then
+    record status str BLOCKED
+    record failure.code str CLEANUP_RESIDUE
+    record failure.detail str exact-packet-resource-remains
+    cleanup_rc=1
+  elif [[ ! -f "$RESULT_FILE" ]]; then
+    record status str BLOCKED
+    record failure.code str HARNESS_INTERRUPTED
+    record failure.detail str cleanup-step-recovered-interrupted-run
+  fi
+
+  python3 "$ROOT/scripts/write_result.py" \
+    --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_FILE" \
+    --merge-existing >"$RAW/cleanup-result-writer.log" 2>&1 || cleanup_rc=1
+
+  rm -f -- "$STATE_FILE"
+  case "$RUNTIME" in
+    "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
+  esac
+  [[ "$cleanup_rc" == "0" ]] || exit "$cleanup_rc"
+  printf 'CLEANUP_EXACT_PASS\n'
+  exit 0
+}
+
+if [[ "$MODE" == "cleanup-only" ]]; then
+  cleanup_only
+fi
+
+mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
+: >"$STATE_FILE"
+: >"$AUDIT_FILE"
+: >"$VIOLATION_FILE"
 trap finalize EXIT
 
 record started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -369,7 +409,7 @@ done
 [[ -f "$WATCH_READY" ]] || block CONTAINER_WATCHER_NOT_READY
 
 set +e
-"$RUNTIME/bin/supabase" \
+timeout --signal=TERM --kill-after=10s 600s "$RUNTIME/bin/supabase" \
   --workdir "$PROJECT_DIR" \
   --network-id "$NETWORK_ID" \
   --yes \
@@ -388,6 +428,7 @@ if [[ -s "$VIOLATION_FILE" ]]; then
   first_violation="$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["violations"][0])' "$VIOLATION_FILE" 2>/dev/null || printf UNKNOWN)"
   block CONTAINER_AUDIT_REJECTED "$first_violation"
 fi
+[[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 [[ "$cli_rc" == "0" ]] || block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 
 database_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"

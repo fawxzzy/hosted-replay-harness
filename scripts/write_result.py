@@ -81,10 +81,24 @@ def main() -> None:
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--audit", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--merge-existing", action="store_true")
     args = parser.parse_args()
 
     pins = json.loads((args.root / "pins.json").read_text(encoding="utf-8"))
     state = read_state(args.state)
+    if args.merge_existing and args.output.exists():
+        result = json.loads(args.output.read_text(encoding="utf-8"))
+        status = state.pop("status", None)
+        failure = state.pop("failure", None)
+        if status is not None:
+            result["status"] = status
+            result["failure"] = None if status == "CONTAINMENT_SMOKE_PASS" else failure
+        result.update(state)
+        if args.audit.exists() and args.audit.stat().st_size:
+            result["container_audit"] = read_audit(args.audit)
+        args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return
+
     status = state.pop("status", "BLOCKED")
     failure = state.pop(
         "failure", {"code": "HARNESS_RESULT_INCOMPLETE", "detail": "sanitized-state-missing"}
