@@ -423,6 +423,11 @@ cli_rc="$?"
 set -e
 sleep 1
 stop_watcher
+if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
+  --input "$RAW/supabase-db-start.log" \
+  --exit-code "$cli_rc" >>"$STATE_FILE"; then
+  block DB_START_LOG_SANITIZER_FAILED
+fi
 [[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 
 project_network_count="$(docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" | awk 'NF' | wc -l)"

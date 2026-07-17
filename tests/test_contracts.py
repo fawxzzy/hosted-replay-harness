@@ -23,6 +23,7 @@ def load_module(name: str, relative: str):
 
 watch = load_module("container_watch", "scripts/container_watch.py")
 subnets = load_module("check_subnet", "scripts/check_subnet.py")
+db_start_log = load_module("classify_db_start_log", "scripts/classify_db_start_log.py")
 
 
 class PinContractTests(unittest.TestCase):
@@ -139,6 +140,19 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner.index('project_network_count="$(docker network ls'),
         )
 
+    def test_db_start_log_is_sanitized_before_failure_mapping(self) -> None:
+        classifier = 'python3 -B "$ROOT/scripts/classify_db_start_log.py"'
+        self.assertIn(classifier, self.runner)
+        self.assertNotIn("--debug", self.runner)
+        self.assertLess(
+            self.runner.index(classifier),
+            self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
+        )
+        self.assertLess(
+            self.runner.index(classifier),
+            self.runner.index('block SUPABASE_DB_START_FAILED'),
+        )
+
     def test_prohibited_operations_are_absent(self) -> None:
         prohibited = (
             r"docker\s+(system|container|volume|network|image)\s+prune",
@@ -195,6 +209,113 @@ class ResultWriterTests(unittest.TestCase):
             result = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(result["failure"]["code"], "ORIGINAL")
             self.assertEqual(result["cleanup"]["containers_remaining"], 0)
+
+    def test_diagnostic_state_is_nested_without_raw_text(self) -> None:
+        raw = b"opaque diagnostic fixture\n"
+        diagnostic = db_start_log.classify(raw, 1)
+        state_text = db_start_log.format_state_lines(diagnostic)
+        self.assertNotIn("opaque diagnostic fixture", state_text)
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text(
+                "status\tstr\tBLOCKED\n"
+                "failure.code\tstr\tSUPABASE_DB_START_FAILED\n"
+                "failure.detail\tstr\tcli-exit-1\n"
+                + state_text,
+                encoding="utf-8",
+            )
+            audit.write_text("", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            observed = result["supabase_cli"]["db_start_diagnostic"]
+            self.assertEqual(observed, diagnostic)
+            self.assertNotIn("opaque diagnostic fixture", output.read_text(encoding="utf-8"))
+
+
+class DbStartLogClassifierTests(unittest.TestCase):
+    def test_every_admitted_category_has_a_synthetic_fixture(self) -> None:
+        fixtures = {
+            "CONFIG_VALIDATION_FAILED": b"failed to validate config\n",
+            "CLI_USAGE_ERROR": b"unknown flag: --not-real\n",
+            "IMAGE_RESOLUTION_FAILED": b"manifest unknown\n",
+            "NETWORK_CONFIGURATION_REJECTED": b"failed to create docker network\n",
+            "CONTAINER_CREATE_FAILED": b"failed to create the container\n",
+            "PORT_BIND_FAILED": b"port is already allocated\n",
+            "DATABASE_HEALTH_FAILED": b"database is not healthy\n",
+            "GOTRUE_MIGRATION_FAILED": b"gotrue migrate failed\n",
+            "DOCKER_DAEMON_ERROR": b"cannot connect to the Docker daemon\n",
+            "UNKNOWN_SANITIZED": b"unrecognized opaque failure\n",
+        }
+        self.assertEqual(set(fixtures), set(db_start_log.ALLOWED_CATEGORIES))
+        for expected, raw in fixtures.items():
+            with self.subTest(category=expected):
+                result = db_start_log.classify(raw, 1)
+                self.assertEqual(result["category"], expected)
+                self.assertEqual(result["exit_code"], 1)
+                self.assertEqual(result["raw_byte_count"], len(raw))
+                self.assertEqual(result["raw_line_count"], 1)
+                self.assertRegex(result["raw_sha256"], r"^[0-9a-f]{64}$")
+                self.assertEqual(
+                    set(result),
+                    {"category", "exit_code", "raw_byte_count", "raw_line_count", "raw_sha256"},
+                )
+
+    def test_specific_network_rule_precedes_generic_daemon_rule(self) -> None:
+        raw = b"Error response from daemon: failed to create docker network\n"
+        self.assertEqual(
+            db_start_log.classify(raw, 1)["category"],
+            "NETWORK_CONFIGURATION_REJECTED",
+        )
+
+    def test_empty_log_defaults_without_leaking_input(self) -> None:
+        result = db_start_log.classify(b"", 7)
+        self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
+        self.assertEqual(result["raw_byte_count"], 0)
+        self.assertEqual(result["raw_line_count"], 0)
+        rendered = db_start_log.format_state_lines(result)
+        self.assertEqual(len(rendered.splitlines()), 5)
+
+    def test_executable_path_emits_only_sanitized_state(self) -> None:
+        raw = b"failed to create docker network opaque-fixture-text\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "db-start.log"
+            path.write_bytes(raw)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/classify_db_start_log.py"),
+                    "--input",
+                    str(path),
+                    "--exit-code",
+                    "1",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(len(completed.stdout.splitlines()), 5)
+        self.assertIn("NETWORK_CONFIGURATION_REJECTED", completed.stdout)
+        self.assertNotIn("opaque-fixture-text", completed.stdout)
+        self.assertEqual(completed.stderr, "")
 
 
 def base_inspection() -> dict:
