@@ -22,7 +22,7 @@ No application repository, application migration, source data, Auth row, provide
 
 ## Fail-closed result
 
-Every failure maps to a stable uppercase code. A reachable daemon-reported packet gateway is `PACKET_GATEWAY_REACHABLE`. Supabase database start is bounded to 600 seconds so `SUPABASE_DB_START_TIMEOUT` is emitted before the 30-minute job cutoff. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output remains transient and is never uploaded. A failed gate does not cause a broader network, another runner label, an unpinned image, a remote Supabase path, or an application replay.
+Every failure maps to a stable uppercase code. A reachable daemon-reported packet gateway is `PACKET_GATEWAY_REACHABLE`. Supabase database start is bounded to 300 seconds so `SUPABASE_DB_START_TIMEOUT` is emitted before the 30-minute job cutoff. Each exact container, volume, and network removal is independently bounded to 20 seconds. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output remains transient and is never uploaded. A failed gate does not cause a broader network, another runner label, an unpinned image, a remote Supabase path, or an application replay.
 
 ## Known compatibility probe
 

@@ -91,7 +91,7 @@ cleanup_exact() {
     label="$(docker inspect --format '{{index .Config.Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker inspect --format '{{index .Config.Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
     if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
-      docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
+      timeout --signal=TERM --kill-after=5s 20s docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
     fi
   done
 
@@ -106,7 +106,7 @@ cleanup_exact() {
     label="$(docker volume inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker volume inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
     if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
-      docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
+      timeout --signal=TERM --kill-after=5s 20s docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
     fi
   done
 
@@ -121,7 +121,7 @@ cleanup_exact() {
     label="$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
     if [[ "$label" == "$PACKET" || "$project_label" == "$PROJECT" ]]; then
-      docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
+      timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
     fi
   done
 
@@ -409,7 +409,7 @@ done
 [[ -f "$WATCH_READY" ]] || block CONTAINER_WATCHER_NOT_READY
 
 set +e
-timeout --signal=TERM --kill-after=10s 600s "$RUNTIME/bin/supabase" \
+timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
   --workdir "$PROJECT_DIR" \
   --network-id "$NETWORK_ID" \
   --yes \

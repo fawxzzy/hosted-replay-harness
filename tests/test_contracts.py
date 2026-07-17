@@ -130,7 +130,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn("record network.ipam_gateway", self.runner)
         self.assertIn("16) block PACKET_GATEWAY_REACHABLE", self.runner)
         self.assertIn(
-            'timeout --signal=TERM --kill-after=10s 600s "$RUNTIME/bin/supabase"',
+            'timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase"',
             self.runner,
         )
         self.assertIn('block SUPABASE_DB_START_TIMEOUT', self.runner)
@@ -153,6 +153,9 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertNotIn("docker rm -f $(docker ps", self.runner)
         self.assertNotIn("supabase stop", self.runner)
         self.assertIn('if [[ "$MODE" == "cleanup-only" ]]', self.runner)
+        self.assertIn('20s docker rm -f "$id"', self.runner)
+        self.assertIn('20s docker volume rm "$id"', self.runner)
+        self.assertIn('20s docker network rm "$id"', self.runner)
 
 
 class ResultWriterTests(unittest.TestCase):
