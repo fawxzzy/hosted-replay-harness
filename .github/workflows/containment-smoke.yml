@@ -1,4 +1,4 @@
-name: Hosted replay containment smoke
+name: Hosted replay direct Docker port diagnostic
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  containment-smoke:
+  direct-docker-port-diagnostic:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -20,12 +20,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run fail-closed containment smoke
+      - name: Run fail-closed direct Docker port diagnostic
         run: >-
           env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME="$(pwd)/.smoke-runtime/home"
-          ./scripts/run-containment-smoke.sh
+          ./scripts/run-containment-smoke.sh direct-port
 
       - name: Cleanup exact packet resources
         if: always()
@@ -33,6 +33,7 @@ jobs:
           env -i
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
           HOME="$(pwd)/.smoke-runtime/home"
+          RESULT_PROFILE=direct-docker-port-v1
           ./scripts/run-containment-smoke.sh cleanup-only
 
       - name: Upload sanitized receipt
