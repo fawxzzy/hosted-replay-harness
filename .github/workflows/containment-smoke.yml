@@ -1,0 +1,37 @@
+name: Hosted replay containment smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fp-hosted-replay-ro-001
+  cancel-in-progress: false
+
+jobs:
+  containment-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+
+      - name: Run fail-closed containment smoke
+        run: >-
+          env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME="$(pwd)/.smoke-runtime/home"
+          ./scripts/run-containment-smoke.sh
+
+      - name: Upload sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fp-hosted-replay-ro-001-${{ github.run_id }}
+          path: artifacts/containment-smoke.json
+          if-no-files-found: error
+          retention-days: 7
