@@ -77,6 +77,92 @@ version_at_least() {
   [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
 }
 
+hash_identifier() {
+  printf 'sha256:%s' "$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
+}
+
+network_contract_code() {
+  local endpoint_mode="${1:-active}" resolved_ids correlated_ids endpoint_ids allowed_ids
+  local resolved_count correlated_count endpoint_count id
+
+  resolved_ids="$(docker network ls --no-trunc \
+    --filter "name=^${NETWORK_NAME}$" --format '{{.ID}}' 2>"$RAW/network-name-resolution.log")" \
+    || { printf 'NETWORK_NAME_ID_MAPPING_FAILED\n'; return 1; }
+  resolved_count="$(printf '%s\n' "$resolved_ids" | awk 'NF' | sort -u | wc -l)"
+  [[ "$resolved_count" == "1" && "$(printf '%s\n' "$resolved_ids" | awk 'NF{print; exit}')" == "$NETWORK_ID" ]] \
+    || { printf 'NETWORK_NAME_ID_MAPPING_FAILED\n'; return 1; }
+
+  correlated_ids="$({
+    docker network ls --no-trunc -q --filter "label=io.fawxzzy.packet=${PACKET}" 2>/dev/null
+    docker network ls --no-trunc -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u)"
+  correlated_count="$(printf '%s\n' "$correlated_ids" | awk 'NF' | wc -l)"
+  [[ "$correlated_count" == "1" && "$(printf '%s\n' "$correlated_ids" | awk 'NF{print; exit}')" == "$NETWORK_ID" ]] \
+    || { printf 'SECOND_PACKET_NETWORK_DETECTED\n'; return 1; }
+
+  [[ "$(docker network inspect --format '{{.Id}}' "$NETWORK_NAME" 2>"$RAW/network-contract.log")" == "$NETWORK_ID" ]] \
+    || { printf 'NETWORK_NAME_ID_MAPPING_FAILED\n'; return 1; }
+  [[ "$(docker network inspect --format '{{.Name}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$NETWORK_NAME" ]] \
+    || { printf 'NETWORK_NAME_ID_MAPPING_FAILED\n'; return 1; }
+  [[ "$(docker network inspect --format '{{.Driver}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "bridge" ]] \
+    || { printf 'NETWORK_DRIVER_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{.Scope}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "local" ]] \
+    || { printf 'NETWORK_SCOPE_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "true" ]] \
+    || { printf 'NETWORK_NOT_INTERNAL\n'; return 1; }
+  [[ "$(docker network inspect --format '{{.EnableIPv6}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "false" ]] \
+    || { printf 'NETWORK_IPV6_ENABLED\n'; return 1; }
+  [[ "$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$SUBNET" ]] \
+    || { printf 'NETWORK_SUBNET_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "127.0.0.1" ]] \
+    || { printf 'NETWORK_HOST_BINDING_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "isolated" ]] \
+    || { printf 'NETWORK_GATEWAY_MODE_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$PACKET" ]] \
+    || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Labels "io.fawxzzy.role"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "containment-network" ]] \
+    || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$PROJECT" ]] \
+    || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
+  [[ "$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$PROJECT" ]] \
+    || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
+
+  endpoint_ids="$(docker network inspect \
+    --format '{{range $id, $_ := .Containers}}{{println $id}}{{end}}' \
+    "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" \
+    || { printf 'NETWORK_NAME_ID_MAPPING_FAILED\n'; return 1; }
+  endpoint_count="$(printf '%s\n' "$endpoint_ids" | awk 'NF' | wc -l)"
+  if [[ "$endpoint_mode" == "empty" ]]; then
+    [[ "$endpoint_count" == "0" ]] || { printf 'NETWORK_PRESTART_ENDPOINTS_PRESENT\n'; return 1; }
+  else
+    allowed_ids="$(docker ps -aq --no-trunc --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null | awk 'NF' | sort -u)"
+    while IFS= read -r id; do
+      [[ -z "$id" ]] || grep -Fxq "$id" <<<"$allowed_ids" \
+        || { printf 'UNEXPECTED_NETWORK_ENDPOINT\n'; return 1; }
+    done <<<"$endpoint_ids"
+  fi
+
+  printf 'PASS\n'
+}
+
+assert_frozen_network() {
+  local stage="$1" endpoint_mode="${2:-active}" code
+  code="$(network_contract_code "$endpoint_mode")" || true
+  [[ "$code" == "PASS" ]] || block "${code:-NETWORK_NAME_ID_MAPPING_FAILED}" "$stage"
+  record "network.${stage}_exact_id" bool true
+}
+
+first_observer_violation() {
+  local code
+  code="$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["violations"][0])' "$VIOLATION_FILE" 2>/dev/null || printf UNKNOWN)"
+  [[ "$code" =~ ^[A-Z0-9_]+$ ]] || code=CONTAINER_AUDIT_REJECTED
+  printf '%s\n' "$code"
+}
+
+current_failure_code() {
+  awk -F $'\t' '$1=="failure.code"{code=$3} END{print code}' "$STATE_FILE" 2>/dev/null
+}
+
 stop_watcher() {
   if [[ -n "$WATCH_PID" ]] && kill -0 "$WATCH_PID" 2>/dev/null; then
     kill "$WATCH_PID" 2>/dev/null || true
@@ -162,16 +248,37 @@ cleanup_exact() {
 }
 
 finalize() {
-  local original_rc="$?" final_rc=1 final_status=BLOCKED
+  local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1 primary_failure
   [[ "$FINALIZING" == "0" ]] || return
   FINALIZING=1
   set +e
 
+  if [[ "$MODE" == "run" && -n "$NETWORK_ID" ]]; then
+    network_code="$(network_contract_code active)" || true
+    if [[ "$network_code" != "PASS" ]]; then
+      network_contract_ok=0
+      network_code="${network_code:-NETWORK_NAME_ID_MAPPING_FAILED}"
+      record network.pre_cleanup_failure_code str "$network_code"
+      primary_failure="$(current_failure_code)"
+      if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+        record status str BLOCKED
+        record failure.code str "$network_code"
+        record failure.detail str pre-cleanup-network-contract
+      fi
+    else
+      record network.pre_cleanup_exact_id bool true
+    fi
+  fi
+
   if ! cleanup_exact; then
-    record status str BLOCKED
-    record failure.code str CLEANUP_RESIDUE
-    record failure.detail str exact-packet-resource-remains
-  elif [[ "$SMOKE_PASSED" == "1" && "$original_rc" == "0" ]]; then
+    record cleanup.failure_code str CLEANUP_RESIDUE
+    primary_failure="$(current_failure_code)"
+    if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+      record status str BLOCKED
+      record failure.code str CLEANUP_RESIDUE
+      record failure.detail str exact-packet-resource-remains
+    fi
+  elif [[ "$SMOKE_PASSED" == "1" && "$original_rc" == "0" && "$network_contract_ok" == "1" ]]; then
     if [[ "$MODE" == "direct-port" ]]; then
       record status str DIRECT_DOCKER_PORT_PATH_PASS
       final_status=DIRECT_DOCKER_PORT_PATH_PASS
@@ -418,7 +525,7 @@ NETWORK_ID="$(docker network create \
   --opt "com.docker.network.bridge.gateway_mode_ipv4=isolated" \
   "$NETWORK_NAME" 2>"$RAW/network-create.log")" || block NETWORK_CREATE_FAILED
 [[ -n "$NETWORK_ID" ]] || block NETWORK_ID_EMPTY
-record network.id str "$NETWORK_ID"
+record network.id_sha256 str "$(hash_identifier "$NETWORK_ID")"
 record network.name str "$NETWORK_NAME"
 record network.subnet str "$SUBNET"
 record network.internal bool true
@@ -436,6 +543,7 @@ record network.ipam_gateway str "${ipam_gateway:-none}"
 [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$NETWORK_ID")" == "127.0.0.1" ]] || block NETWORK_HOST_BINDING_MISMATCH
 [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_ID")" == "isolated" ]] || block NETWORK_GATEWAY_MODE_MISMATCH
 [[ "$(docker network ls -q --filter "label=io.fawxzzy.packet=${PACKET}" | awk 'NF' | wc -l)" == "1" ]] || block PACKET_NETWORK_COUNT_MISMATCH
+assert_frozen_network after_create empty
 bridge_name="br-${NETWORK_ID:0:12}"
 ip link show dev "$bridge_name" >"$RAW/bridge-link.log" 2>&1 || block PACKET_BRIDGE_MISSING
 if ip -4 -o addr show dev "$bridge_name" | grep -q ' inet '; then
@@ -487,6 +595,7 @@ record canaries.prestart.external_dns_failed bool true
 record canaries.prestart.literal_ip_failed bool true
 record canaries.prestart.metadata_failed bool true
 record canaries.prestart.host_gateway_failed bool true
+assert_frozen_network pre_cli empty
 
 if [[ "$MODE" == "direct-port" ]]; then
   run_direct_port_probe
@@ -499,6 +608,9 @@ cp "$ROOT/supabase/config.toml" "$PROJECT_DIR/supabase/config.toml"
 
 python3 "$ROOT/scripts/container_watch.py" \
   --network-id "$NETWORK_ID" \
+  --network-name "$NETWORK_NAME" \
+  --network-subnet "$SUBNET" \
+  --packet "$PACKET" \
   --postgres-image-id "$POSTGRES_IMAGE_ID" \
   --gotrue-image-id "$GOTRUE_IMAGE_ID" \
   --audit-file "$AUDIT_FILE" \
@@ -508,19 +620,28 @@ python3 "$ROOT/scripts/container_watch.py" \
 WATCH_PID="$!"
 for _ in $(seq 1 50); do
   [[ -f "$WATCH_READY" ]] && break
+  kill -0 "$WATCH_PID" 2>/dev/null || break
   sleep 0.1
 done
-[[ -f "$WATCH_READY" ]] || block CONTAINER_WATCHER_NOT_READY
+if [[ ! -f "$WATCH_READY" ]]; then
+  if [[ -s "$VIOLATION_FILE" ]]; then
+    block "$(first_observer_violation)"
+  fi
+  block CONTAINER_WATCHER_NOT_READY
+fi
+assert_frozen_network pre_cli_start empty
 
 set +e
 timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
   --workdir "$PROJECT_DIR" \
-  --network-id "$NETWORK_ID" \
+  --network-id "$NETWORK_NAME" \
   --yes \
   db start >"$RAW/supabase-db-start.log" 2>&1
 cli_rc="$?"
 set -e
 sleep 1
+watcher_alive=0
+kill -0 "$WATCH_PID" 2>/dev/null && watcher_alive=1
 stop_watcher
 if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
   --input "$RAW/supabase-db-start.log" \
@@ -528,24 +649,37 @@ if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
   block DB_START_LOG_SANITIZER_FAILED
 fi
 [[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
-
-project_network_count="$(docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" | awk 'NF' | wc -l)"
-record network.correlated_count_after_cli int "$project_network_count"
-if [[ "$project_network_count" != "1" ]]; then
-  block CLI_CREATED_SECOND_NETWORK
+if [[ "$watcher_alive" != "1" ]]; then
+  if [[ -s "$VIOLATION_FILE" ]]; then
+    block "$(first_observer_violation)"
+  fi
+  block CONTAINER_WATCHER_EXITED
 fi
+
+assert_frozen_network post_cli active
+record network.correlated_count_after_cli int 1
+
+database_create_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" and json.loads(x).get("phase")=="create" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
+database_start_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" and json.loads(x).get("phase")=="start" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
+gotrue_create_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="gotrue_migration" and json.loads(x).get("phase")=="create" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
+gotrue_start_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="gotrue_migration" and json.loads(x).get("phase")=="start" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
+record container_lifecycle.database.create_count int "$database_create_observations"
+record container_lifecycle.database.start_count int "$database_start_observations"
+record container_lifecycle.gotrue_migration.create_count int "$gotrue_create_observations"
+record container_lifecycle.gotrue_migration.start_count int "$gotrue_start_observations"
+record container_lifecycle.network_id_correlated bool true
 if [[ -s "$VIOLATION_FILE" ]]; then
-  first_violation="$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["violations"][0])' "$VIOLATION_FILE" 2>/dev/null || printf UNKNOWN)"
-  block CONTAINER_AUDIT_REJECTED "$first_violation"
+  block "$(first_observer_violation)"
+fi
+if (( database_create_observations > database_start_observations || gotrue_create_observations > gotrue_start_observations )); then
+  block CONTAINER_CREATED_NOT_STARTED
 fi
 [[ "$cli_rc" == "0" ]] || block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 
-database_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
-gotrue_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="gotrue_migration" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
-record database.audit_observations int "$database_observations"
-record gotrue.audit_observations int "$gotrue_observations"
-[[ "$database_observations" == "1" ]] || block DATABASE_CONTAINER_NOT_EXACTLY_ONCE
-[[ "$gotrue_observations" == "1" ]] || block GOTRUE_MIGRATION_NOT_EXACTLY_ONCE
+record database.audit_observations int "$database_start_observations"
+record gotrue.audit_observations int "$gotrue_start_observations"
+[[ "$database_create_observations" == "1" && "$database_start_observations" == "1" ]] || block DATABASE_CONTAINER_NOT_EXACTLY_ONCE
+[[ "$gotrue_create_observations" == "1" && "$gotrue_start_observations" == "1" ]] || block GOTRUE_MIGRATION_NOT_EXACTLY_ONCE
 
 db_id="$(docker ps -q --filter "name=^/${DB_NAME}$" --filter "label=com.supabase.cli.project=${PROJECT}")"
 [[ -n "$db_id" ]] || block DATABASE_CONTAINER_MISSING

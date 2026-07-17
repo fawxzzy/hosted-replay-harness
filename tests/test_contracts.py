@@ -85,11 +85,12 @@ class WorkflowContractTests(unittest.TestCase):
             r"run-containment-smoke\.sh cleanup-only\s+- name: Upload sanitized receipt",
         )
 
-    def test_existing_manual_workflow_selects_only_the_direct_diagnostic_mode(self) -> None:
-        self.assertIn("Hosted replay direct Docker port diagnostic", self.workflow)
-        self.assertEqual(self.workflow.count("run-containment-smoke.sh direct-port"), 1)
+    def test_manual_workflow_selects_only_fixed_cli_containment_mode(self) -> None:
+        self.assertIn("Hosted replay containment smoke", self.workflow)
+        self.assertEqual(self.workflow.count("./scripts/run-containment-smoke.sh\n"), 1)
+        self.assertNotIn("run-containment-smoke.sh direct-port", self.workflow)
         self.assertEqual(self.workflow.count("run-containment-smoke.sh cleanup-only"), 1)
-        self.assertEqual(self.workflow.count("RESULT_PROFILE=direct-docker-port-v1"), 1)
+        self.assertNotIn("RESULT_PROFILE=", self.workflow)
 
 
 class SupabaseProfileTests(unittest.TestCase):
@@ -159,17 +160,24 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_contract_tests_do_not_leave_bytecode(self) -> None:
         self.assertIn('python3 -B -m unittest discover', self.runner)
 
-    def test_exact_network_contract_and_actual_id_pass_through(self) -> None:
+    def test_exact_network_contract_and_name_pass_through(self) -> None:
         for fragment in (
             "--internal",
             "--ipv6=false",
             'com.docker.network.bridge.host_binding_ipv4=127.0.0.1',
             'com.docker.network.bridge.gateway_mode_ipv4=isolated',
-            '--network-id "$NETWORK_ID"',
+            '--network-id "$NETWORK_NAME"',
         ):
             self.assertIn(fragment, self.runner)
+        self.assertEqual(self.runner.count('--network-id "$NETWORK_NAME"'), 1)
         self.assertIn("record network.ipam_gateway", self.runner)
         self.assertIn("16) block PACKET_GATEWAY_REACHABLE", self.runner)
+        self.assertIn("assert_frozen_network after_create empty", self.runner)
+        self.assertIn("assert_frozen_network pre_cli empty", self.runner)
+        self.assertIn("assert_frozen_network pre_cli_start empty", self.runner)
+        self.assertIn("assert_frozen_network post_cli active", self.runner)
+        self.assertIn("record network.pre_cleanup_exact_id bool true", self.runner)
+        self.assertIn("SECOND_PACKET_NETWORK_DETECTED", self.runner)
         self.assertIn(
             'timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase"',
             self.runner,
@@ -177,7 +185,41 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn('block SUPABASE_DB_START_TIMEOUT', self.runner)
         self.assertLess(
             self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
-            self.runner.index('project_network_count="$(docker network ls'),
+            self.runner.index('assert_frozen_network post_cli active'),
+        )
+
+    def test_lifecycle_requires_create_and_start_for_both_roles(self) -> None:
+        for fragment in (
+            'container_lifecycle.database.create_count',
+            'container_lifecycle.database.start_count',
+            'container_lifecycle.gotrue_migration.create_count',
+            'container_lifecycle.gotrue_migration.start_count',
+            'block CONTAINER_CREATED_NOT_STARTED',
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertIn(
+            '"$database_create_observations" == "1" && "$database_start_observations" == "1"',
+            self.runner,
+        )
+        self.assertIn(
+            '"$gotrue_create_observations" == "1" && "$gotrue_start_observations" == "1"',
+            self.runner,
+        )
+
+    def test_pre_cleanup_network_failure_cannot_be_overwritten_by_pass(self) -> None:
+        self.assertIn("network_contract_ok=1", self.runner)
+        self.assertIn("network_contract_ok=0", self.runner)
+        self.assertIn('"$network_contract_ok" == "1"', self.runner)
+
+    def test_finalize_preserves_the_first_explicit_failure_code(self) -> None:
+        self.assertIn("current_failure_code()", self.runner)
+        self.assertIn('record network.pre_cleanup_failure_code str "$network_code"', self.runner)
+        self.assertIn("record cleanup.failure_code str CLEANUP_RESIDUE", self.runner)
+        self.assertGreaterEqual(
+            self.runner.count(
+                '[[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]'
+            ),
+            2,
         )
 
     def test_db_start_log_is_sanitized_before_failure_mapping(self) -> None:
@@ -223,6 +265,63 @@ class RunnerStaticContractTests(unittest.TestCase):
 
 
 class ResultWriterTests(unittest.TestCase):
+    def test_cli_result_preserves_lifecycle_counts_and_only_hashed_object_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text(
+                "status\tstr\tBLOCKED\n"
+                "failure.code\tstr\tCONTAINER_CREATED_NOT_STARTED\n"
+                "failure.detail\tstr\tgate-rejected\n"
+                "container_lifecycle.database.create_count\tint\t1\n"
+                "container_lifecycle.database.start_count\tint\t0\n"
+                "container_lifecycle.network_id_correlated\tbool\ttrue\n",
+                encoding="utf-8",
+            )
+            audit.write_text(
+                json.dumps(
+                    {
+                        "phase": "create",
+                        "role": "database",
+                        "container_id": "sha256:" + "a" * 64,
+                        "image_id": "sha256:" + "b" * 64,
+                        "command": [],
+                        "network_ids": ["sha256:" + "c" * 64],
+                        "published_db_binding": None,
+                        "compliant": True,
+                        "violations": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["container_lifecycle"]["database"]["create_count"], 1)
+            self.assertEqual(result["container_lifecycle"]["database"]["start_count"], 0)
+            observed = result["container_audit"]["containers"][0]
+            self.assertRegex(observed["container_id"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(observed["network_ids"][0], r"^sha256:[0-9a-f]{64}$")
+            self.assertNotIn("phase", observed)
+            self.assertEqual(observed["command"], [])
+
     def test_direct_result_is_strictly_allowlisted_and_cleanup_merge_preserves_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -440,7 +539,7 @@ def base_inspection() -> dict:
             "com.supabase.cli.project": "fp-hosted-replay-ro-001",
             "com.docker.compose.project": "fp-hosted-replay-ro-001",
         },
-        "network_mode": network_id,
+        "network_mode": "fp-hosted-replay-ro-001-net",
         "privileged": False,
         "pid_mode": "",
         "ipc_mode": "private",
@@ -469,7 +568,28 @@ def base_inspection() -> dict:
 class ContainerAuditTests(unittest.TestCase):
     def test_accepts_exact_database(self) -> None:
         data = base_inspection()
-        role, violations = watch.classify_and_validate(data, "a" * 64, "sha256:postgres", "sha256:gotrue")
+        role, violations = watch.classify_and_validate(
+            data,
+            "start",
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "sha256:postgres",
+            "sha256:gotrue",
+        )
+        self.assertEqual(role, "database")
+        self.assertEqual(violations, [])
+
+    def test_create_phase_does_not_require_runtime_port_publication(self) -> None:
+        data = base_inspection()
+        data["published_ports"] = {}
+        role, violations = watch.classify_and_validate(
+            data,
+            "create",
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "sha256:postgres",
+            "sha256:gotrue",
+        )
         self.assertEqual(role, "database")
         self.assertEqual(violations, [])
 
@@ -485,7 +605,14 @@ class ContainerAuditTests(unittest.TestCase):
             published_ports={},
             restart_policy={"Name": "no"},
         )
-        role, violations = watch.classify_and_validate(data, "a" * 64, "sha256:postgres", "sha256:gotrue")
+        role, violations = watch.classify_and_validate(
+            data,
+            "start",
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "sha256:postgres",
+            "sha256:gotrue",
+        )
         self.assertEqual(role, "gotrue_migration")
         self.assertEqual(violations, [])
 
@@ -495,11 +622,113 @@ class ContainerAuditTests(unittest.TestCase):
         data["network_mode"] = "bridge"
         data["cap_add"] = ["NET_ADMIN"]
         data["binds"] = ["/var/run/docker.sock:/var/run/docker.sock"]
-        _, violations = watch.classify_and_validate(data, "a" * 64, "sha256:postgres", "sha256:gotrue")
+        _, violations = watch.classify_and_validate(
+            data,
+            "start",
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "sha256:postgres",
+            "sha256:gotrue",
+        )
         self.assertIn("PRIVILEGED_MODE_REJECTED", violations)
         self.assertIn("NETWORK_ATTACHMENT_MISMATCH", violations)
         self.assertIn("ADDED_CAPABILITY_REJECTED", violations)
         self.assertIn("DOCKER_SOCKET_REJECTED", violations)
+
+    def test_rejects_second_network_even_when_expected_network_is_present(self) -> None:
+        data = base_inspection()
+        data["networks"]["foreign"] = {"NetworkID": "c" * 64}
+        _, violations = watch.classify_and_validate(
+            data,
+            "start",
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "sha256:postgres",
+            "sha256:gotrue",
+        )
+        self.assertIn("NETWORK_ATTACHMENT_MISMATCH", violations)
+
+    def test_observer_hashes_object_ids_and_never_inspects_environment(self) -> None:
+        self.assertRegex(watch.identity_digest("opaque"), r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn("Config.Env", watch.INSPECT_TEMPLATE)
+        source = (ROOT / "scripts/container_watch.py").read_text(encoding="utf-8")
+        self.assertIn('"event=create"', source)
+        self.assertIn('"event=start"', source)
+        self.assertNotIn('str(data.get("id", ""))[:12]', source)
+
+
+def network_inspection() -> dict:
+    return {
+        "id": "a" * 64,
+        "name": "fp-hosted-replay-ro-001-net",
+        "driver": "bridge",
+        "scope": "local",
+        "internal": True,
+        "enable_ipv6": False,
+        "subnet": "172.31.253.0/24",
+        "options": {
+            "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1",
+            "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+        },
+        "labels": {
+            "io.fawxzzy.packet": "FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001",
+            "io.fawxzzy.role": "containment-network",
+            "com.supabase.cli.project": "fp-hosted-replay-ro-001",
+            "com.docker.compose.project": "fp-hosted-replay-ro-001",
+        },
+    }
+
+
+class NetworkIdentityContractTests(unittest.TestCase):
+    def validate(
+        self,
+        data: dict,
+        resolved_ids: list[str] | None = None,
+        correlated_ids: list[str] | None = None,
+    ) -> list[str]:
+        return watch.validate_network_contract(
+            data,
+            resolved_ids if resolved_ids is not None else ["a" * 64],
+            correlated_ids if correlated_ids is not None else ["a" * 64],
+            "fp-hosted-replay-ro-001-net",
+            "a" * 64,
+            "172.31.253.0/24",
+            "FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001",
+        )
+
+    def test_unique_name_resolves_to_frozen_engine_id(self) -> None:
+        self.assertEqual(self.validate(network_inspection()), [])
+
+    def test_rejects_name_to_id_drift(self) -> None:
+        violations = self.validate(network_inspection(), resolved_ids=["c" * 64])
+        self.assertIn("NETWORK_NAME_ID_MAPPING_FAILED", violations)
+        data = network_inspection()
+        data["id"] = "c" * 64
+        self.assertIn("NETWORK_NAME_ID_MAPPING_FAILED", self.validate(data))
+
+    def test_rejects_second_packet_or_project_network(self) -> None:
+        violations = self.validate(
+            network_inspection(), correlated_ids=["a" * 64, "c" * 64]
+        )
+        self.assertIn("SECOND_PACKET_NETWORK_DETECTED", violations)
+
+    def test_rejects_any_network_contract_option_or_label_drift(self) -> None:
+        mutations = (
+            ("internal", False, "NETWORK_NOT_INTERNAL"),
+            ("enable_ipv6", True, "NETWORK_IPV6_ENABLED"),
+            ("subnet", "172.31.252.0/24", "NETWORK_SUBNET_MISMATCH"),
+        )
+        for key, value, expected in mutations:
+            with self.subTest(key=key):
+                data = network_inspection()
+                data[key] = value
+                self.assertIn(expected, self.validate(data))
+        data = network_inspection()
+        data["options"]["com.docker.network.bridge.gateway_mode_ipv4"] = "nat"
+        self.assertIn("NETWORK_GATEWAY_MODE_MISMATCH", self.validate(data))
+        data = network_inspection()
+        data["labels"]["io.fawxzzy.packet"] = "foreign"
+        self.assertIn("NETWORK_LABEL_MISMATCH", self.validate(data))
 
 
 def direct_inspection() -> dict:
