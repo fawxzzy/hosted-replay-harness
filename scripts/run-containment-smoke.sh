@@ -1138,6 +1138,7 @@ expect_firewall_block() {
   local receipt_key="$1" counter="$2" success_code="$3" correlation_code="$4"
   shift 4
   local before_input before_forward before_output after_input after_forward after_output before after command_rc
+  local input_delta forward_delta output_delta command_exit_class
   before_input="$(firewall_counter_value input_deny)"
   before_forward="$(firewall_counter_value forward_deny)"
   before_output="$(firewall_counter_value output_deny)"
@@ -1148,6 +1149,34 @@ expect_firewall_block() {
   after_input="$(firewall_counter_value input_deny)"
   after_forward="$(firewall_counter_value forward_deny)"
   after_output="$(firewall_counter_value output_deny)"
+  input_delta="$(( after_input - before_input ))"
+  forward_delta="$(( after_forward - before_forward ))"
+  output_delta="$(( after_output - before_output ))"
+
+  if [[ "$receipt_key" == "gateway" ]]; then
+    case "$command_rc" in
+      0) command_exit_class="SUCCESS" ;;
+      1) command_exit_class="NO_REPLY" ;;
+      *) command_exit_class="RUNTIME_ERROR" ;;
+    esac
+    record canaries.firewall.gateway_command_exit_code int "$command_rc"
+    record canaries.firewall.gateway_command_exit_class str "$command_exit_class"
+    record canaries.firewall.gateway_input_deny_delta int "$input_delta"
+    record canaries.firewall.gateway_forward_deny_delta int "$forward_delta"
+    record canaries.firewall.gateway_output_deny_delta int "$output_delta"
+
+    [[ "$command_exit_class" != "SUCCESS" ]] || block PACKET_GATEWAY_REACHABLE
+    (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) \
+      || block FIREWALL_COUNTER_NONMONOTONIC
+    [[ "$command_exit_class" != "RUNTIME_ERROR" ]] || block GATEWAY_COMMAND_RUNTIME_FAILED
+    (( forward_delta == 0 && output_delta == 0 )) || block GATEWAY_UNEXPECTED_COUNTER_DELTA
+    (( input_delta > 0 )) || block GATEWAY_INPUT_COUNTER_DELTA_MISSING
+    record canaries.firewall.gateway_failed bool true
+    record canaries.firewall.gateway_deny_delta int "$input_delta"
+    EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + input_delta ))"
+    return 0
+  fi
+
   [[ "$command_rc" != "0" ]] || block "$success_code"
   case "$counter" in
     input_deny)

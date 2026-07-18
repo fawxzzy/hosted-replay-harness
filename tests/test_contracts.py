@@ -4161,6 +4161,119 @@ class FirewallBoundaryTests(unittest.TestCase):
         self.assertNotIn('expect_firewall_block external_dns forward_deny', runner)
         self.assertNotIn('cat "$RAW/canary-', runner)
 
+    def test_gateway_canary_records_complete_sanitized_evidence_before_classification(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        start = runner.index("expect_firewall_block() {")
+        end = runner.index("\n}\n\nwait_healthy_container()", start) + 2
+        function = runner[start:end]
+
+        def execute(
+            command_rc: int,
+            before: tuple[int, int, int],
+            after: tuple[int, int, int],
+        ) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                script = f"""set -Eeuo pipefail
+RAW={shlex.quote(directory)}
+PHASE_FILE="$RAW/after"
+EXPECTED_INPUT_DENIES=0
+EXPECTED_FORWARD_DENIES=0
+EXPECTED_OUTPUT_DENIES=0
+COMMAND_RC={command_rc}
+BEFORE_INPUT={before[0]}
+BEFORE_FORWARD={before[1]}
+BEFORE_OUTPUT={before[2]}
+AFTER_INPUT={after[0]}
+AFTER_FORWARD={after[1]}
+AFTER_OUTPUT={after[2]}
+firewall_counter_value() {{
+  local name="$1" prefix=BEFORE variable
+  [[ ! -e "$PHASE_FILE" ]] || prefix=AFTER
+  case "$name" in
+    input_deny) variable="${{prefix}}_INPUT" ;;
+    forward_deny) variable="${{prefix}}_FORWARD" ;;
+    output_deny) variable="${{prefix}}_OUTPUT" ;;
+  esac
+  printf '%s\\n' "${{!variable}}"
+}}
+record() {{ printf 'RECORD:%s:%s:%s\\n' "$1" "$2" "$3"; }}
+block() {{ printf 'BLOCK:%s\\n' "$1"; exit 91; }}
+trigger() {{
+  : >"$PHASE_FILE"
+  printf 'raw-secret-token 172.31.253.1 nft-rule-text\\n'
+  return "$COMMAND_RC"
+}}
+{function}
+expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED trigger
+printf 'expected-input=%s\\n' "$EXPECTED_INPUT_DENIES"
+"""
+                return subprocess.run(
+                    [bash_executable()],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+        evidence_keys = (
+            "gateway_command_exit_code",
+            "gateway_command_exit_class",
+            "gateway_input_deny_delta",
+            "gateway_forward_deny_delta",
+            "gateway_output_deny_delta",
+        )
+
+        accepted = execute(1, (0, 0, 0), (2, 0, 0))
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("expected-input=2", accepted.stdout)
+        self.assertIn("gateway_command_exit_class:str:NO_REPLY", accepted.stdout)
+
+        failures = (
+            (0, (1, 1, 1), (0, 1, 1), "PACKET_GATEWAY_REACHABLE"),
+            (1, (0, 0, 0), (0, 0, 0), "GATEWAY_INPUT_COUNTER_DELTA_MISSING"),
+            (1, (0, 0, 0), (1, 1, 0), "GATEWAY_UNEXPECTED_COUNTER_DELTA"),
+            (1, (0, 0, 0), (0, 1, 1), "GATEWAY_UNEXPECTED_COUNTER_DELTA"),
+            (1, (1, 0, 0), (0, 0, 0), "FIREWALL_COUNTER_NONMONOTONIC"),
+            (1, (0, 1, 0), (0, 0, 0), "FIREWALL_COUNTER_NONMONOTONIC"),
+            (1, (0, 0, 1), (0, 0, 0), "FIREWALL_COUNTER_NONMONOTONIC"),
+            (2, (0, 0, 0), (0, 0, 0), "GATEWAY_COMMAND_RUNTIME_FAILED"),
+            (125, (0, 0, 0), (0, 0, 0), "GATEWAY_COMMAND_RUNTIME_FAILED"),
+            (126, (0, 0, 0), (0, 0, 0), "GATEWAY_COMMAND_RUNTIME_FAILED"),
+            (127, (0, 0, 0), (0, 0, 0), "GATEWAY_COMMAND_RUNTIME_FAILED"),
+            (42, (0, 0, 0), (0, 0, 0), "GATEWAY_COMMAND_RUNTIME_FAILED"),
+        )
+        for command_rc, before, after, expected in failures:
+            with self.subTest(command_rc=command_rc, before=before, after=after):
+                result = execute(command_rc, before, after)
+                self.assertEqual(result.returncode, 91, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[-1], f"BLOCK:{expected}")
+                for key in evidence_keys:
+                    self.assertTrue(
+                        any(line.startswith(f"RECORD:canaries.firewall.{key}:") for line in lines[:-1]),
+                        (key, lines),
+                    )
+                self.assertNotIn("raw-secret-token", result.stdout)
+                self.assertNotIn("172.31.253.1", result.stdout)
+                self.assertNotIn("nft-rule-text", result.stdout)
+
+    def test_gateway_diagnostic_preserves_following_tcp_host_listener_proof(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        gateway = (
+            "expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE "
+            "GATEWAY_NOT_FIREWALL_CORRELATED"
+        )
+        host_listener = (
+            "expect_firewall_block host_listener input_deny HOST_TEST_LISTENER_REACHABLE "
+            "HOST_TEST_LISTENER_NOT_FIREWALL_CORRELATED"
+        )
+        self.assertLess(runner.index(gateway), runner.index(host_listener))
+        self.assertIn(
+            'docker exec "$client_id" timeout 3 bash -ceu "</dev/tcp/${SUBNET_GATEWAY}/${HOST_TEST_PORT}"',
+            runner,
+        )
+
     def test_output_canary_rejects_any_simultaneous_unrelated_counter_hit(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
         start = runner.index("expect_firewall_block() {")
