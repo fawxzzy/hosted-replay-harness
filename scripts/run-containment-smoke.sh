@@ -1105,10 +1105,15 @@ stop_host_test_listener() {
 }
 
 cleanup_firewall_boundary() {
-  local pre_firewall_container_count="$1" cleanup_mode_rc="$2" firewall_code
+  local pre_firewall_container_count="$1" cleanup_mode_rc="$2" pre_firewall_network_count="$3" firewall_code
   record cleanup.containers_before_firewall_remove int "$pre_firewall_container_count"
+  record cleanup.networks_before_firewall_remove int "$pre_firewall_network_count"
   if [[ "$pre_firewall_container_count" != "0" ]]; then
     record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE
+    return 1
+  fi
+  if [[ "$pre_firewall_network_count" != "0" ]]; then
+    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_NETWORK_RESIDUE
     return 1
   fi
   if [[ "$cleanup_mode_rc" != "0" ]]; then
@@ -1147,6 +1152,7 @@ cleanup_firewall_boundary() {
 
 cleanup_exact() {
   local id label project_label count listener_count container_count volume_count pre_firewall_container_count
+  local pre_firewall_network_count
   local cleanup_mode_rc=0 firewall_rc=0 firewall_code
   if ! resolve_cleanup_mode_contract "$MODE"; then
     cleanup_mode_rc=1
@@ -1190,9 +1196,6 @@ cleanup_exact() {
   done
 
   stop_host_test_listener
-  pre_firewall_container_count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" || firewall_rc=1
-
   mapfile -t network_ids < <(
     {
       docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
@@ -1209,6 +1212,10 @@ cleanup_exact() {
       timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
     fi
   done
+
+  pre_firewall_container_count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  pre_firewall_network_count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" "$pre_firewall_network_count" || firewall_rc=1
 
   count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.containers_remaining int "$count"
@@ -2033,7 +2040,7 @@ run_firewall_publication_rehearsal() {
 
   record diagnostic.timing.started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   freeze_precli_objects_and_listeners
-  [[ ! -e "$FIREWALL_LEDGER" ]] || block FIREWALL_LEDGER_COLLISION
+  [[ -f "$FIREWALL_LEDGER" && ! -L "$FIREWALL_LEDGER" ]] || block FIREWALL_LEDGER_INVALID
   python3 -B "$ROOT/scripts/firewall_boundary.py" install \
     --ledger "$FIREWALL_LEDGER" \
     --interface "$FIREWALL_BRIDGE_NAME" \
@@ -2721,6 +2728,19 @@ else
     --internal
     --opt "com.docker.network.bridge.gateway_mode_ipv4=isolated"
   )
+fi
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  firewall_prepare_state="$RUNTIME/firewall-prepare.tsv"
+  python3 -B "$ROOT/scripts/firewall_boundary.py" prepare \
+    --ledger "$FIREWALL_LEDGER" \
+    --interface "$FIREWALL_BRIDGE_NAME" \
+    --subnet "$SUBNET" >"$firewall_prepare_state" 2>"$RAW/firewall-prepare.log" \
+    || {
+      failure_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$firewall_prepare_state" 2>/dev/null || true)"
+      [[ "$failure_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || failure_code=FIREWALL_PREPARE_FAILED
+      block "$failure_code"
+    }
+  cat "$firewall_prepare_state" >>"$STATE_FILE"
 fi
 NETWORK_ID="$(docker network create "${network_args[@]}" "$NETWORK_NAME" 2>"$RAW/network-create.log")" \
   || block NETWORK_CREATE_FAILED

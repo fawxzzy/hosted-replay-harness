@@ -21,7 +21,7 @@ import sys
 from typing import Any
 
 
-SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v3"
+SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v4"
 COMPLETION_SCHEMA = "fawxzzy.hosted-replay-harness.firewall-restoration.v1"
 TABLE = "fp_hosted_replay_ro_001"
 INPUT_CHAIN = "packet_input"
@@ -892,7 +892,7 @@ def read_ledger(path: Path) -> dict[str, Any]:
     return ledger
 
 
-def install(ledger_path: Path, interface: str, subnet: str) -> None:
+def prepare(ledger_path: Path, interface: str, subnet: str) -> None:
     completion_path = restoration_completion_path(ledger_path)
     if (
         os.path.lexists(ledger_path)
@@ -920,6 +920,44 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
         "combined_sha256": "",
     }
     write_ledger(ledger_path, ledger)
+    emit(
+        [
+            ("firewall.backend_class", "str", backend_class),
+            ("firewall.daemon_class", "str", daemon_class),
+            ("firewall.docker_daemon_root_owned", "bool", daemon_root_owned),
+            ("firewall.runner_nonroot", "bool", runner_nonroot),
+            ("firewall.prepared_before_network", "bool", True),
+            ("firewall.preimage_sha256", "str", pre_sha),
+            ("firewall.preimage_table_count", "int", pre_counts.get("table", 0)),
+            ("firewall.preimage_chain_count", "int", pre_counts.get("chain", 0)),
+            ("firewall.preimage_rule_count", "int", pre_counts.get("rule", 0)),
+        ]
+    )
+
+
+def install(ledger_path: Path, interface: str, subnet: str) -> None:
+    completion_path = restoration_completion_path(ledger_path)
+    if os.path.lexists(completion_path) or os.path.lexists(
+        restoration_stage_path(completion_path)
+    ):
+        raise BoundaryError("FIREWALL_LEDGER_COLLISION")
+    ledger = read_ledger(ledger_path)
+    if (
+        ledger["interface"] != interface
+        or ledger["subnet"] != subnet
+        or ledger["installed"] is not False
+        or ledger["markers_installed"] is not False
+        or ledger["owned_sha256"]
+        or ledger["marker_sha256"]
+        or ledger["combined_sha256"]
+    ):
+        raise BoundaryError("FIREWALL_LEDGER_INVALID")
+    process_ownership_preflight()
+    prefix, _ = privileged_prefix()
+    entries = read_ruleset(prefix)
+    if owned_entries(entries, TABLE):
+        raise BoundaryError("FIREWALL_TABLE_COLLISION")
+    install_pre_sha, install_pre_counts = canonical_snapshot(entries, exclude_table=TABLE)
     batch = build_batch(TABLE, interface, subnet)
     checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
     if checked.returncode != 0:
@@ -930,22 +968,32 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     after = read_ruleset(prefix)
     owned_sha, owned_counts = validate_owned(after, TABLE)
     foreign_sha, foreign_counts = canonical_snapshot(after, exclude_table=TABLE)
-    if foreign_sha != pre_sha or foreign_counts != pre_counts:
+    if foreign_sha != install_pre_sha or foreign_counts != install_pre_counts:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     ledger["installed"] = True
     ledger["owned_sha256"] = owned_sha
     write_ledger(ledger_path, ledger)
     emit(
         [
-            ("firewall.backend_class", "str", backend_class),
-            ("firewall.daemon_class", "str", daemon_class),
-            ("firewall.docker_daemon_root_owned", "bool", daemon_root_owned),
-            ("firewall.runner_nonroot", "bool", runner_nonroot),
             ("firewall.atomic_install", "bool", True),
-            ("firewall.preimage_sha256", "str", pre_sha),
-            ("firewall.preimage_table_count", "int", pre_counts.get("table", 0)),
-            ("firewall.preimage_chain_count", "int", pre_counts.get("chain", 0)),
-            ("firewall.preimage_rule_count", "int", pre_counts.get("rule", 0)),
+            ("firewall.install_foreign_unchanged", "bool", True),
+            ("firewall.install_preimage_sha256", "str", install_pre_sha),
+            ("firewall.install_postimage_sha256", "str", foreign_sha),
+            (
+                "firewall.install_preimage_table_count",
+                "int",
+                install_pre_counts.get("table", 0),
+            ),
+            (
+                "firewall.install_preimage_chain_count",
+                "int",
+                install_pre_counts.get("chain", 0),
+            ),
+            (
+                "firewall.install_preimage_rule_count",
+                "int",
+                install_pre_counts.get("rule", 0),
+            ),
             ("firewall.owned_sha256", "str", owned_sha),
             ("firewall.owned_chain_count", "int", owned_counts["chain"]),
             ("firewall.owned_counter_count", "int", owned_counts["counter"]),
@@ -1261,7 +1309,14 @@ def remove(ledger_path: Path) -> None:
         return
     before_sha, before_counts = canonical_snapshot(entries, exclude_table=TABLE)
     foreign_drift = before_sha != ledger["preimage_sha256"] or before_counts != ledger["preimage_counts"]
+    if foreign_drift:
+        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     if selected:
+        validate_owned(
+            entries,
+            TABLE,
+            markers_installed=bool(ledger["markers_installed"]),
+        )
         batch = f"delete table inet {TABLE}\n"
         checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
         if checked.returncode != 0:
@@ -1273,7 +1328,7 @@ def remove(ledger_path: Path) -> None:
     if owned_entries(after, TABLE):
         raise BoundaryError("FIREWALL_ROLLBACK_RESIDUE")
     post_sha, post_counts = canonical_snapshot(after, exclude_table=TABLE)
-    if foreign_drift or post_sha != ledger["preimage_sha256"] or post_counts != ledger["preimage_counts"]:
+    if post_sha != ledger["preimage_sha256"] or post_counts != ledger["preimage_counts"]:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     completion = build_completion(ledger, post_sha, post_counts)
     write_completion(completion_path, completion)
@@ -1301,6 +1356,10 @@ def remove(ledger_path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--ledger", required=True, type=Path)
+    prepare_parser.add_argument("--interface", required=True)
+    prepare_parser.add_argument("--subnet", required=True)
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--ledger", required=True, type=Path)
     install_parser.add_argument("--interface", required=True)
@@ -1320,7 +1379,9 @@ def main() -> int:
     remove_parser.add_argument("--ledger", required=True, type=Path)
     args = parser.parse_args()
     try:
-        if args.command == "install":
+        if args.command == "prepare":
+            prepare(args.ledger, args.interface, args.subnet)
+        elif args.command == "install":
             install(args.ledger, args.interface, args.subnet)
         elif args.command == "install-markers":
             install_markers(
