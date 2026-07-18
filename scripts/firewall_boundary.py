@@ -56,6 +56,12 @@ MARKER_CHAIN_CLASSES = {
 MARKER_DIAGNOSTIC_SCHEMA = (
     "fawxzzy.hosted-replay-harness.marker-expression-diagnostic.v1"
 )
+MARKER_INTENT_SCHEMA = (
+    "fawxzzy.hosted-replay-harness.marker-transaction-intent.v1"
+)
+MARKER_INSTALLED_SCHEMA = (
+    "fawxzzy.hosted-replay-harness.marker-installed-evidence.v1"
+)
 MARKER_DIAGNOSTIC_STATE_FILE = (
     Path(__file__).resolve().parents[1] / "artifacts" / ".state.tsv"
 )
@@ -119,6 +125,36 @@ MARKER_DIAGNOSTIC_KEYS = frozenset(
         "expected_shape_supported",
         "observed_shape_supported",
         "matched_shape",
+    }
+)
+MARKER_INTENT_KEYS = frozenset(
+    {
+        "schema",
+        "table",
+        "base_ledger_sha256",
+        "client_ip",
+        "service_ip",
+        "foreign_ip",
+        "gateway_ip",
+        "host_port",
+        "batch_sha256",
+        "evidence_sha256",
+    }
+)
+MARKER_INSTALLED_KEYS = frozenset(
+    {
+        "schema",
+        "table",
+        "base_ledger_sha256",
+        "intent_evidence_sha256",
+        "marker_sha256",
+        "combined_sha256",
+        "diagnostic_sha256",
+        "mismatch_class",
+        "expected_shape_sha256",
+        "observed_shape_sha256",
+        "effective_ledger_sha256",
+        "evidence_sha256",
     }
 )
 # DNS question wire identity for the fixed public canary name already frozen in
@@ -1337,6 +1373,292 @@ def ledger_sha256(ledger: dict[str, Any]) -> str:
     return canonical_json_sha256(ledger)
 
 
+def marker_intent_path(ledger_path: Path) -> Path:
+    return ledger_path.with_name(f"{ledger_path.name}.marker-intent")
+
+
+def marker_installed_path(ledger_path: Path) -> Path:
+    return ledger_path.with_name(f"{ledger_path.name}.marker-installed")
+
+
+def marker_evidence_stage_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.stage")
+
+
+def marker_evidence_sha256(evidence: dict[str, Any]) -> str:
+    return canonical_json_sha256(
+        {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    )
+
+
+def _validate_sha256(value: Any, failure_code: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise BoundaryError(failure_code)
+    return value
+
+
+def validate_marker_intent(
+    intent: Any, ledger: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    failure = "FIREWALL_MARKER_STATE_INVALID"
+    if not isinstance(intent, dict) or set(intent) != MARKER_INTENT_KEYS:
+        raise BoundaryError(failure)
+    if intent.get("schema") != MARKER_INTENT_SCHEMA or intent.get("table") != TABLE:
+        raise BoundaryError(failure)
+    for key in ("base_ledger_sha256", "batch_sha256", "evidence_sha256"):
+        _validate_sha256(intent.get(key), failure)
+    for key in ("client_ip", "service_ip", "foreign_ip", "gateway_ip"):
+        value = intent.get(key)
+        try:
+            parsed = ipaddress.ip_address(value)
+        except (TypeError, ValueError) as exc:
+            raise BoundaryError(failure) from exc
+        if parsed.version != 4 or str(parsed) != value:
+            raise BoundaryError(failure)
+    host_port = intent.get("host_port")
+    if (
+        not isinstance(host_port, int)
+        or isinstance(host_port, bool)
+        or not 1 <= host_port <= 65535
+    ):
+        raise BoundaryError(failure)
+    if intent["evidence_sha256"] != marker_evidence_sha256(intent):
+        raise BoundaryError(failure)
+    if ledger is not None:
+        if (
+            ledger.get("installed") is not True
+            or ledger.get("markers_installed") is not False
+            or intent["base_ledger_sha256"] != ledger_sha256(ledger)
+        ):
+            raise BoundaryError(failure)
+        batch = build_marker_batch(
+            TABLE,
+            ledger["interface"],
+            ledger["subnet"],
+            intent["client_ip"],
+            intent["service_ip"],
+            intent["foreign_ip"],
+            intent["gateway_ip"],
+            intent["host_port"],
+        )
+        if intent["batch_sha256"] != hashlib.sha256(batch.encode("utf-8")).hexdigest():
+            raise BoundaryError(failure)
+    return intent
+
+
+def build_marker_intent(
+    ledger: dict[str, Any],
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+    batch: str,
+) -> dict[str, Any]:
+    intent = {
+        "schema": MARKER_INTENT_SCHEMA,
+        "table": TABLE,
+        "base_ledger_sha256": ledger_sha256(ledger),
+        "client_ip": client_ip,
+        "service_ip": service_ip,
+        "foreign_ip": foreign_ip,
+        "gateway_ip": gateway_ip,
+        "host_port": host_port,
+        "batch_sha256": hashlib.sha256(batch.encode("utf-8")).hexdigest(),
+        "evidence_sha256": "",
+    }
+    intent["evidence_sha256"] = marker_evidence_sha256(intent)
+    return validate_marker_intent(intent, ledger)
+
+
+def overlay_marker_ledger(
+    ledger: dict[str, Any], marker_sha256: str, combined_sha256: str
+) -> dict[str, Any]:
+    if ledger.get("markers_installed") is not False:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    _validate_sha256(marker_sha256, "FIREWALL_MARKER_STATE_INVALID")
+    _validate_sha256(combined_sha256, "FIREWALL_MARKER_STATE_INVALID")
+    effective = dict(ledger)
+    effective["markers_installed"] = True
+    effective["marker_sha256"] = marker_sha256
+    effective["combined_sha256"] = combined_sha256
+    return effective
+
+
+def validate_marker_installed(
+    installed: Any,
+    ledger: dict[str, Any] | None = None,
+    intent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    failure = "FIREWALL_MARKER_STATE_INVALID"
+    if not isinstance(installed, dict) or set(installed) != MARKER_INSTALLED_KEYS:
+        raise BoundaryError(failure)
+    if installed.get("schema") != MARKER_INSTALLED_SCHEMA or installed.get("table") != TABLE:
+        raise BoundaryError(failure)
+    for key in (
+        "base_ledger_sha256",
+        "intent_evidence_sha256",
+        "marker_sha256",
+        "combined_sha256",
+        "diagnostic_sha256",
+        "expected_shape_sha256",
+        "observed_shape_sha256",
+        "effective_ledger_sha256",
+        "evidence_sha256",
+    ):
+        _validate_sha256(installed.get(key), failure)
+    if installed.get("mismatch_class") not in MARKER_MISMATCH_CLASSES:
+        raise BoundaryError(failure)
+    if installed["evidence_sha256"] != marker_evidence_sha256(installed):
+        raise BoundaryError(failure)
+    if ledger is not None:
+        if installed["base_ledger_sha256"] != ledger_sha256(ledger):
+            raise BoundaryError(failure)
+        effective = overlay_marker_ledger(
+            ledger, installed["marker_sha256"], installed["combined_sha256"]
+        )
+        if installed["effective_ledger_sha256"] != ledger_sha256(effective):
+            raise BoundaryError(failure)
+    if intent is not None:
+        validate_marker_intent(intent, ledger)
+        if (
+            installed["intent_evidence_sha256"] != intent["evidence_sha256"]
+            or installed["base_ledger_sha256"] != intent["base_ledger_sha256"]
+        ):
+            raise BoundaryError(failure)
+    return installed
+
+
+def build_marker_installed(
+    ledger: dict[str, Any],
+    intent: dict[str, Any],
+    marker_sha256: str,
+    combined_sha256: str,
+    diagnostic: dict[str, Any],
+) -> dict[str, Any]:
+    validate_marker_intent(intent, ledger)
+    marker_diagnostic_state_rows(diagnostic)
+    effective = overlay_marker_ledger(ledger, marker_sha256, combined_sha256)
+    installed = {
+        "schema": MARKER_INSTALLED_SCHEMA,
+        "table": TABLE,
+        "base_ledger_sha256": ledger_sha256(ledger),
+        "intent_evidence_sha256": intent["evidence_sha256"],
+        "marker_sha256": marker_sha256,
+        "combined_sha256": combined_sha256,
+        "diagnostic_sha256": canonical_json_sha256(diagnostic),
+        "mismatch_class": diagnostic["mismatch_class"],
+        "expected_shape_sha256": diagnostic["expected_shape_sha256"],
+        "observed_shape_sha256": diagnostic["observed_shape_sha256"],
+        "effective_ledger_sha256": ledger_sha256(effective),
+        "evidence_sha256": "",
+    }
+    installed["evidence_sha256"] = marker_evidence_sha256(installed)
+    return validate_marker_installed(installed, ledger, intent)
+
+
+def _read_private_marker_evidence(path: Path) -> dict[str, Any]:
+    failure = "FIREWALL_MARKER_STATE_INVALID"
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise BoundaryError(failure) from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BoundaryError(failure)
+    if os.name != "nt" and observed.st_mode & 0o077:
+        raise BoundaryError(failure)
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_strict_json_object
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise BoundaryError(failure) from exc
+    if not isinstance(value, dict):
+        raise BoundaryError(failure)
+    return value
+
+
+def read_marker_intent(path: Path, ledger: dict[str, Any] | None = None) -> dict[str, Any]:
+    return validate_marker_intent(_read_private_marker_evidence(path), ledger)
+
+
+def read_marker_installed(
+    path: Path,
+    ledger: dict[str, Any] | None = None,
+    intent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return validate_marker_installed(
+        _read_private_marker_evidence(path), ledger, intent
+    )
+
+
+def _reconcile_marker_evidence_stage(path: Path) -> None:
+    stage_path = marker_evidence_stage_path(path)
+    if not os.path.lexists(stage_path):
+        return
+    try:
+        observed = stage_path.lstat()
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    if os.name != "nt" and observed.st_mode & 0o077:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    if os.path.lexists(path):
+        try:
+            if not os.path.samefile(stage_path, path):
+                raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+        except OSError as exc:
+            raise BoundaryError("FIREWALL_MARKER_STATE_INVALID") from exc
+    _retire_private_path(stage_path, "FIREWALL_MARKER_STATE_PERSISTENCE_FAILED")
+
+
+def _write_marker_evidence(
+    path: Path, evidence: dict[str, Any], validator: Any
+) -> None:
+    validator(evidence)
+    _reconcile_marker_evidence_stage(path)
+    if os.path.lexists(path):
+        raise BoundaryError("FIREWALL_MARKER_STATE_COLLISION")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stage_path = marker_evidence_stage_path(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(stage_path, flags, 0o600)
+        payload = (
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if os.write(descriptor, payload) != len(payload):
+            raise OSError("partial marker evidence write")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.chmod(stage_path, 0o600)
+        os.link(stage_path, path)
+        _fsync_parent(path)
+    except (BoundaryError, OSError) as exc:
+        if isinstance(exc, BoundaryError):
+            raise
+        raise BoundaryError("FIREWALL_MARKER_STATE_PERSISTENCE_FAILED") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(stage_path):
+            try:
+                stage_path.unlink()
+            except OSError as exc:
+                raise BoundaryError("FIREWALL_MARKER_STATE_PERSISTENCE_FAILED") from exc
+
+
+def write_marker_intent(path: Path, intent: dict[str, Any]) -> None:
+    _write_marker_evidence(path, intent, validate_marker_intent)
+
+
+def write_marker_installed(path: Path, installed: dict[str, Any]) -> None:
+    _write_marker_evidence(path, installed, validate_marker_installed)
+
+
 def counts_sha256(counts: dict[str, int]) -> str:
     return canonical_json_sha256(counts)
 
@@ -1569,12 +1891,133 @@ def read_ledger(path: Path) -> dict[str, Any]:
     return ledger
 
 
+def _marker_evidence_paths(ledger_path: Path) -> tuple[Path, Path]:
+    return marker_intent_path(ledger_path), marker_installed_path(ledger_path)
+
+
+def _reconcile_marker_evidence_stages(ledger_path: Path) -> None:
+    for path in _marker_evidence_paths(ledger_path):
+        _reconcile_marker_evidence_stage(path)
+
+
+def read_effective_ledger(ledger_path: Path) -> dict[str, Any]:
+    ledger = read_ledger(ledger_path)
+    _reconcile_marker_evidence_stages(ledger_path)
+    intent_path, installed_path = _marker_evidence_paths(ledger_path)
+    has_intent = os.path.lexists(intent_path)
+    has_installed = os.path.lexists(installed_path)
+    if has_installed and not has_intent:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    if not has_installed:
+        if has_intent:
+            read_marker_intent(intent_path, ledger)
+            raise BoundaryError("FIREWALL_MARKER_STATE_PENDING")
+        return ledger
+    intent = read_marker_intent(intent_path, ledger)
+    installed = read_marker_installed(installed_path, ledger, intent)
+    return overlay_marker_ledger(
+        ledger, installed["marker_sha256"], installed["combined_sha256"]
+    )
+
+
+def reconcile_marker_state_for_cleanup(
+    ledger_path: Path, ledger: dict[str, Any], entries: list[dict[str, Any]]
+) -> dict[str, Any]:
+    _reconcile_marker_evidence_stages(ledger_path)
+    intent_path, installed_path = _marker_evidence_paths(ledger_path)
+    has_intent = os.path.lexists(intent_path)
+    has_installed = os.path.lexists(installed_path)
+    if has_installed and not has_intent:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    if has_installed:
+        intent = read_marker_intent(intent_path, ledger)
+        installed = read_marker_installed(installed_path, ledger, intent)
+        return overlay_marker_ledger(
+            ledger, installed["marker_sha256"], installed["combined_sha256"]
+        )
+    if not has_intent:
+        return ledger
+
+    intent = read_marker_intent(intent_path, ledger)
+    selected = owned_entries(entries, TABLE)
+    if not selected:
+        return ledger
+    try:
+        base_sha, _ = validate_owned(entries, TABLE, markers_installed=False)
+        if base_sha != ledger["owned_sha256"]:
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        return ledger
+    except BoundaryError:
+        pass
+
+    try:
+        diagnostic = diagnose_marker_rule_expressions(
+            entries,
+            TABLE,
+            ledger["interface"],
+            ledger["subnet"],
+            intent["client_ip"],
+            intent["service_ip"],
+            intent["foreign_ip"],
+            intent["gateway_ip"],
+            intent["host_port"],
+        )
+        combined_sha, _ = validate_owned(entries, TABLE, markers_installed=True)
+        marker_sha, marker_counts = canonical_snapshot(marker_entries(entries, TABLE))
+        if marker_counts != {"chain": 3, "counter": 7, "rule": 7}:
+            raise BoundaryError("FIREWALL_MARKER_RECOVERY_FAILED")
+        installed = build_marker_installed(
+            ledger, intent, marker_sha, combined_sha, diagnostic
+        )
+        write_marker_installed(installed_path, installed)
+        return overlay_marker_ledger(ledger, marker_sha, combined_sha)
+    except BoundaryError as exc:
+        if exc.code in {
+            "FIREWALL_MARKER_STATE_PERSISTENCE_FAILED",
+            "FIREWALL_MARKER_STATE_COLLISION",
+        }:
+            raise
+        raise BoundaryError("FIREWALL_MARKER_RECOVERY_FAILED") from exc
+
+
+def validate_orphan_marker_evidence(
+    ledger_path: Path, completion: dict[str, Any]
+) -> None:
+    _reconcile_marker_evidence_stages(ledger_path)
+    intent_path, installed_path = _marker_evidence_paths(ledger_path)
+    has_intent = os.path.lexists(intent_path)
+    has_installed = os.path.lexists(installed_path)
+    intent = read_marker_intent(intent_path) if has_intent else None
+    installed = (
+        read_marker_installed(installed_path, None, intent)
+        if has_installed
+        else None
+    )
+    if installed is not None:
+        if installed["effective_ledger_sha256"] != completion["ledger_sha256"]:
+            raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+    elif intent is not None and intent["base_ledger_sha256"] != completion["ledger_sha256"]:
+        raise BoundaryError("FIREWALL_MARKER_STATE_INVALID")
+
+
+def retire_marker_evidence(ledger_path: Path) -> None:
+    intent_path, installed_path = _marker_evidence_paths(ledger_path)
+    for path in (intent_path, installed_path):
+        if os.path.lexists(path):
+            _retire_private_path(path, "FIREWALL_MARKER_STATE_RETIREMENT_FAILED")
+
+
 def prepare(ledger_path: Path, interface: str, subnet: str) -> None:
     completion_path = restoration_completion_path(ledger_path)
+    marker_paths = _marker_evidence_paths(ledger_path)
     if (
         os.path.lexists(ledger_path)
         or os.path.lexists(completion_path)
         or os.path.lexists(restoration_stage_path(completion_path))
+        or any(
+            os.path.lexists(path) or os.path.lexists(marker_evidence_stage_path(path))
+            for path in marker_paths
+        )
     ):
         raise BoundaryError("FIREWALL_LEDGER_COLLISION")
     daemon_class, daemon_root_owned, runner_nonroot = process_ownership_preflight()
@@ -1616,6 +2059,9 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     completion_path = restoration_completion_path(ledger_path)
     if os.path.lexists(completion_path) or os.path.lexists(
         restoration_stage_path(completion_path)
+    ) or any(
+        os.path.lexists(path) or os.path.lexists(marker_evidence_stage_path(path))
+        for path in _marker_evidence_paths(ledger_path)
     ):
         raise BoundaryError("FIREWALL_LEDGER_COLLISION")
     ledger = read_ledger(ledger_path)
@@ -1731,6 +2177,12 @@ def install_markers(
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     if ledger.get("markers_installed") is True:
         raise BoundaryError("FIREWALL_MARKER_COLLISION")
+    intent_path, installed_path = _marker_evidence_paths(ledger_path)
+    if any(
+        os.path.lexists(path) or os.path.lexists(marker_evidence_stage_path(path))
+        for path in (intent_path, installed_path)
+    ):
+        raise BoundaryError("FIREWALL_MARKER_STATE_COLLISION")
     prefix, _ = privileged_prefix()
     batch = build_marker_batch(
         TABLE,
@@ -1755,6 +2207,17 @@ def install_markers(
     if digest != ledger["owned_sha256"]:
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
     foreign_sha, foreign_counts = canonical_snapshot(before, exclude_table=TABLE)
+    # Publish retry-capable intent before apply; it never claims markers exist.
+    intent = build_marker_intent(
+        ledger,
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
+        batch,
+    )
+    write_marker_intent(intent_path, intent)
     applied = _run([*prefix, "-f", "-"], input_text=batch)
     if applied.returncode != 0:
         raise BoundaryError("FIREWALL_MARKER_ATOMIC_INSTALL_FAILED")
@@ -1780,12 +2243,14 @@ def install_markers(
     marker_sha, marker_counts = canonical_snapshot(marker_entries(after, TABLE))
     if marker_counts != {"chain": 3, "counter": 7, "rule": 7}:
         raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
+    # Exact readback now proved the owned shape. Persist it before any later
+    # foreign-state comparison can fail and hand control to always-cleanup.
+    installed = build_marker_installed(
+        ledger, intent, marker_sha, combined_sha, diagnostic
+    )
+    write_marker_installed(installed_path, installed)
     if post_foreign_sha != foreign_sha or post_foreign_counts != foreign_counts:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
-    ledger["markers_installed"] = True
-    ledger["marker_sha256"] = marker_sha
-    ledger["combined_sha256"] = combined_sha
-    write_ledger(ledger_path, ledger)
     rows = marker_diagnostic_state_rows(diagnostic)
     publish_marker_diagnostic_state(rows)
     if diagnostic["mismatch_class"] == "MATCHED_SHAPE":
@@ -1794,7 +2259,7 @@ def install_markers(
 
 
 def counters(ledger_path: Path) -> None:
-    ledger = read_ledger(ledger_path)
+    ledger = read_effective_ledger(ledger_path)
     if ledger.get("installed") is not True:
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     prefix, _ = privileged_prefix()
@@ -1810,7 +2275,7 @@ def counters(ledger_path: Path) -> None:
 
 
 def marker_counters(ledger_path: Path) -> None:
-    ledger = read_ledger(ledger_path)
+    ledger = read_effective_ledger(ledger_path)
     if ledger.get("installed") is not True or ledger.get("markers_installed") is not True:
         raise BoundaryError("FIREWALL_MARKER_LEDGER_INVALID")
     prefix, _ = privileged_prefix()
@@ -1834,6 +2299,7 @@ def remove(ledger_path: Path) -> None:
     selected = owned_entries(entries, TABLE)
     completion_path = restoration_completion_path(ledger_path)
     _reconcile_completion_stage(completion_path)
+    _reconcile_marker_evidence_stages(ledger_path)
     if not os.path.lexists(ledger_path):
         if selected:
             raise BoundaryError("FIREWALL_LEDGER_MISSING")
@@ -1842,6 +2308,8 @@ def remove(ledger_path: Path) -> None:
         completion = read_completion(completion_path)
         post_sha, post_counts = canonical_snapshot(entries, exclude_table=TABLE)
         validate_completion_against_current(completion, post_sha, post_counts)
+        validate_orphan_marker_evidence(ledger_path, completion)
+        retire_marker_evidence(ledger_path)
         _retire_private_path(
             completion_path, "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED"
         )
@@ -1875,7 +2343,9 @@ def remove(ledger_path: Path) -> None:
             ]
         )
         return
-    ledger = read_ledger(ledger_path)
+    ledger = reconcile_marker_state_for_cleanup(
+        ledger_path, read_ledger(ledger_path), entries
+    )
     if os.path.lexists(completion_path):
         if selected:
             raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
@@ -1883,6 +2353,7 @@ def remove(ledger_path: Path) -> None:
         post_sha, post_counts = canonical_snapshot(entries, exclude_table=TABLE)
         validate_completion_against_ledger(completion, ledger, post_sha, post_counts)
         _retire_private_path(ledger_path, "FIREWALL_LEDGER_RETIREMENT_FAILED")
+        retire_marker_evidence(ledger_path)
         _retire_private_path(
             completion_path, "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED"
         )
@@ -1922,11 +2393,10 @@ def remove(ledger_path: Path) -> None:
     if foreign_drift:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     if selected:
-        validate_owned(
-            entries,
-            TABLE,
-            markers_installed=bool(ledger["markers_installed"]),
-        )
+        if ledger.get("markers_installed") is True:
+            _validated_current_owned(entries, ledger)
+        else:
+            validate_owned(entries, TABLE, markers_installed=False)
         batch = f"delete table inet {TABLE}\n"
         checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
         if checked.returncode != 0:
@@ -1943,6 +2413,7 @@ def remove(ledger_path: Path) -> None:
     completion = build_completion(ledger, post_sha, post_counts)
     write_completion(completion_path, completion)
     _retire_private_path(ledger_path, "FIREWALL_LEDGER_RETIREMENT_FAILED")
+    retire_marker_evidence(ledger_path)
     emit(
         [
             ("firewall.rollback_idempotent", "bool", False),
