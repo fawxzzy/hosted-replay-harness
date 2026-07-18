@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def bash_executable() -> str:
+    git = shutil.which("git")
+    if git:
+        bundled = Path(git).resolve().parent.parent / "bin" / (
+            "bash.exe" if sys.platform == "win32" else "bash"
+        )
+        if bundled.is_file():
+            return str(bundled)
+    bash = shutil.which("bash")
+    assert bash, "bash is required for listener contract tests"
+    return bash
+
+
+BASH = bash_executable()
 
 
 def load_module(name: str, relative: str):
@@ -241,7 +259,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         boundary = 'EVENT_SINCE="$(date -u +%s)"'
         cli_start = 'db start >"$RAW/supabase-db-start.log"'
         self.assertIn(freeze, self.runner)
-        self.assertIn('ss -H -ltn "sport = :${port}"', self.runner)
+        self.assertIn('"$LISTENER_QUERY_BIN" -H -ltn "sport = :${port}"', self.runner)
         self.assertIn("pre_cli.packet_db_container_count", self.runner)
         self.assertIn("pre_cli.packet_db_volume_count", self.runner)
         self.assertIn("pre_cli.db_listener_count", self.runner)
@@ -249,6 +267,40 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn("native_listener_contract cleanup", self.runner)
         self.assertLess(self.runner.index(freeze), self.runner.index(boundary))
         self.assertLess(self.runner.index(boundary), self.runner.index(cli_start))
+
+    def test_listener_capture_is_sequential_and_fail_closed(self) -> None:
+        ordered = (
+            "COMMAND_PRECHECK_BEGIN",
+            "COMMAND_PRECHECK_COMPLETE",
+            "QUERY_BEGIN",
+            "QUERY_COMPLETE",
+            "NORMALIZATION_BEGIN",
+            "NORMALIZATION_COMPLETE",
+            "COUNT_BEGIN",
+            "COUNT_COMPLETE",
+            "HASH_BEGIN",
+            "HASH_COMPLETE",
+            "RECEIPT_BEGIN",
+            "RECEIPT_COMPLETE",
+        )
+        positions = [self.runner.index(value) for value in ordered]
+        self.assertEqual(positions, sorted(positions))
+        for code in (
+            "LISTENER_COMMAND_UNAVAILABLE",
+            "LISTENER_QUERY_NONZERO",
+            "LISTENER_NORMALIZATION_FAILED",
+            "LISTENER_COUNT_FAILED",
+            "LISTENER_HASH_FAILED",
+            "LISTENER_RECEIPT_WRITE_FAILED",
+            "LISTENER_UNEXPECTED_INTERRUPTION",
+        ):
+            self.assertIn(code, self.runner)
+        self.assertIn("listener_phase_is_unexpected", self.runner)
+        self.assertIn("listener_diagnostic.unexpected_interruption_phase", self.runner)
+        self.assertNotRegex(
+            self.runner,
+            r'local stage="\$1" port="\$2" snapshot=',
+        )
 
     def test_event_history_is_bounded_correlated_and_sanitized(self) -> None:
         classifier = 'python3 -B "$ROOT/scripts/classify_docker_events.py"'
@@ -308,6 +360,177 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner,
             r'(?s)elif \[\[ ! -f "\$RESULT_FILE" \]\]; then\s+if \[\[ "\$RESULT_PROFILE" == "direct-docker-port-v1" \]\]; then\s+record result.profile str direct-docker-port-v1',
         )
+
+
+class ListenerDiagnosticTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        start = runner.index("# BEGIN LISTENER_DIAGNOSTIC_FUNCTIONS")
+        end = runner.index("# END LISTENER_DIAGNOSTIC_FUNCTIONS")
+        cls.functions = runner[start:end].split("\n", 1)[1]
+
+    def run_capture(
+        self,
+        query_body: str = "exit 0\n",
+        *,
+        overrides: dict[str, str] | None = None,
+        record_fail_key: str = "",
+    ) -> tuple[dict[str, str], str]:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            raw = temp / "raw"
+            raw.mkdir()
+            state = temp / "state.tsv"
+            query = temp / "listener-query"
+            query.write_text("#!/usr/bin/env bash\n" + query_body, encoding="utf-8", newline="\n")
+            query.chmod(0o755)
+            commands = {
+                "LISTENER_QUERY_BIN": query.as_posix(),
+                "LISTENER_NORMALIZE_BIN": "awk",
+                "LISTENER_SORT_BIN": "sort",
+                "LISTENER_COUNT_BIN": "awk",
+                "LISTENER_HASH_BIN": "sha256sum",
+            }
+            commands.update(overrides or {})
+            assignments = "\n".join(
+                f"{key}={shlex.quote(value)}" for key, value in commands.items()
+            )
+            script = f"""
+set -u
+RAW={shlex.quote(raw.as_posix())}
+STATE_FILE={shlex.quote(state.as_posix())}
+RECORD_FAIL_KEY={shlex.quote(record_fail_key)}
+LISTENER_FAILURE_CODE=
+LISTENER_LAST_PHASE=
+LISTENER_SNAPSHOT_COUNT=
+LISTENER_SNAPSHOT_SHA256=
+{assignments}
+record() {{
+  local key kind value
+  key="$1"
+  kind="$2"
+  value="$3"
+  if [[ -n "$RECORD_FAIL_KEY" && "$key" == "$RECORD_FAIL_KEY" ]]; then
+    return 97
+  fi
+  printf '%s\\t%s\\t%s\\n' "$key" "$kind" "$value" >>"$STATE_FILE"
+}}
+{self.functions}
+capture_listener_snapshot pre_cli 56422
+capture_rc="$?"
+printf 'capture_rc=%s\\n' "$capture_rc"
+printf 'failure_code=%s\\n' "$LISTENER_FAILURE_CODE"
+printf 'last_phase=%s\\n' "$LISTENER_LAST_PHASE"
+printf 'count=%s\\n' "$LISTENER_SNAPSHOT_COUNT"
+printf 'sha256=%s\\n' "$LISTENER_SNAPSHOT_SHA256"
+"""
+            completed = subprocess.run(
+                [BASH, "-c", script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            observed = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+            return observed, state.read_text(encoding="utf-8") if state.exists() else ""
+
+    def test_empty_and_nonempty_snapshots_emit_only_count_and_digest(self) -> None:
+        empty, empty_state = self.run_capture()
+        self.assertEqual(empty["capture_rc"], "0")
+        self.assertEqual(empty["count"], "0")
+        self.assertRegex(empty["sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("PRE_CLI_PORT_56422_RECEIPT_COMPLETE", empty_state)
+
+        nonempty, state = self.run_capture(
+            "printf '%s\\n' "
+            "'LISTEN 0 4096 fixture-a:5432 peer-a:*' "
+            "'LISTEN 0 4096 fixture-a:5432 peer-a:*' "
+            "'LISTEN 0 4096 fixture-b:5432 peer-b:*'\n"
+        )
+        self.assertEqual(nonempty["capture_rc"], "0")
+        self.assertEqual(nonempty["count"], "2")
+        self.assertRegex(nonempty["sha256"], r"^[0-9a-f]{64}$")
+        for raw_tuple in ("fixture-a", "fixture-b", "peer-a", "peer-b"):
+            self.assertNotIn(raw_tuple, state)
+
+    def test_each_operation_failure_has_a_stable_code_and_phase(self) -> None:
+        cases = (
+            (
+                "command",
+                {"LISTENER_QUERY_BIN": "listener-command-does-not-exist"},
+                "",
+                "LISTENER_COMMAND_UNAVAILABLE",
+                "COMMAND_UNAVAILABLE",
+            ),
+            (
+                "query",
+                None,
+                "exit 7\n",
+                "LISTENER_QUERY_NONZERO",
+                "QUERY_FAILED",
+            ),
+            (
+                "normalization",
+                {"LISTENER_NORMALIZE_BIN": "false"},
+                "",
+                "LISTENER_NORMALIZATION_FAILED",
+                "NORMALIZATION_FAILED",
+            ),
+            (
+                "count",
+                {"LISTENER_COUNT_BIN": "false"},
+                "",
+                "LISTENER_COUNT_FAILED",
+                "COUNT_FAILED",
+            ),
+            (
+                "hash",
+                {"LISTENER_HASH_BIN": "false"},
+                "",
+                "LISTENER_HASH_FAILED",
+                "HASH_FAILED",
+            ),
+        )
+        for name, overrides, query_body, failure_code, phase_suffix in cases:
+            with self.subTest(name=name):
+                observed, state = self.run_capture(query_body, overrides=overrides)
+                self.assertEqual(observed["capture_rc"], "1")
+                self.assertEqual(observed["failure_code"], failure_code)
+                self.assertTrue(observed["last_phase"].endswith(phase_suffix))
+                self.assertNotRegex(state, r"fixture-[ab]|peer-[ab]")
+
+    def test_receipt_failure_is_distinct(self) -> None:
+        observed, _ = self.run_capture(
+            record_fail_key="listener_diagnostic.pre_cli.port_56422.normalized_count"
+        )
+        self.assertEqual(observed["capture_rc"], "1")
+        self.assertEqual(observed["failure_code"], "LISTENER_RECEIPT_WRITE_FAILED")
+        self.assertEqual(observed["last_phase"], "PRE_CLI_PORT_56422_RECEIPT_BEGIN")
+
+    def test_unexpected_interruption_phase_predicate_is_bounded(self) -> None:
+        script = f"""
+set -u
+record() {{ :; }}
+LISTENER_FAILURE_CODE=
+LISTENER_LAST_PHASE=
+{self.functions}
+for phase in PRE_CLI_BOUNDARY_BEGIN PRE_CLI_PORT_56422_QUERY_BEGIN PRE_CLI_PORT_5433_HASH_COMPLETE PRE_CLI_PREFLIGHT_COMPLETE POST_CLI_PORT_5432_QUERY_BEGIN; do
+  if listener_phase_is_unexpected "$phase"; then
+    printf '%s=true\\n' "$phase"
+  else
+    printf '%s=false\\n' "$phase"
+  fi
+done
+"""
+        completed = subprocess.run(
+            [BASH, "-c", script], check=True, capture_output=True, text=True
+        )
+        observed = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+        self.assertEqual(observed["PRE_CLI_BOUNDARY_BEGIN"], "true")
+        self.assertEqual(observed["PRE_CLI_PORT_56422_QUERY_BEGIN"], "true")
+        self.assertEqual(observed["PRE_CLI_PORT_5433_HASH_COMPLETE"], "true")
+        self.assertEqual(observed["PRE_CLI_PREFLIGHT_COMPLETE"], "false")
+        self.assertEqual(observed["POST_CLI_PORT_5432_QUERY_BEGIN"], "false")
 
 
 class ResultWriterTests(unittest.TestCase):

@@ -49,6 +49,13 @@ NATIVE_5432_COUNT=""
 NATIVE_5432_SHA256=""
 NATIVE_5433_COUNT=""
 NATIVE_5433_SHA256=""
+LISTENER_FAILURE_CODE=""
+LISTENER_LAST_PHASE=""
+LISTENER_QUERY_BIN="ss"
+LISTENER_NORMALIZE_BIN="awk"
+LISTENER_SORT_BIN="sort"
+LISTENER_COUNT_BIN="awk"
+LISTENER_HASH_BIN="sha256sum"
 SMOKE_PASSED=0
 FINALIZING=0
 
@@ -91,17 +98,158 @@ hash_identifier() {
   printf 'sha256:%s' "$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
 }
 
-capture_listener_snapshot() {
-  local stage="$1" port="$2" snapshot="$RAW/listeners-${stage}-${port}.txt"
-  ss -H -ltn "sport = :${port}" 2>"$RAW/listeners-${stage}-${port}.log" \
-    | awk 'NF{print $1 "|" $4 "|" $5}' \
-    | LC_ALL=C sort -u >"$snapshot" || return 1
-  LISTENER_SNAPSHOT_COUNT="$(awk 'NF' "$snapshot" | wc -l)"
-  LISTENER_SNAPSHOT_SHA256="$(sha256sum "$snapshot" | awk '{print $1}')"
+# BEGIN LISTENER_DIAGNOSTIC_FUNCTIONS
+listener_record() {
+  local key kind value
+  key="$1"
+  kind="$2"
+  value="$3"
+  if ! record "$key" "$kind" "$value"; then
+    LISTENER_FAILURE_CODE=LISTENER_RECEIPT_WRITE_FAILED
+    return 1
+  fi
 }
+
+listener_set_phase() {
+  local phase
+  phase="$1"
+  LISTENER_LAST_PHASE="$phase"
+  listener_record listener_diagnostic.last_phase str "$phase"
+}
+
+listener_fail() {
+  local code phase
+  code="$1"
+  phase="$2"
+  LISTENER_FAILURE_CODE="$code"
+  if ! listener_set_phase "$phase"; then
+    LISTENER_FAILURE_CODE=LISTENER_RECEIPT_WRITE_FAILED
+  fi
+  return 1
+}
+
+listener_phase_is_unexpected() {
+  local phase
+  phase="$1"
+  [[ "$phase" == PRE_CLI_* && "$phase" != "PRE_CLI_PREFLIGHT_COMPLETE" ]]
+}
+
+capture_listener_snapshot() {
+  local stage port prefix raw_file normalized_unsorted snapshot count_file hash_file
+  local listener_command precheck_rc query_rc normalize_rc count_rc hash_rc count_value hash_value ignored
+  stage="$1"
+  port="$2"
+  prefix="${stage^^}_PORT_${port}"
+  raw_file="$RAW/listeners-${stage}-${port}.raw"
+  normalized_unsorted="$RAW/listeners-${stage}-${port}.normalized-unsorted"
+  snapshot="$RAW/listeners-${stage}-${port}.normalized"
+  count_file="$RAW/listeners-${stage}-${port}.count"
+  hash_file="$RAW/listeners-${stage}-${port}.sha256"
+  LISTENER_FAILURE_CODE=LISTENER_UNEXPECTED_INTERRUPTION
+  LISTENER_LAST_PHASE="${prefix}_COMMAND_PRECHECK_BEGIN"
+
+  listener_set_phase "${prefix}_COMMAND_PRECHECK_BEGIN" || return 1
+  precheck_rc=0
+  for listener_command in \
+    "$LISTENER_QUERY_BIN" \
+    "$LISTENER_NORMALIZE_BIN" \
+    "$LISTENER_SORT_BIN" \
+    "$LISTENER_COUNT_BIN" \
+    "$LISTENER_HASH_BIN"; do
+    if ! command -v "$listener_command" >/dev/null 2>&1; then
+      precheck_rc=127
+      break
+    fi
+  done
+  listener_record "listener_diagnostic.${stage}.port_${port}.command_precheck_exit_code" int "$precheck_rc" || return 1
+  if [[ "$precheck_rc" != "0" ]]; then
+    listener_fail LISTENER_COMMAND_UNAVAILABLE "${prefix}_COMMAND_UNAVAILABLE"
+    return 1
+  fi
+  listener_set_phase "${prefix}_COMMAND_PRECHECK_COMPLETE" || return 1
+
+  listener_set_phase "${prefix}_QUERY_BEGIN" || return 1
+  if "$LISTENER_QUERY_BIN" -H -ltn "sport = :${port}" >"$raw_file" 2>"$RAW/listeners-${stage}-${port}.log"; then
+    query_rc=0
+  else
+    query_rc="$?"
+  fi
+  listener_record "listener_diagnostic.${stage}.port_${port}.query_exit_code" int "$query_rc" || return 1
+  if [[ "$query_rc" != "0" ]]; then
+    listener_fail LISTENER_QUERY_NONZERO "${prefix}_QUERY_FAILED"
+    return 1
+  fi
+  listener_set_phase "${prefix}_QUERY_COMPLETE" || return 1
+
+  listener_set_phase "${prefix}_NORMALIZATION_BEGIN" || return 1
+  if "$LISTENER_NORMALIZE_BIN" 'NF{print $1 "|" $4 "|" $5}' "$raw_file" >"$normalized_unsorted"; then
+    normalize_rc=0
+  else
+    normalize_rc="$?"
+  fi
+  if [[ "$normalize_rc" == "0" ]]; then
+    if LC_ALL=C "$LISTENER_SORT_BIN" -u "$normalized_unsorted" >"$snapshot"; then
+      normalize_rc=0
+    else
+      normalize_rc="$?"
+    fi
+  fi
+  listener_record "listener_diagnostic.${stage}.port_${port}.normalization_exit_code" int "$normalize_rc" || return 1
+  if [[ "$normalize_rc" != "0" ]]; then
+    listener_fail LISTENER_NORMALIZATION_FAILED "${prefix}_NORMALIZATION_FAILED"
+    return 1
+  fi
+  listener_set_phase "${prefix}_NORMALIZATION_COMPLETE" || return 1
+
+  listener_set_phase "${prefix}_COUNT_BEGIN" || return 1
+  if "$LISTENER_COUNT_BIN" 'NF{count++} END{print count+0}' "$snapshot" >"$count_file"; then
+    count_rc=0
+  else
+    count_rc="$?"
+  fi
+  count_value=""
+  if [[ "$count_rc" == "0" ]]; then
+    IFS= read -r count_value <"$count_file" || count_rc=65
+    [[ "$count_value" =~ ^[0-9]+$ ]] || count_rc=65
+  fi
+  listener_record "listener_diagnostic.${stage}.port_${port}.count_exit_code" int "$count_rc" || return 1
+  if [[ "$count_rc" != "0" ]]; then
+    listener_fail LISTENER_COUNT_FAILED "${prefix}_COUNT_FAILED"
+    return 1
+  fi
+  LISTENER_SNAPSHOT_COUNT="$count_value"
+  listener_set_phase "${prefix}_COUNT_COMPLETE" || return 1
+
+  listener_set_phase "${prefix}_HASH_BEGIN" || return 1
+  if "$LISTENER_HASH_BIN" "$snapshot" >"$hash_file"; then
+    hash_rc=0
+  else
+    hash_rc="$?"
+  fi
+  hash_value=""
+  ignored=""
+  if [[ "$hash_rc" == "0" ]]; then
+    IFS=' ' read -r hash_value ignored <"$hash_file" || hash_rc=65
+    [[ "$hash_value" =~ ^[0-9a-f]{64}$ ]] || hash_rc=65
+  fi
+  listener_record "listener_diagnostic.${stage}.port_${port}.hash_exit_code" int "$hash_rc" || return 1
+  if [[ "$hash_rc" != "0" ]]; then
+    listener_fail LISTENER_HASH_FAILED "${prefix}_HASH_FAILED"
+    return 1
+  fi
+  LISTENER_SNAPSHOT_SHA256="$hash_value"
+  listener_set_phase "${prefix}_HASH_COMPLETE" || return 1
+
+  listener_set_phase "${prefix}_RECEIPT_BEGIN" || return 1
+  listener_record "listener_diagnostic.${stage}.port_${port}.normalized_count" int "$LISTENER_SNAPSHOT_COUNT" || return 1
+  listener_record "listener_diagnostic.${stage}.port_${port}.normalized_sha256" str "$LISTENER_SNAPSHOT_SHA256" || return 1
+  listener_set_phase "${prefix}_RECEIPT_COMPLETE" || return 1
+}
+# END LISTENER_DIAGNOSTIC_FUNCTIONS
 
 freeze_precli_objects_and_listeners() {
   local container_count volume_count
+  listener_set_phase PRE_CLI_BOUNDARY_BEGIN || block LISTENER_RECEIPT_WRITE_FAILED PRE_CLI_BOUNDARY_BEGIN
   container_count="$({
     docker ps -aq --no-trunc --filter "name=^/${DB_NAME}$" 2>/dev/null
     docker ps -aq --no-trunc --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
@@ -115,40 +263,49 @@ freeze_precli_objects_and_listeners() {
   [[ "$container_count" == "0" ]] || block PRESTART_DB_CONTAINER_PRESENT
   [[ "$volume_count" == "0" ]] || block PRESTART_DB_VOLUME_PRESENT
 
-  capture_listener_snapshot pre_cli "$DB_PORT" || block LISTENER_INSPECTION_FAILED
-  record pre_cli.db_listener_count int "$LISTENER_SNAPSHOT_COUNT"
+  capture_listener_snapshot pre_cli "$DB_PORT" || block "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" "${LISTENER_LAST_PHASE:-PRE_CLI_PORT_56422_UNKNOWN}"
+  listener_record pre_cli.db_listener_count int "$LISTENER_SNAPSHOT_COUNT" || block LISTENER_RECEIPT_WRITE_FAILED "$LISTENER_LAST_PHASE"
   [[ "$LISTENER_SNAPSHOT_COUNT" == "0" ]] || block PRESTART_DB_PORT_LISTENER_PRESENT
 
-  capture_listener_snapshot pre_cli 5432 || block LISTENER_INSPECTION_FAILED
+  capture_listener_snapshot pre_cli 5432 || block "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" "${LISTENER_LAST_PHASE:-PRE_CLI_PORT_5432_UNKNOWN}"
   NATIVE_5432_COUNT="$LISTENER_SNAPSHOT_COUNT"
   NATIVE_5432_SHA256="$LISTENER_SNAPSHOT_SHA256"
-  record native_listeners.port_5432.pre_cli_count int "$NATIVE_5432_COUNT"
-  record native_listeners.port_5432.pre_cli_sha256 str "$NATIVE_5432_SHA256"
+  listener_record native_listeners.port_5432.pre_cli_count int "$NATIVE_5432_COUNT" || block LISTENER_RECEIPT_WRITE_FAILED "$LISTENER_LAST_PHASE"
+  listener_record native_listeners.port_5432.pre_cli_sha256 str "$NATIVE_5432_SHA256" || block LISTENER_RECEIPT_WRITE_FAILED "$LISTENER_LAST_PHASE"
 
-  capture_listener_snapshot pre_cli 5433 || block LISTENER_INSPECTION_FAILED
+  capture_listener_snapshot pre_cli 5433 || block "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" "${LISTENER_LAST_PHASE:-PRE_CLI_PORT_5433_UNKNOWN}"
   NATIVE_5433_COUNT="$LISTENER_SNAPSHOT_COUNT"
   NATIVE_5433_SHA256="$LISTENER_SNAPSHOT_SHA256"
-  record native_listeners.port_5433.pre_cli_count int "$NATIVE_5433_COUNT"
-  record native_listeners.port_5433.pre_cli_sha256 str "$NATIVE_5433_SHA256"
+  listener_record native_listeners.port_5433.pre_cli_count int "$NATIVE_5433_COUNT" || block LISTENER_RECEIPT_WRITE_FAILED "$LISTENER_LAST_PHASE"
+  listener_record native_listeners.port_5433.pre_cli_sha256 str "$NATIVE_5433_SHA256" || block LISTENER_RECEIPT_WRITE_FAILED "$LISTENER_LAST_PHASE"
+  listener_set_phase PRE_CLI_PREFLIGHT_COMPLETE || block LISTENER_RECEIPT_WRITE_FAILED PRE_CLI_PREFLIGHT_COMPLETE
 }
 
 native_listener_contract() {
-  local stage="$1" matched=true
+  local stage matched
+  stage="$1"
+  matched=true
   [[ -n "$NATIVE_5432_COUNT" && -n "$NATIVE_5433_COUNT" ]] || return 0
 
-  capture_listener_snapshot "$stage" 5432 || return 1
-  record "native_listeners.port_5432.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT"
-  record "native_listeners.port_5432.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256"
+  if ! capture_listener_snapshot "$stage" 5432; then
+    record "native_listeners.${stage}_failure_code" str "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" || true
+    return 1
+  fi
+  listener_record "native_listeners.port_5432.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT" || return 1
+  listener_record "native_listeners.port_5432.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256" || return 1
   [[ "$LISTENER_SNAPSHOT_COUNT" == "$NATIVE_5432_COUNT" && "$LISTENER_SNAPSHOT_SHA256" == "$NATIVE_5432_SHA256" ]] \
     || matched=false
 
-  capture_listener_snapshot "$stage" 5433 || return 1
-  record "native_listeners.port_5433.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT"
-  record "native_listeners.port_5433.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256"
+  if ! capture_listener_snapshot "$stage" 5433; then
+    record "native_listeners.${stage}_failure_code" str "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" || true
+    return 1
+  fi
+  listener_record "native_listeners.port_5433.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT" || return 1
+  listener_record "native_listeners.port_5433.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256" || return 1
   [[ "$LISTENER_SNAPSHOT_COUNT" == "$NATIVE_5433_COUNT" && "$LISTENER_SNAPSHOT_SHA256" == "$NATIVE_5433_SHA256" ]] \
     || matched=false
 
-  record "native_listeners.${stage}_unchanged" bool "$matched"
+  listener_record "native_listeners.${stage}_unchanged" bool "$matched" || return 1
   [[ "$matched" == "true" ]]
 }
 
@@ -234,6 +391,10 @@ current_failure_code() {
   awk -F $'\t' '$1=="failure.code"{code=$3} END{print code}' "$STATE_FILE" 2>/dev/null
 }
 
+current_listener_phase() {
+  awk -F $'\t' '$1=="listener_diagnostic.last_phase"{phase=$3} END{print phase}' "$STATE_FILE" 2>/dev/null
+}
+
 stop_watcher() {
   if [[ -n "$WATCH_PID" ]] && kill -0 "$WATCH_PID" 2>/dev/null; then
     kill "$WATCH_PID" 2>/dev/null || true
@@ -307,7 +468,13 @@ cleanup_exact() {
   volume_count="$count"
   count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.networks_remaining int "$count"
-  listener_count="$(ss -H -ltn "sport = :${DB_PORT}" 2>/dev/null | awk 'NF' | wc -l)"
+  if capture_listener_snapshot cleanup "$DB_PORT"; then
+    listener_count="$LISTENER_SNAPSHOT_COUNT"
+  else
+    listener_count=-1
+    record cleanup.listener_failure_code str "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" || true
+    record cleanup.listener_failure_phase str "${LISTENER_LAST_PHASE:-CLEANUP_PORT_56422_UNKNOWN}" || true
+  fi
   record cleanup.listeners_remaining int "$listener_count"
 
   [[ "$container_count" == "0" ]] || return 1
@@ -320,10 +487,21 @@ cleanup_exact() {
 }
 
 finalize() {
-  local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1 primary_failure
+  local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1 primary_failure listener_phase
   [[ "$FINALIZING" == "0" ]] || return
   FINALIZING=1
   set +e
+
+  primary_failure="$(current_failure_code)"
+  listener_phase="$(current_listener_phase)"
+  if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+    if listener_phase_is_unexpected "$listener_phase"; then
+      record status str BLOCKED
+      record failure.code str LISTENER_UNEXPECTED_INTERRUPTION
+      record failure.detail str "$listener_phase"
+      record listener_diagnostic.unexpected_interruption_phase str "$listener_phase"
+    fi
+  fi
 
   if [[ "$MODE" == "run" && -n "$NETWORK_ID" ]]; then
     network_code="$(network_contract_code active)" || true
@@ -739,7 +917,8 @@ fi
 
 assert_frozen_network post_cli active
 record network.correlated_count_after_cli int 1
-native_listener_contract post_cli || block NATIVE_LISTENER_DRIFT
+native_listener_contract post_cli \
+  || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"
 
 EVENT_UNTIL="$(( $(date -u +%s) + 1 ))"
 timeout --signal=TERM --kill-after=5s 20s docker events \
