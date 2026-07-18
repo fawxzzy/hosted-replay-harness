@@ -6,35 +6,44 @@
 
 No application repository, application migration, source data, Auth row, provider API, Supabase remote command, production environment, secret, or inherited workflow environment is in scope.
 
-## Current status-only diagnostic
+## Current root-initialization diagnostic
 
-The manual workflow's fixed default mode is `status-phase-split-v1`. It invokes only the pinned CLI's `supabase status --ignore-health-check` command after the preserved runner, image, network, canary, listener, and empty-object gates. It never invokes `db start`, `db reset`, migrations, SQL, GoTrue, or any application/provider path. A clean status exit proves no replay admission.
+The manual workflow's fixed default mode is `root-init-split-v1`. It invokes exactly `supabase telemetry status` from the pinned v2.109.1 binary. It never invokes local `status`, `start`, `stop`, `db start`, `db reset`, login/link, remote flags, migrations, SQL, GoTrue, an application path, image acquisition, or Docker lifecycle mutation. The workflow-selected `run` path terminates before the preserved inactive image/network/direct-diagnostic code.
 
-Only the status child receives the packet-local `DOCKER_HOST`. The observer permits `GET` and `HEAD` only. Any other method is counted as one write attempt, stopped before its bytes reach the Docker daemon, and classified `DOCKER_API_WRITE_ATTEMPT_OBSERVED`. Read-only traffic remains byte-transparent. Raw status output may contain generated local keys, so it is created under process umask `077`, reduced only to command exit, byte/line counts, and SHA-256, and deleted before any phase decision.
+The immutable source contract is finite:
 
-Zero observer connections and requests maps to `SHARED_INIT_BLOCKED_BEFORE_DOCKER_API`. One or more successful, fully answered `CONTAINER_LIST` requests, optionally preceded by read-only API negotiation, maps to `DB_START_SPECIFIC_PRE_API_BLOCKER`. Any other phase, non-2xx response, incomplete response, unknown path, write attempt, object event, or listener/network drift blocks without claiming a phase split.
+- `apps/cli-go/cmd/root.go` defines the root `PersistentPreRunE` that loads the profile, resolves the current project working directory, parses database-related flags when present, prepares local telemetry context, and initializes Sentry.
+- `apps/cli-go/cmd/telemetry.go` defines the `telemetry status` leaf with `RunE`; neither that file nor `internal/telemetry` calls `flags.LoadConfig` or Docker.
+- `apps/cli-go/go.mod` pins Cobra v1.10.2. Cobra executes the first inherited `PersistentPreRunE` before a runnable leaf's `RunE`, so this leaf provably crosses root persistent initialization. Help and version shortcuts are not used.
+- `DO_NOT_TRACK=1` and `SUPABASE_TELEMETRY_DISABLED=1` prevent telemetry capture. `SUPABASE_HOME` is packet-local. A fresh packet-local `supabase/.temp/cli-latest` is pre-seeded with the pinned version so the post-command upgrade check reads locally instead of contacting GitHub.
 
-## Ordered status-diagnostic gates
+Only the root-init child receives packet-local `HOME`, `SUPABASE_HOME`, all four XDG roots, `TMPDIR`, and `DOCKER_HOST`; its environment is rebuilt with `env -i`. The Docker observer permits `GET` and `HEAD` only, but this command must produce zero connections and requests. Any request, write method, forwarding/parser error, packet object, or listener delta is `BLOCKED_UNKNOWN` or a narrower fail-closed boundary code.
 
-1. Verify Ubuntu 24.04, x86_64, Docker client/server `>=28`, at least 8 GiB actual RAM, and more than 10 GiB free disk. The exact hosted image is retained in GitHub's **Set up job** log.
-2. Download the one pinned CLI asset and verify SHA-256 before extraction.
-3. Pull exactly two `linux/amd64` Docker digest references, verify platform/RepoDigests/image IDs, and retag them to the CLI's public-ECR lookup names.
-4. Reject the fixed subnet if it overlaps a host link route or existing Docker network.
-5. Create one internal IPv4 bridge with IPv6 disabled, loopback default binding, isolated IPv4 gateway mode, fixed subnet, and packet labels.
-6. Prove the isolated bridge has no host IPv4 address. On the exact network, prove no default route, failed external DNS, failed `1.1.1.1:443`, failed metadata access, and failed host/gateway reachability.
-7. Freeze the unique network name to its exact Docker engine ID, then pass that name to the pinned CLI because v2.109.1 treats `--network-id` as a user-defined network name. Re-prove the name-to-ID mapping, labels, options, subnet, scope, and zero prestart endpoints immediately before CLI start.
-8. Immediately before CLI execution, require zero exact database containers, zero exact database volumes, and no listener on 56422. Capture each listener snapshot as explicit command-precheck, query, normalization, count, hash, and sanitized-record operations, with stable begin/complete phases around every operation. Freeze only operation exit codes, normalized counts, and SHA-256 of normalized listener tuples on native ports 5432 and 5433; never connect to, stop, or otherwise mutate those listeners. Require the native fingerprints to remain unchanged after CLI exit and after cleanup.
-9. Start the existing container lifecycle watcher and the permissions-restricted Docker API observer, then invoke exactly one status-only child. Require zero write attempts and allow only API negotiation plus `CONTAINER_LIST` read phases.
-10. Freeze event history after the last empty-network proof. After status exit, require zero project-labelled container create/start/die/destroy events, zero project-labelled volume-create events, zero exact-network connect events, and zero watcher observations. Raw events remain transient.
-11. Re-prove the frozen network and native listener fingerprints, then remove only correlated resources and scratch. Require zero correlated containers, volumes, networks, and no listener on 56422.
+Raw CLI output is created under umask `077`, reduced to exit code, byte/line counts, SHA-256, and two exact fingerprint-match booleans, then deleted. The child starts inside a packet-local project-root sentinel so root initialization does not emit a machine-specific workdir path. Scratch files are reduced to the closed classes `PROJECT_ROOT_SENTINEL`, `CLI_UPDATE_CACHE`, and `TELEMETRY_STATE`, per-class counts, and a canonical digest. Any other file class is `ROOT_INIT_STATE_ESCAPE`. All scratch is deleted before the terminal classification.
 
-## Inactive containment-admission gates
+## Ordered root-init gates
 
-Database/GoTrue create/start, loopback publication, extension availability, Auth schema, pg_net, and pg_cron checks remain preserved below the terminal status-phase decision in the runner, but are unreachable in `status-phase-split-v1`. They are not evidence from this packet and cannot be used to admit application replay.
+1. Verify Ubuntu 24.04, x86_64, Docker client/server `>=28`, at least 8 GiB actual RAM, and more than 10 GiB free disk.
+2. Download the one pinned CLI asset, verify its SHA-256, extract it, and verify the frozen binary SHA-256. The CLI `--version` shortcut is not executed because the pinned source makes it perform an external upgrade lookup.
+3. Require zero packet-labelled/project-labelled containers, volumes, and networks; no listener on 56422; and frozen count/digest fingerprints for native listeners 5432 and 5433.
+4. Create only permissions-restricted packet scratch and pre-seed only the local upgrade-cache class.
+5. Start the read-only Docker API observer, then invoke exactly one root-only child with all supported mutable locations redirected and telemetry endpoint delivery disabled.
+6. Stop the observer deterministically. Require zero connections, requests, responses, write attempts, forwarding errors, and parser errors.
+7. Sanitize and delete raw output, audit the closed scratch classes, and delete all root-init scratch.
+8. Re-prove zero packet objects, no 56422 listener, and unchanged native listener fingerprints.
+9. The explicit `if: always()` cleanup step proves zero correlated containers, volumes, networks, listeners, bytecode, and runtime scratch before the sanitized artifact is retained.
+
+## Terminal split
+
+- Exit `0` with the exact source-derived `Telemetry is enabled.` fingerprint and zero Docker API traffic records `diagnostic.classification=ROOT_INIT_PASS` and terminates with `LOAD_CONFIG_BLOCKER`. Root persistent initialization passed; the remaining shared failure boundary is `flags.LoadConfig`.
+- Exit `1` with the exact prior `1,078`-byte, `23`-line, `d3a19bac...` fingerprint and zero Docker API traffic terminates `ROOT_PERSISTENT_INIT_BLOCKER`.
+- Any other output, command exit, Docker request, state escape, object/listener drift, observer failure, or cleanup ambiguity terminates `BLOCKED_UNKNOWN` or its narrower stable prerequisite code.
+
+These are diagnostic classifications only. None admits containment, database startup, GoTrue migration, or application replay.
 
 ## Fail-closed result
 
-Every failure maps to a stable uppercase code, and later pre-cleanup or cleanup evidence cannot overwrite the first explicit failure code. A reachable daemon-reported packet gateway is `PACKET_GATEWAY_REACHABLE`; a non-unique or drifting network name-to-ID mapping is `NETWORK_NAME_ID_MAPPING_FAILED`. The prior database-start fingerprint remains historical evidence only and is not reproduced because this packet cannot invoke database start.
+Every failure maps to a stable uppercase code, and cleanup evidence cannot overwrite the first explicit failure code. The prior database-start/status fingerprint is admitted only as the exact root-persistent comparison fingerprint; the packet cannot invoke either command that originally produced it.
 
 The sanitizer's output schema is closed: only fixed dotted keys, scalar types, uppercase enums, booleans, nonnegative integers, and a 64-character lowercase SHA-256 are admitted. Credential-bearing URLs, JWTs, bearer tokens, password/secret/token/key assignments, connection strings, private keys, environment dumps, SQL, Auth rows, PII, and arbitrary text can never be values in the sanitized state. Secret-shaped input is counted only as a boolean and line count; its content is never retained.
 
@@ -44,7 +53,7 @@ The observer receipt contains only its fixed schema and classification, connecti
 
 Listener diagnostics map unavailable tooling, a nonzero query, normalization failure, count failure, hash failure, and sanitized receipt failure to `LISTENER_COMMAND_UNAVAILABLE`, `LISTENER_QUERY_NONZERO`, `LISTENER_NORMALIZATION_FAILED`, `LISTENER_COUNT_FAILED`, `LISTENER_HASH_FAILED`, and `LISTENER_RECEIPT_WRITE_FAILED`. An otherwise preterminal exit between `PRE_CLI_BOUNDARY_BEGIN` and `PRE_CLI_PREFLIGHT_COMPLETE` maps to `LISTENER_UNEXPECTED_INTERRUPTION` with only the last stable phase. Raw listener output and normalized tuples remain transient and are deleted with scratch; addresses, process details, and tuples never enter logs, state, receipts, or artifacts. Local initialization is split defensively without attributing the prior interruption to initialization behavior.
 
-For this status-only packet, any lifecycle or event-history observation is `STATUS_DOCKER_MUTATION_OBSERVED` or `STATUS_CONTAINER_LIFECYCLE_OBSERVED`; no create/start identity is accepted. Image or frozen-network correlation failure stops independently. Watcher shutdown is bounded to five seconds, and each exact container, volume, and network removal is independently bounded to 20 seconds. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output remains transient and is never uploaded. A failed gate does not cause a broader network, another runner label, an unpinned image, a remote Supabase path, or an application replay.
+For this root-init packet, any Docker API request or correlated object/listener delta is terminal; no create/start identity is accepted. Observer shutdown is bounded to five seconds, and each exact container, volume, and network removal remains independently bounded to 20 seconds. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output and state remain transient and are never uploaded. A failed gate does not cause image acquisition, a network mutation, a remote Supabase path, or an application replay.
 
 ## Network-name compatibility contract
 

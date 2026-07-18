@@ -30,6 +30,15 @@ RUNTIME="$ROOT/.smoke-runtime"
 RUNTIME_HOME="$RUNTIME/home"
 RAW="$RUNTIME/raw"
 PROJECT_DIR="$RUNTIME/project"
+ROOT_INIT_DIR="$RUNTIME/root-init"
+ROOT_INIT_WORKDIR="$ROOT_INIT_DIR/workdir"
+ROOT_INIT_HOME="$ROOT_INIT_DIR/home"
+ROOT_INIT_SUPABASE_HOME="$ROOT_INIT_DIR/supabase-home"
+ROOT_INIT_XDG_CONFIG="$ROOT_INIT_DIR/xdg-config"
+ROOT_INIT_XDG_CACHE="$ROOT_INIT_DIR/xdg-cache"
+ROOT_INIT_XDG_DATA="$ROOT_INIT_DIR/xdg-data"
+ROOT_INIT_XDG_STATE="$ROOT_INIT_DIR/xdg-state"
+ROOT_INIT_TMP="$ROOT_INIT_DIR/tmp"
 AUDIT_FILE="$RUNTIME/container-audit.jsonl"
 VIOLATION_FILE="$RUNTIME/container-violations.jsonl"
 WATCH_READY="$RUNTIME/watcher.ready"
@@ -66,8 +75,15 @@ FINALIZING=0
 CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
 CLI_SHA="36d87b7fe6b4bcfe89ac47a4354e526cff22480224de426d7b370f6934556976"
+CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"
 CLI_ASSET="supabase_2.109.1_linux_amd64.tar.gz"
 CLI_URL="https://github.com/supabase/cli/releases/download/v2.109.1/${CLI_ASSET}"
+ROOT_INIT_EXPECTED_BYTES="22"
+ROOT_INIT_EXPECTED_LINES="1"
+ROOT_INIT_EXPECTED_SHA="5a73be3c00c7ce7af784eb10f0b9c48e80db0c7ed02ff12bff98734f5bcbc968"
+PRIOR_SHARED_FAILURE_BYTES="1078"
+PRIOR_SHARED_FAILURE_LINES="23"
+PRIOR_SHARED_FAILURE_SHA="d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31"
 POSTGRES_TAG="supabase/postgres:17.6.1.143"
 POSTGRES_DIGEST="sha256:b021e96054128399f84f24e39d29c21ee7c7169515e5d9e4e99ff15d5043d1d8"
 POSTGRES_PULL="supabase/postgres@${POSTGRES_DIGEST}"
@@ -688,6 +704,241 @@ run_direct_port_probe() {
   SMOKE_PASSED=1
 }
 
+packet_object_counts() {
+  local stage container_count volume_count network_count
+  stage="$1"
+  container_count="$({
+    docker ps -aq --no-trunc --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null
+    docker ps -aq --no-trunc --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u | wc -l)"
+  volume_count="$({
+    docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null
+    docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u | wc -l)"
+  network_count="$({
+    docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null
+    docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u | wc -l)"
+  record "root_init.objects.${stage}.containers" int "$container_count"
+  record "root_init.objects.${stage}.volumes" int "$volume_count"
+  record "root_init.objects.${stage}.networks" int "$network_count"
+  [[ "$container_count" == "0" && "$volume_count" == "0" && "$network_count" == "0" ]]
+}
+
+prepare_root_init_scratch() {
+  [[ ! -e "$ROOT_INIT_DIR" ]] || block ROOT_INIT_SCRATCH_PREEXISTING
+  install -d -m 0700 \
+    "$ROOT_INIT_WORKDIR/supabase/.temp" \
+    "$ROOT_INIT_HOME" \
+    "$ROOT_INIT_SUPABASE_HOME" \
+    "$ROOT_INIT_XDG_CONFIG" \
+    "$ROOT_INIT_XDG_CACHE" \
+    "$ROOT_INIT_XDG_DATA" \
+    "$ROOT_INIT_XDG_STATE" \
+    "$ROOT_INIT_TMP"
+  : >"$ROOT_INIT_WORKDIR/supabase/config.toml"
+  printf 'v%s' "$CLI_VERSION" >"$ROOT_INIT_WORKDIR/supabase/.temp/cli-latest"
+  chmod 0600 "$ROOT_INIT_WORKDIR/supabase/config.toml"
+  chmod 0600 "$ROOT_INIT_WORKDIR/supabase/.temp/cli-latest"
+  record root_init.scratch.redirected_location_count int 8
+  record root_init.scratch.upgrade_cache_preseeded bool true
+}
+
+audit_root_init_scratch() {
+  local manifest="$RAW/root-init-scratch-manifest.tsv"
+  local file relative class digest update_count=0 telemetry_count=0 sentinel_count=0 file_count=0
+  : >"$manifest"
+  while IFS= read -r -d '' file; do
+    relative="${file#"$ROOT_INIT_DIR"/}"
+    case "$relative" in
+      workdir/supabase/.temp/cli-latest)
+        class=CLI_UPDATE_CACHE
+        update_count="$((update_count + 1))"
+        ;;
+      supabase-home/telemetry.json)
+        class=TELEMETRY_STATE
+        telemetry_count="$((telemetry_count + 1))"
+        ;;
+      workdir/supabase/config.toml)
+        class=PROJECT_ROOT_SENTINEL
+        sentinel_count="$((sentinel_count + 1))"
+        ;;
+      *) block ROOT_INIT_STATE_ESCAPE "unexpected-scratch-class" ;;
+    esac
+    digest="$(sha256sum "$file" | awk '{print $1}')"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
+    printf '%s\t%s\n' "$class" "$digest" >>"$manifest"
+    file_count="$((file_count + 1))"
+  done < <(find "$ROOT_INIT_DIR" -xdev -type f -print0)
+  LC_ALL=C sort -o "$manifest" "$manifest"
+  record root_init.scratch.file_count int "$file_count"
+  record root_init.scratch.class_counts.cli_update_cache int "$update_count"
+  record root_init.scratch.class_counts.telemetry_state int "$telemetry_count"
+  record root_init.scratch.class_counts.project_root_sentinel int "$sentinel_count"
+  record root_init.scratch.class_digest_sha256 str "$(sha256sum "$manifest" | awk '{print $1}')"
+  [[ "$update_count" == "1" ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
+  [[ "$sentinel_count" == "1" ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
+  (( telemetry_count <= 1 )) || block ROOT_INIT_SCRATCH_AUDIT_FAILED
+}
+
+# BEGIN ROOT_INIT_CLASSIFIER_FUNCTION
+classify_root_init_result() {
+  local cli_rc="$1" raw_bytes="$2" raw_lines="$3" raw_sha="$4"
+  if [[ "$cli_rc" == "0" \
+    && "$raw_bytes" == "$ROOT_INIT_EXPECTED_BYTES" \
+    && "$raw_lines" == "$ROOT_INIT_EXPECTED_LINES" \
+    && "$raw_sha" == "$ROOT_INIT_EXPECTED_SHA" ]]; then
+    printf 'LOAD_CONFIG_BLOCKER\n'
+    return 0
+  fi
+  if [[ "$cli_rc" == "1" \
+    && "$raw_bytes" == "$PRIOR_SHARED_FAILURE_BYTES" \
+    && "$raw_lines" == "$PRIOR_SHARED_FAILURE_LINES" \
+    && "$raw_sha" == "$PRIOR_SHARED_FAILURE_SHA" ]]; then
+    printf 'ROOT_PERSISTENT_INIT_BLOCKER\n'
+    return 0
+  fi
+  printf 'BLOCKED_UNKNOWN\n'
+}
+# END ROOT_INIT_CLASSIFIER_FUNCTION
+
+run_root_init_split() {
+  local cli_rc observer_rc=0 observer_state_present=true observer_classification
+  local raw_bytes raw_lines raw_sha request_count response_count write_count forwarding_errors parser_errors
+  local expected_output=false prior_output=false root_init_classification
+
+  prepare_root_init_scratch
+  packet_object_counts pre_cli || block ROOT_INIT_PREEXISTING_OBJECT
+  freeze_precli_objects_and_listeners
+  EVENT_SINCE="$(date -u +%s)"
+  record docker_event_history.boundary_frozen bool true
+
+  [[ ! -e "$DOCKER_API_SOCKET" && ! -e "$DOCKER_API_READY" && ! -e "$DOCKER_API_BOUNDARY_STATE_FILE" ]] \
+    || block DOCKER_API_OBSERVER_PREEXISTING_STATE
+  python3 -B "$ROOT/scripts/docker_api_boundary.py" \
+    --listen "$DOCKER_API_SOCKET" \
+    --upstream /var/run/docker.sock \
+    --state "$DOCKER_API_BOUNDARY_STATE_FILE" \
+    --ready "$DOCKER_API_READY" \
+    >"$RAW/docker-api-observer.log" 2>&1 &
+  DOCKER_API_OBSERVER_PID="$!"
+  for _ in $(seq 1 50); do
+    [[ -S "$DOCKER_API_SOCKET" && -f "$DOCKER_API_READY" ]] && break
+    kill -0 "$DOCKER_API_OBSERVER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -S "$DOCKER_API_SOCKET" && -f "$DOCKER_API_READY" ]] || block DOCKER_API_OBSERVER_NOT_READY
+  [[ "$(stat -c '%a' "$DOCKER_API_SOCKET")" == "600" ]] || block DOCKER_API_OBSERVER_SOCKET_PERMISSIONS
+  [[ "$(stat -c '%a' "$DOCKER_API_READY")" == "600" ]] || block DOCKER_API_OBSERVER_READY_PERMISSIONS
+
+  set +e
+  (
+    cd -- "$ROOT_INIT_WORKDIR"
+    env -i \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      HOME="$ROOT_INIT_HOME" \
+      SUPABASE_HOME="$ROOT_INIT_SUPABASE_HOME" \
+      XDG_CONFIG_HOME="$ROOT_INIT_XDG_CONFIG" \
+      XDG_CACHE_HOME="$ROOT_INIT_XDG_CACHE" \
+      XDG_DATA_HOME="$ROOT_INIT_XDG_DATA" \
+      XDG_STATE_HOME="$ROOT_INIT_XDG_STATE" \
+      TMPDIR="$ROOT_INIT_TMP" \
+      DO_NOT_TRACK=1 \
+      SUPABASE_TELEMETRY_DISABLED=1 \
+      CI=1 \
+      DOCKER_HOST="unix://$DOCKER_API_SOCKET" \
+      timeout --signal=TERM --kill-after=10s 120s "$RUNTIME/bin/supabase" \
+      telemetry status
+  ) >"$RAW/supabase-root-init.log" 2>&1
+  cli_rc="$?"
+  set -e
+
+  observer_rc=0
+  stop_docker_api_observer || observer_rc="$?"
+  if [[ ! -f "$DOCKER_API_BOUNDARY_STATE_FILE" ]]; then
+    observer_state_present=false
+    observer_classification=OBSERVER_STATE_MISSING
+  else
+    cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"
+    observer_classification="$(awk -F '\t' '$1=="docker_api_boundary.classification"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  fi
+  record docker_api_boundary.observer_exit_code int "$observer_rc"
+  record docker_api_boundary.state_present bool "$observer_state_present"
+
+  raw_bytes="$(wc -c <"$RAW/supabase-root-init.log" | tr -d ' ')"
+  raw_lines="$(wc -l <"$RAW/supabase-root-init.log" | tr -d ' ')"
+  raw_sha="$(sha256sum "$RAW/supabase-root-init.log" | awk '{print $1}')"
+  [[ "$raw_bytes" =~ ^[0-9]+$ && "$raw_lines" =~ ^[0-9]+$ && "$raw_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || block ROOT_INIT_OUTPUT_SANITIZER_FAILED
+  [[ "$raw_bytes" == "$ROOT_INIT_EXPECTED_BYTES" \
+    && "$raw_lines" == "$ROOT_INIT_EXPECTED_LINES" \
+    && "$raw_sha" == "$ROOT_INIT_EXPECTED_SHA" ]] && expected_output=true
+  [[ "$raw_bytes" == "$PRIOR_SHARED_FAILURE_BYTES" \
+    && "$raw_lines" == "$PRIOR_SHARED_FAILURE_LINES" \
+    && "$raw_sha" == "$PRIOR_SHARED_FAILURE_SHA" ]] && prior_output=true
+  record supabase_cli.root_init.exit_code int "$cli_rc"
+  record supabase_cli.root_init.raw_byte_count int "$raw_bytes"
+  record supabase_cli.root_init.raw_line_count int "$raw_lines"
+  record supabase_cli.root_init.raw_sha256 str "$raw_sha"
+  record supabase_cli.root_init.expected_output_match bool "$expected_output"
+  record supabase_cli.root_init.prior_fingerprint_match bool "$prior_output"
+  rm -f -- "$RAW/supabase-root-init.log" || block ROOT_INIT_RAW_LOG_DELETE_FAILED
+  [[ ! -e "$RAW/supabase-root-init.log" ]] || block ROOT_INIT_RAW_LOG_DELETE_FAILED
+  record supabase_cli.root_init.raw_deleted bool true
+
+  audit_root_init_scratch
+  case "$ROOT_INIT_DIR" in
+    "$RUNTIME"/root-init) rm -rf -- "$ROOT_INIT_DIR" || block ROOT_INIT_SCRATCH_DELETE_FAILED ;;
+    *) block ROOT_INIT_SCRATCH_DELETE_FAILED invalid-root-init-path ;;
+  esac
+  [[ ! -e "$ROOT_INIT_DIR" ]] || block ROOT_INIT_SCRATCH_DELETE_FAILED
+  record root_init.scratch.deleted bool true
+
+  [[ "$observer_state_present" == "true" ]] || block DOCKER_API_OBSERVER_STATE_MISSING
+  [[ "$observer_classification" =~ ^[A-Z0-9_]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
+  [[ "$observer_rc" == "0" || "$observer_rc" == "2" ]] \
+    || block DOCKER_API_OBSERVER_FAILED "observer-exit-${observer_rc}"
+  [[ "$cli_rc" != "124" ]] || block ROOT_INIT_COMMAND_TIMEOUT
+
+  request_count="$(awk -F '\t' '$1=="docker_api_boundary.request_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  response_count="$(awk -F '\t' '$1=="docker_api_boundary.response_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  write_count="$(awk -F '\t' '$1=="docker_api_boundary.write_attempt_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  forwarding_errors="$(awk -F '\t' '$1=="docker_api_boundary.forwarding_error_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  parser_errors="$(awk -F '\t' '$1=="docker_api_boundary.parser_error_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+  for count in "$request_count" "$response_count" "$write_count" "$forwarding_errors" "$parser_errors"; do
+    [[ "$count" =~ ^[0-9]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
+  done
+  [[ "$observer_classification" == "NO_DOCKER_API_REQUEST_OBSERVED" \
+    && "$request_count" == "0" \
+    && "$response_count" == "0" \
+    && "$write_count" == "0" \
+    && "$forwarding_errors" == "0" \
+    && "$parser_errors" == "0" ]] || block BLOCKED_UNKNOWN "unexpected-docker-api-boundary"
+
+  packet_object_counts post_cli || block ROOT_INIT_DOCKER_OBJECT_DRIFT
+  capture_listener_snapshot post_cli "$DB_PORT" \
+    || block "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" "${LISTENER_LAST_PHASE:-POST_CLI_PORT_56422_UNKNOWN}"
+  [[ "$LISTENER_SNAPSHOT_COUNT" == "0" ]] || block ROOT_INIT_LISTENER_DRIFT
+  native_listener_contract post_cli \
+    || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"
+
+  root_init_classification="$(classify_root_init_result "$cli_rc" "$raw_bytes" "$raw_lines" "$raw_sha")"
+  case "$root_init_classification" in
+    LOAD_CONFIG_BLOCKER)
+      record diagnostic.classification str ROOT_INIT_PASS
+      block LOAD_CONFIG_BLOCKER root-persistent-init-passed
+      ;;
+    ROOT_PERSISTENT_INIT_BLOCKER)
+      record diagnostic.classification str ROOT_PERSISTENT_INIT_BLOCKER
+      block ROOT_PERSISTENT_INIT_BLOCKER exact-prior-fingerprint
+      ;;
+    *)
+      record diagnostic.classification str BLOCKED_UNKNOWN
+      block BLOCKED_UNKNOWN "root-init-exit-${cli_rc}"
+      ;;
+  esac
+}
+
 if [[ "$MODE" == "cleanup-only" ]]; then
   cleanup_only
 fi
@@ -705,11 +956,15 @@ record failure.detail str preterminal-state
 if [[ "$MODE" == "direct-port" ]]; then
   record result.profile str direct-docker-port-v1
 else
-  record result.profile str status-phase-split-v1
-  record diagnostic.profile str status-phase-split-v1
-  record source_contract.command str supabase-status-ignore-health-check
-  record source_contract.status_only bool true
-  record source_contract.database_only bool true
+  record result.profile str root-init-split-v1
+  record diagnostic.profile str root-init-split-v1
+  record source_contract.command str supabase-telemetry-status
+  record source_contract.root_persistent_prerun bool true
+  record source_contract.load_config bool false
+  record source_contract.docker_access_expected bool false
+  record source_contract.provider_access_enabled bool false
+  record source_contract.telemetry_endpoint_enabled bool false
+  record source_contract.database_only bool false
   record source_contract.application_migrations_enabled bool false
   record source_contract.seed_enabled bool false
   record source_contract.gotrue_enabled bool false
@@ -758,8 +1013,11 @@ if [[ "$MODE" == "run" ]]; then
   mkdir -p "$RUNTIME/bin"
   tar -xzf "$RUNTIME/$CLI_ASSET" -C "$RUNTIME/bin" supabase >"$RAW/cli-extract.log" 2>&1 || block CLI_EXTRACTION_FAILED
   chmod 0555 "$RUNTIME/bin/supabase"
-  reported_cli_version="$($RUNTIME/bin/supabase --version 2>"$RAW/cli-version.log")" || block CLI_VERSION_FAILED
-  [[ "$reported_cli_version" == "$CLI_VERSION" ]] || block CLI_VERSION_MISMATCH
+  actual_cli_binary_sha="$(sha256sum "$RUNTIME/bin/supabase" | awk '{print $1}')"
+  record supabase_cli.binary_sha256 str "$actual_cli_binary_sha"
+  [[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]] || block CLI_BINARY_DIGEST_MISMATCH
+  run_root_init_split
+  exit 1
 fi
 
 docker pull --platform linux/amd64 "$POSTGRES_PULL" >"$RAW/postgres-pull.log" 2>&1 || block POSTGRES_PULL_FAILED
