@@ -407,6 +407,70 @@ hash_identifier() {
   printf 'sha256:%s' "$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
 }
 
+gateway_contract() {
+  python3 -B - "$@" <<'PY'
+# BEGIN GATEWAY_CONTRACT_PYTHON
+from __future__ import annotations
+
+import ipaddress
+import json
+from pathlib import Path
+import sys
+
+
+def validate_pair(subnet_text: str, gateway_text: str) -> tuple[ipaddress.IPv4Network, ipaddress.IPv4Address]:
+    subnet = ipaddress.ip_network(subnet_text, strict=True)
+    gateway = ipaddress.ip_address(gateway_text)
+    if not isinstance(subnet, ipaddress.IPv4Network) or not isinstance(gateway, ipaddress.IPv4Address):
+        raise ValueError("IPv4 required")
+    if gateway not in subnet or gateway in (subnet.network_address, subnet.broadcast_address):
+        raise ValueError("gateway is not a usable address in subnet")
+    return subnet, gateway
+
+
+def validate_ipam(path: Path, subnet_text: str, gateway_text: str) -> None:
+    subnet, gateway = validate_pair(subnet_text, gateway_text)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or len(payload) != 1:
+        raise ValueError("exactly one IPAM config row required")
+    row = payload[0]
+    if not isinstance(row, dict):
+        raise ValueError("IPAM config row must be an object")
+    allowed = {"Subnet", "IPRange", "Gateway", "AuxiliaryAddresses"}
+    if not set(row).issubset(allowed):
+        raise ValueError("unexpected IPAM field")
+    if row.get("IPRange") not in (None, "") or row.get("AuxiliaryAddresses") not in (None, {}):
+        raise ValueError("extra IPAM allocation data is not admitted")
+    if row.get("Subnet") != str(subnet) or row.get("Gateway") != str(gateway):
+        raise ValueError("IPAM subnet or gateway mismatch")
+
+
+try:
+    mode, subnet_text, gateway_text = sys.argv[1:4]
+    validate_pair(subnet_text, gateway_text)
+    if mode == "request":
+        if len(sys.argv) != 4:
+            raise ValueError("unexpected request arguments")
+    elif mode == "readback":
+        if len(sys.argv) != 5:
+            raise ValueError("unexpected readback arguments")
+        validate_ipam(Path(sys.argv[4]), subnet_text, gateway_text)
+    else:
+        raise ValueError("unknown gateway contract mode")
+except (IndexError, OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+# END GATEWAY_CONTRACT_PYTHON
+PY
+}
+
+validate_network_ipam_contract() {
+  local network_ref="$1" stage="$2" ipam_path="$RAW/network-ipam-${stage}.json"
+  docker network inspect --format '{{json .IPAM.Config}}' "$network_ref" \
+    >"$ipam_path" 2>>"$RAW/network-contract.log" \
+    || return 1
+  gateway_contract readback "$SUBNET" "$SUBNET_GATEWAY" "$ipam_path"
+}
+
 # BEGIN LISTENER_DIAGNOSTIC_FUNCTIONS
 listener_record() {
   local key kind value
@@ -654,8 +718,13 @@ network_contract_code() {
   fi
   [[ "$(docker network inspect --format '{{.EnableIPv6}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "false" ]] \
     || { printf 'NETWORK_IPV6_ENABLED\n'; return 1; }
-  [[ "$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$SUBNET" ]] \
-    || { printf 'NETWORK_SUBNET_MISMATCH\n'; return 1; }
+  if [[ "$MODE" == "firewall-rehearsal" ]]; then
+    validate_network_ipam_contract "$NETWORK_NAME" contract \
+      || { printf 'NETWORK_IPAM_CONTRACT_MISMATCH\n'; return 1; }
+  else
+    [[ "$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$SUBNET" ]] \
+      || { printf 'NETWORK_SUBNET_MISMATCH\n'; return 1; }
+  fi
   [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "127.0.0.1" ]] \
     || { printf 'NETWORK_HOST_BINDING_MISMATCH\n'; return 1; }
   if [[ "$MODE" == "firewall-rehearsal" ]]; then
@@ -1793,9 +1862,12 @@ network_args=(
   --opt "com.docker.network.bridge.host_binding_ipv4=127.0.0.1"
 )
 if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  gateway_contract request "$SUBNET" "$SUBNET_GATEWAY" \
+    || block PACKET_GATEWAY_REQUEST_INVALID
   ip link show dev "$FIREWALL_BRIDGE_NAME" >"$RAW/bridge-collision.log" 2>&1 \
     && block FIREWALL_BRIDGE_COLLISION
   network_args+=(
+    --gateway "$SUBNET_GATEWAY"
     --opt "com.docker.network.bridge.gateway_mode_ipv4=nat"
     --opt "com.docker.network.bridge.name=${FIREWALL_BRIDGE_NAME}"
   )
@@ -1824,7 +1896,13 @@ if [[ "$MODE" == "firewall-rehearsal" ]]; then
 else
   record network.gateway_mode_ipv4 str isolated
 fi
-ipam_gateway="$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' "$NETWORK_ID")"
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  validate_network_ipam_contract "$NETWORK_ID" after-create \
+    || block NETWORK_IPAM_CONTRACT_MISMATCH
+  ipam_gateway="$SUBNET_GATEWAY"
+else
+  ipam_gateway="$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' "$NETWORK_ID")"
+fi
 record network.ipam_gateway str "${ipam_gateway:-none}"
 
 [[ "$(docker network inspect --format '{{.Id}}' "$NETWORK_ID")" == "$NETWORK_ID" ]] || block NETWORK_ID_MISMATCH
@@ -1849,8 +1927,7 @@ bridge_name="br-${NETWORK_ID:0:12}"
 [[ "$MODE" != "firewall-rehearsal" ]] || bridge_name="$FIREWALL_BRIDGE_NAME"
 ip link show dev "$bridge_name" >"$RAW/bridge-link.log" 2>&1 || block PACKET_BRIDGE_MISSING
 if [[ "$MODE" == "firewall-rehearsal" ]]; then
-  [[ -n "$ipam_gateway" ]] || block PACKET_GATEWAY_MISSING
-  ip -4 -o addr show dev "$bridge_name" | grep -Fq " ${ipam_gateway}/" || block PACKET_GATEWAY_ADDRESS_MISMATCH
+  ip -4 -o addr show dev "$bridge_name" | grep -Fq " ${SUBNET_GATEWAY}/" || block PACKET_GATEWAY_ADDRESS_MISMATCH
 else
   if ip -4 -o addr show dev "$bridge_name" | grep -q ' inet '; then
     block ISOLATED_BRIDGE_HAS_HOST_ADDRESS

@@ -40,6 +40,38 @@ def bash_executable() -> str:
 BASH = bash_executable()
 
 
+def gateway_contract_source() -> str:
+    runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"# BEGIN GATEWAY_CONTRACT_PYTHON\n(?P<source>.*?)\n# END GATEWAY_CONTRACT_PYTHON",
+        runner,
+        re.DOTALL,
+    )
+    assert match
+    return match.group("source")
+
+
+def run_gateway_contract(
+    mode: str,
+    subnet: str,
+    gateway: str,
+    payload: object | None = None,
+) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory() as directory:
+        command = [sys.executable, "-B", "-", mode, subnet, gateway]
+        if payload is not None:
+            path = Path(directory) / "ipam.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            command.append(str(path))
+        return subprocess.run(
+            command,
+            input=gateway_contract_source(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
 def load_module(name: str, relative: str):
     spec = importlib.util.spec_from_file_location(name, ROOT / relative)
     assert spec and spec.loader
@@ -229,6 +261,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_firewall_rehearsal_uses_nat_loopback_network_and_one_pinned_image(self) -> None:
         for fragment in (
             'record network.internal bool false',
+            '--gateway "$SUBNET_GATEWAY"',
             'com.docker.network.bridge.gateway_mode_ipv4=nat',
             'com.docker.network.bridge.host_binding_ipv4=127.0.0.1',
             'com.docker.network.bridge.name=${FIREWALL_BRIDGE_NAME}',
@@ -246,6 +279,61 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertEqual(rehearsal.count("--tmpfs"), 3)
         self.assertNotIn('"$GOTRUE_PULL"', rehearsal)
         self.assertNotRegex(rehearsal, r"docker (pull|build|network create|volume create)")
+
+    def test_firewall_gateway_request_and_exact_ipam_readback_precede_mutation(self) -> None:
+        request_check = 'gateway_contract request "$SUBNET" "$SUBNET_GATEWAY"'
+        network_create = 'NETWORK_ID="$(docker network create "${network_args[@]}" "$NETWORK_NAME"'
+        readback = 'validate_network_ipam_contract "$NETWORK_ID" after-create'
+        dispatch = 'run_firewall_publication_rehearsal\n  exit 0'
+        self.assertLess(self.runner.index(request_check), self.runner.index(network_create))
+        self.assertLess(self.runner.index(network_create), self.runner.index(readback))
+        self.assertLess(self.runner.index(readback), self.runner.index(dispatch))
+        self.assertIn('ipam_gateway="$SUBNET_GATEWAY"', self.runner)
+        self.assertIn("NETWORK_IPAM_CONTRACT_MISMATCH", self.runner)
+
+    def test_gateway_request_rejects_nonusable_or_non_ipv4_addresses(self) -> None:
+        self.assertEqual(
+            run_gateway_contract("request", "172.31.253.0/24", "172.31.253.1").returncode,
+            0,
+        )
+        rejected = (
+            ("172.31.253.0/24", "172.31.253.0"),
+            ("172.31.253.0/24", "172.31.253.255"),
+            ("172.31.253.0/24", "172.31.252.1"),
+            ("172.31.253.1/24", "172.31.253.1"),
+            ("fd00::/64", "fd00::1"),
+            ("malformed", "172.31.253.1"),
+        )
+        for subnet, gateway in rejected:
+            with self.subTest(subnet=subnet, gateway=gateway):
+                self.assertNotEqual(run_gateway_contract("request", subnet, gateway).returncode, 0)
+
+    def test_ipam_readback_requires_one_exact_ipv4_row(self) -> None:
+        exact = [{"Subnet": "172.31.253.0/24", "Gateway": "172.31.253.1"}]
+        self.assertEqual(
+            run_gateway_contract(
+                "readback", "172.31.253.0/24", "172.31.253.1", exact
+            ).returncode,
+            0,
+        )
+        rejected = (
+            [],
+            [{"Subnet": "172.31.253.0/24"}],
+            [{"Subnet": "172.31.253.0/24", "Gateway": "172.31.253.2"}],
+            exact + exact,
+            [{"Subnet": "172.31.253.0/24", "Gateway": "172.31.253.1", "IPRange": "172.31.253.0/25"}],
+            [{"Subnet": "fd00::/64", "Gateway": "fd00::1"}],
+            [{"Subnet": "172.31.253.0/24", "Gateway": "172.31.253.1", "Unexpected": "value"}],
+            "malformed-shape",
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload):
+                self.assertNotEqual(
+                    run_gateway_contract(
+                        "readback", "172.31.253.0/24", "172.31.253.1", payload
+                    ).returncode,
+                    0,
+                )
 
     def test_firewall_is_active_before_first_container_and_removed_after_all_containers(self) -> None:
         rehearsal = self.runner[
