@@ -4087,6 +4087,43 @@ def owned_firewall_entries_with_markers() -> list[dict]:
 
 class FirewallBoundaryTests(unittest.TestCase):
     @staticmethod
+    def _restoration_ledger_payload(
+        foreign: list[dict], *, markers_installed: bool = True
+    ) -> dict[str, object]:
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        owned = (
+            owned_firewall_entries_with_markers()
+            if markers_installed
+            else owned_firewall_entries()
+        )
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned, firewall_boundary.TABLE, markers_installed=markers_installed
+        )
+        marker_sha = ""
+        combined_sha = ""
+        if markers_installed:
+            marker_sha, _ = firewall_boundary.canonical_snapshot(
+                firewall_boundary.marker_entries(owned, firewall_boundary.TABLE)
+            )
+            combined_sha = owned_sha
+            owned_sha, _ = firewall_boundary.validate_owned(
+                owned_firewall_entries(), firewall_boundary.TABLE
+            )
+        return {
+            "schema": firewall_boundary.SCHEMA,
+            "table": firewall_boundary.TABLE,
+            "interface": "br-fpro001",
+            "subnet": "172.31.253.0/24",
+            "preimage_sha256": pre_sha,
+            "preimage_counts": pre_counts,
+            "installed": True,
+            "owned_sha256": owned_sha,
+            "markers_installed": markers_installed,
+            "marker_sha256": marker_sha,
+            "combined_sha256": combined_sha,
+        }
+
+    @staticmethod
     def _phase_contract_functions() -> str:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
         start = runner.index("firewall_phase_finish() {")
@@ -4965,6 +5002,13 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             ):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_TABLE_COLLISION"):
                     firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            completion.write_text("collision\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_LEDGER_COLLISION"
+            ):
+                firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            completion.unlink()
             foreign = [{"table": {"family": "ip", "name": "foreign"}}]
             failed = subprocess.CompletedProcess([], 1, stdout="", stderr="invalid")
             with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
@@ -4972,7 +5016,8 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             ), mock.patch.object(firewall_boundary, "_run", return_value=failed):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_CHECK_FAILED"):
                     firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
-            self.assertFalse(ledger.exists())
+            self.assertTrue(ledger.exists())
+            self.assertFalse(firewall_boundary.read_ledger(ledger)["installed"])
 
     def test_atomic_install_and_exact_foreign_preservation(self) -> None:
         foreign = [{"table": {"family": "ip", "name": "foreign"}}]
@@ -5338,47 +5383,43 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
         with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_COUNTER_INVALID"):
             firewall_boundary.counter_packets(entries, firewall_boundary.INPUT_COUNTER)
 
-    def test_exact_atomic_rollback_and_duplicate_cleanup(self) -> None:
+    def test_exact_atomic_rollback_requires_completion_for_idempotency(self) -> None:
         foreign = [{"table": {"family": "ip", "name": "foreign"}}]
-        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
-        owned_sha, _ = firewall_boundary.validate_owned(
-            owned_firewall_entries(), firewall_boundary.TABLE
-        )
         marked = owned_firewall_entries_with_markers()
-        combined_sha, _ = firewall_boundary.validate_owned(
-            marked, firewall_boundary.TABLE, markers_installed=True
-        )
-        marker_sha, _ = firewall_boundary.canonical_snapshot(
-            firewall_boundary.marker_entries(marked, firewall_boundary.TABLE)
-        )
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
-            firewall_boundary.write_ledger(
-                ledger,
-                {
-                    "schema": firewall_boundary.SCHEMA,
-                    "table": firewall_boundary.TABLE,
-                    "interface": "br-fpro001",
-                    "subnet": "172.31.253.0/24",
-                    "preimage_sha256": pre_sha,
-                    "preimage_counts": pre_counts,
-                    "installed": True,
-                    "owned_sha256": owned_sha,
-                    "markers_installed": True,
-                    "marker_sha256": marker_sha,
-                    "combined_sha256": combined_sha,
-                },
-            )
+            firewall_boundary.write_ledger(ledger, self._restoration_ledger_payload(foreign))
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            first_state = io.StringIO()
             with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", side_effect=[foreign + marked, foreign]
-            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(io.StringIO()):
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(first_state):
                 firewall_boundary.remove(ledger)
             self.assertFalse(ledger.exists())
+            self.assertTrue(completion.exists())
+            self.assertIn("firewall.rollback_completion_published\tbool\ttrue", first_state.getvalue())
+            for forbidden in (
+                "br-fpro001",
+                "172.31.253.0/24",
+                firewall_boundary.INPUT_COUNTER,
+            ):
+                self.assertNotIn(forbidden, first_state.getvalue())
+            second_state = io.StringIO()
             with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", return_value=foreign
-            ), contextlib.redirect_stdout(io.StringIO()):
+            ), contextlib.redirect_stdout(second_state):
                 firewall_boundary.remove(ledger)
+            self.assertFalse(completion.exists())
+            self.assertIn("firewall.rollback_idempotent\tbool\ttrue", second_state.getvalue())
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_EVIDENCE_MISSING",
+                ):
+                    firewall_boundary.remove(ledger)
 
     def test_rollback_check_failure_retains_ledger_for_always_cleanup(self) -> None:
         foreign = [{"table": {"family": "ip", "name": "foreign"}}]
@@ -5408,6 +5449,307 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_ROLLBACK_CHECK_FAILED"):
                     firewall_boundary.remove(ledger)
             self.assertTrue(ledger.exists())
+
+    def test_restore_and_verification_interruptions_preserve_exact_ledger(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign-private"}}]
+        changed = foreign + [
+            {"chain": {"family": "ip", "table": "foreign-private", "name": "drift"}}
+        ]
+        owned = owned_firewall_entries()
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="blocked")
+
+        def exercise(
+            expected_code: str,
+            *,
+            rulesets: object,
+            commands: object,
+        ) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                ledger = Path(directory) / "ledger.json"
+                firewall_boundary.write_ledger(
+                    ledger,
+                    self._restoration_ledger_payload(foreign, markers_installed=False),
+                )
+                original = ledger.read_bytes()
+                completion = firewall_boundary.restoration_completion_path(ledger)
+                with mock.patch.object(
+                    firewall_boundary,
+                    "privileged_prefix",
+                    return_value=(["nft"], "nftables-v1"),
+                ), mock.patch.object(
+                    firewall_boundary, "read_ruleset", side_effect=rulesets
+                ), mock.patch.object(
+                    firewall_boundary, "_run", side_effect=commands
+                ):
+                    with self.assertRaisesRegex(
+                        firewall_boundary.BoundaryError, expected_code
+                    ):
+                        firewall_boundary.remove(ledger)
+                self.assertEqual(ledger.read_bytes(), original)
+                self.assertFalse(completion.exists())
+
+        with self.subTest(boundary="before-restore"):
+            exercise(
+                "FIREWALL_ATOMIC_ROLLBACK_CHECK_FAILED",
+                rulesets=[foreign + owned],
+                commands=[failed],
+            )
+        with self.subTest(boundary="during-restore"):
+            exercise(
+                "FIREWALL_ATOMIC_ROLLBACK_FAILED",
+                rulesets=[foreign + owned],
+                commands=[success, failed],
+            )
+        with self.subTest(boundary="after-restore-before-verify"):
+            exercise(
+                "FIREWALL_INSPECTION_FAILED",
+                rulesets=[
+                    foreign + owned,
+                    firewall_boundary.BoundaryError("FIREWALL_INSPECTION_FAILED"),
+                ],
+                commands=[success, success],
+            )
+        with self.subTest(boundary="verification-failure"):
+            exercise(
+                "FIREWALL_FOREIGN_STATE_DRIFT",
+                rulesets=[foreign + owned, changed],
+                commands=[success, success],
+            )
+
+    def test_completion_publication_and_ledger_retirement_are_retry_safe(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign-private"}}]
+        owned = owned_firewall_entries()
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            payload = self._restoration_ledger_payload(foreign, markers_installed=False)
+            firewall_boundary.write_ledger(ledger, payload)
+            original = ledger.read_bytes()
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            stage = firewall_boundary.restoration_stage_path(completion)
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[foreign + owned, foreign],
+            ), mock.patch.object(
+                firewall_boundary, "_run", return_value=success
+            ), mock.patch.object(
+                firewall_boundary.os, "link", side_effect=OSError("publish blocked")
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_COMPLETION_FAILED",
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertEqual(ledger.read_bytes(), original)
+            self.assertFalse(completion.exists())
+            self.assertFalse(stage.exists())
+
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[foreign, foreign],
+            ), mock.patch.object(
+                firewall_boundary,
+                "_retire_private_path",
+                side_effect=firewall_boundary.BoundaryError(
+                    "FIREWALL_LEDGER_RETIREMENT_FAILED"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_LEDGER_RETIREMENT_FAILED",
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertEqual(ledger.read_bytes(), original)
+            self.assertTrue(completion.exists())
+            completed = firewall_boundary.read_completion(completion)
+            self.assertEqual(completed["ledger_sha256"], firewall_boundary.ledger_sha256(payload))
+
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.remove(ledger)
+            self.assertFalse(ledger.exists())
+            self.assertFalse(completion.exists())
+
+    def test_cleanup_retry_matrix_is_closed_and_evidence_bound(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign-private"}}]
+        changed = foreign + [
+            {"chain": {"family": "ip", "table": "foreign-private", "name": "changed"}}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            payload = self._restoration_ledger_payload(foreign, markers_installed=False)
+
+            # Ledger only: re-verify restoration, publish completion, then retire the ledger.
+            firewall_boundary.write_ledger(ledger, payload)
+            state = io.StringIO()
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", side_effect=[foreign, foreign]
+            ), contextlib.redirect_stdout(state):
+                firewall_boundary.remove(ledger)
+            self.assertFalse(ledger.exists())
+            self.assertTrue(completion.exists())
+            self.assertIn("firewall.rollback_idempotent\tbool\tfalse", state.getvalue())
+
+            # Completion only: prove current restoration before consuming completion evidence.
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), mock.patch.object(
+                firewall_boundary,
+                "_retire_private_path",
+                side_effect=firewall_boundary.BoundaryError(
+                    "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED",
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertTrue(completion.exists())
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.remove(ledger)
+            self.assertFalse(completion.exists())
+
+            # Both: resume an interruption after completion publication and retire both.
+            firewall_boundary.write_ledger(ledger, payload)
+            valid = firewall_boundary.build_completion(
+                payload, payload["preimage_sha256"], payload["preimage_counts"]
+            )
+            firewall_boundary.write_completion(completion, valid)
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.remove(ledger)
+            self.assertFalse(ledger.exists())
+            self.assertFalse(completion.exists())
+
+            # Neither is never silently idempotent.
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_EVIDENCE_MISSING",
+                ):
+                    firewall_boundary.remove(ledger)
+
+            # A valid completion cannot bless a different current foreign state.
+            firewall_boundary.write_completion(completion, valid)
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=changed
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_EVIDENCE_INVALID",
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertTrue(completion.exists())
+
+            # A completion tied to a different valid ledger is rejected with both retained.
+            mismatched_payload = dict(payload)
+            mismatched_payload["owned_sha256"] = "b" * 64
+            firewall_boundary.write_ledger(ledger, mismatched_payload)
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_RESTORATION_EVIDENCE_INVALID",
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertTrue(ledger.exists())
+            self.assertTrue(completion.exists())
+
+    def test_completion_evidence_rejects_forgery_and_suppresses_raw_state(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "raw-foreign-name"}}]
+        payload = self._restoration_ledger_payload(foreign, markers_installed=False)
+        completion_value = firewall_boundary.build_completion(
+            payload, payload["preimage_sha256"], payload["preimage_counts"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            firewall_boundary.write_completion(completion, completion_value)
+            raw = completion.read_text(encoding="utf-8")
+            for forbidden in (
+                "br-fpro001",
+                "172.31.253.0/24",
+                "raw-foreign-name",
+                firewall_boundary.INPUT_COUNTER,
+                '"packets"',
+                '"bytes"',
+            ):
+                self.assertNotIn(forbidden, raw)
+            expected_mode = "0o666" if os.name == "nt" else "0o600"
+            self.assertEqual(oct(completion.stat().st_mode & 0o777), expected_mode)
+
+            forged = dict(completion_value)
+            forged["evidence_sha256"] = "0" * 64
+            completion.write_text(
+                json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_RESTORATION_EVIDENCE_INVALID",
+            ):
+                firewall_boundary.read_completion(completion)
+
+            completion.write_text(
+                '{"schema":"x","schema":"y"}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_RESTORATION_EVIDENCE_INVALID",
+            ):
+                firewall_boundary.read_completion(completion)
 
     def test_inspection_and_ledger_schema_fail_closed_without_raw_output(self) -> None:
         with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_INSPECTION_FAILED"):

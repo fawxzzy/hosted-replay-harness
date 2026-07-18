@@ -22,6 +22,7 @@ from typing import Any
 
 
 SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v3"
+COMPLETION_SCHEMA = "fawxzzy.hosted-replay-harness.firewall-restoration.v1"
 TABLE = "fp_hosted_replay_ro_001"
 INPUT_CHAIN = "packet_input"
 FORWARD_CHAIN = "packet_forward"
@@ -61,6 +62,17 @@ LEDGER_KEYS = {
     "markers_installed",
     "marker_sha256",
     "combined_sha256",
+}
+COMPLETION_KEYS = {
+    "schema",
+    "table",
+    "ledger_sha256",
+    "preimage_sha256",
+    "preimage_counts_sha256",
+    "postimage_sha256",
+    "postimage_counts_sha256",
+    "restored",
+    "evidence_sha256",
 }
 
 
@@ -630,6 +642,210 @@ def write_ledger(path: Path, ledger: dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def restoration_completion_path(ledger_path: Path) -> Path:
+    return ledger_path.with_name(f"{ledger_path.name}.restoration-complete")
+
+
+def restoration_stage_path(completion_path: Path) -> Path:
+    return completion_path.with_name(f".{completion_path.name}.stage")
+
+
+def ledger_sha256(ledger: dict[str, Any]) -> str:
+    return canonical_json_sha256(ledger)
+
+
+def counts_sha256(counts: dict[str, int]) -> str:
+    return canonical_json_sha256(counts)
+
+
+def completion_evidence_sha256(completion: dict[str, Any]) -> str:
+    return canonical_json_sha256(
+        {key: value for key, value in completion.items() if key != "evidence_sha256"}
+    )
+
+
+def validate_completion(completion: Any) -> dict[str, Any]:
+    if not isinstance(completion, dict) or set(completion) != COMPLETION_KEYS:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if completion.get("schema") != COMPLETION_SCHEMA or completion.get("table") != TABLE:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if completion.get("restored") is not True:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    for key in (
+        "ledger_sha256",
+        "preimage_sha256",
+        "preimage_counts_sha256",
+        "postimage_sha256",
+        "postimage_counts_sha256",
+        "evidence_sha256",
+    ):
+        value = completion.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if completion["preimage_sha256"] != completion["postimage_sha256"]:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if completion["preimage_counts_sha256"] != completion["postimage_counts_sha256"]:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if completion["evidence_sha256"] != completion_evidence_sha256(completion):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    return completion
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def read_completion(path: Path) -> dict[str, Any]:
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    try:
+        completion = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_strict_json_object
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID") from exc
+    return validate_completion(completion)
+
+
+def build_completion(
+    ledger: dict[str, Any], postimage_sha256: str, postimage_counts: dict[str, int]
+) -> dict[str, Any]:
+    completion = {
+        "schema": COMPLETION_SCHEMA,
+        "table": TABLE,
+        "ledger_sha256": ledger_sha256(ledger),
+        "preimage_sha256": ledger["preimage_sha256"],
+        "preimage_counts_sha256": counts_sha256(ledger["preimage_counts"]),
+        "postimage_sha256": postimage_sha256,
+        "postimage_counts_sha256": counts_sha256(postimage_counts),
+        "restored": True,
+        "evidence_sha256": "",
+    }
+    completion["evidence_sha256"] = completion_evidence_sha256(completion)
+    return validate_completion(completion)
+
+
+def _retire_private_path(path: Path, failure_code: str) -> None:
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise BoundaryError(failure_code) from exc
+
+
+def _fsync_parent(path: Path) -> None:
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_RESTORATION_COMPLETION_FAILED") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _reconcile_completion_stage(completion_path: Path) -> None:
+    stage_path = restoration_stage_path(completion_path)
+    if not os.path.lexists(stage_path):
+        return
+    try:
+        observed = stage_path.lstat()
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    if os.path.lexists(completion_path):
+        try:
+            same_file = os.path.samefile(stage_path, completion_path)
+        except OSError as exc:
+            raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID") from exc
+        if not same_file:
+            raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+    _retire_private_path(stage_path, "FIREWALL_RESTORATION_COMPLETION_FAILED")
+
+
+def write_completion(path: Path, completion: dict[str, Any]) -> None:
+    validate_completion(completion)
+    _reconcile_completion_stage(path)
+    if os.path.lexists(path):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_COLLISION")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stage_path = restoration_stage_path(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    linked = False
+    try:
+        descriptor = os.open(stage_path, flags, 0o600)
+        payload = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.chmod(stage_path, 0o600)
+        os.link(stage_path, path)
+        linked = True
+        _fsync_parent(path)
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_RESTORATION_COMPLETION_FAILED") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(stage_path):
+            try:
+                stage_path.unlink()
+            except OSError as exc:
+                raise BoundaryError("FIREWALL_RESTORATION_COMPLETION_FAILED") from exc
+    if not linked:
+        raise BoundaryError("FIREWALL_RESTORATION_COMPLETION_FAILED")
+
+
+def validate_completion_against_ledger(
+    completion: dict[str, Any],
+    ledger: dict[str, Any],
+    current_sha256: str,
+    current_counts: dict[str, int],
+) -> None:
+    validate_completion(completion)
+    if (
+        completion["ledger_sha256"] != ledger_sha256(ledger)
+        or completion["preimage_sha256"] != ledger["preimage_sha256"]
+        or completion["preimage_counts_sha256"] != counts_sha256(ledger["preimage_counts"])
+        or completion["postimage_sha256"] != current_sha256
+        or completion["postimage_counts_sha256"] != counts_sha256(current_counts)
+    ):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+
+
+def validate_completion_against_current(
+    completion: dict[str, Any], current_sha256: str, current_counts: dict[str, int]
+) -> None:
+    validate_completion(completion)
+    if (
+        completion["postimage_sha256"] != current_sha256
+        or completion["postimage_counts_sha256"] != counts_sha256(current_counts)
+    ):
+        raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+
+
 def read_ledger(path: Path) -> dict[str, Any]:
     try:
         observed = path.lstat()
@@ -677,7 +893,12 @@ def read_ledger(path: Path) -> dict[str, Any]:
 
 
 def install(ledger_path: Path, interface: str, subnet: str) -> None:
-    if os.path.lexists(ledger_path):
+    completion_path = restoration_completion_path(ledger_path)
+    if (
+        os.path.lexists(ledger_path)
+        or os.path.lexists(completion_path)
+        or os.path.lexists(restoration_stage_path(completion_path))
+    ):
         raise BoundaryError("FIREWALL_LEDGER_COLLISION")
     daemon_class, daemon_root_owned, runner_nonroot = process_ownership_preflight()
     prefix, backend_class = privileged_prefix()
@@ -702,7 +923,6 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     batch = build_batch(TABLE, interface, subnet)
     checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
     if checked.returncode != 0:
-        ledger_path.unlink(missing_ok=True)
         raise BoundaryError("FIREWALL_ATOMIC_CHECK_FAILED")
     applied = _run([*prefix, "-f", "-"], input_text=batch)
     if applied.returncode != 0:
@@ -954,12 +1174,91 @@ def remove(ledger_path: Path) -> None:
     prefix, _ = privileged_prefix()
     entries = read_ruleset(prefix)
     selected = owned_entries(entries, TABLE)
+    completion_path = restoration_completion_path(ledger_path)
+    _reconcile_completion_stage(completion_path)
     if not os.path.lexists(ledger_path):
         if selected:
             raise BoundaryError("FIREWALL_LEDGER_MISSING")
-        emit([("firewall.rollback_idempotent", "bool", True)])
+        if not os.path.lexists(completion_path):
+            raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_MISSING")
+        completion = read_completion(completion_path)
+        post_sha, post_counts = canonical_snapshot(entries, exclude_table=TABLE)
+        validate_completion_against_current(completion, post_sha, post_counts)
+        _retire_private_path(
+            completion_path, "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED"
+        )
+        emit(
+            [
+                ("firewall.rollback_idempotent", "bool", True),
+                ("firewall.rollback_completion_validated", "bool", True),
+                (
+                    "firewall.rollback_completion_evidence_sha256",
+                    "str",
+                    completion["evidence_sha256"],
+                ),
+                ("firewall.rollback_completion_retired", "bool", True),
+                ("firewall.rollback_foreign_preimage_restored", "bool", True),
+                ("firewall.rollback_postimage_sha256", "str", post_sha),
+                (
+                    "firewall.rollback_postimage_table_count",
+                    "int",
+                    post_counts.get("table", 0),
+                ),
+                (
+                    "firewall.rollback_postimage_chain_count",
+                    "int",
+                    post_counts.get("chain", 0),
+                ),
+                (
+                    "firewall.rollback_postimage_rule_count",
+                    "int",
+                    post_counts.get("rule", 0),
+                ),
+            ]
+        )
         return
     ledger = read_ledger(ledger_path)
+    if os.path.lexists(completion_path):
+        if selected:
+            raise BoundaryError("FIREWALL_RESTORATION_EVIDENCE_INVALID")
+        completion = read_completion(completion_path)
+        post_sha, post_counts = canonical_snapshot(entries, exclude_table=TABLE)
+        validate_completion_against_ledger(completion, ledger, post_sha, post_counts)
+        _retire_private_path(ledger_path, "FIREWALL_LEDGER_RETIREMENT_FAILED")
+        _retire_private_path(
+            completion_path, "FIREWALL_RESTORATION_COMPLETION_RETIREMENT_FAILED"
+        )
+        emit(
+            [
+                ("firewall.rollback_idempotent", "bool", True),
+                ("firewall.rollback_completion_validated", "bool", True),
+                (
+                    "firewall.rollback_completion_evidence_sha256",
+                    "str",
+                    completion["evidence_sha256"],
+                ),
+                ("firewall.rollback_ledger_retired", "bool", True),
+                ("firewall.rollback_completion_retired", "bool", True),
+                ("firewall.rollback_foreign_preimage_restored", "bool", True),
+                ("firewall.rollback_postimage_sha256", "str", post_sha),
+                (
+                    "firewall.rollback_postimage_table_count",
+                    "int",
+                    post_counts.get("table", 0),
+                ),
+                (
+                    "firewall.rollback_postimage_chain_count",
+                    "int",
+                    post_counts.get("chain", 0),
+                ),
+                (
+                    "firewall.rollback_postimage_rule_count",
+                    "int",
+                    post_counts.get("rule", 0),
+                ),
+            ]
+        )
+        return
     before_sha, before_counts = canonical_snapshot(entries, exclude_table=TABLE)
     foreign_drift = before_sha != ledger["preimage_sha256"] or before_counts != ledger["preimage_counts"]
     if selected:
@@ -974,19 +1273,29 @@ def remove(ledger_path: Path) -> None:
     if owned_entries(after, TABLE):
         raise BoundaryError("FIREWALL_ROLLBACK_RESIDUE")
     post_sha, post_counts = canonical_snapshot(after, exclude_table=TABLE)
-    ledger_path.unlink(missing_ok=True)
+    if foreign_drift or post_sha != ledger["preimage_sha256"] or post_counts != ledger["preimage_counts"]:
+        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
+    completion = build_completion(ledger, post_sha, post_counts)
+    write_completion(completion_path, completion)
+    _retire_private_path(ledger_path, "FIREWALL_LEDGER_RETIREMENT_FAILED")
     emit(
         [
+            ("firewall.rollback_idempotent", "bool", False),
             ("firewall.rollback_removed_table_count", "int", 1 if selected else 0),
-            ("firewall.rollback_foreign_preimage_restored", "bool", not foreign_drift and post_sha == ledger["preimage_sha256"] and post_counts == ledger["preimage_counts"]),
+            ("firewall.rollback_foreign_preimage_restored", "bool", True),
+            ("firewall.rollback_completion_published", "bool", True),
+            (
+                "firewall.rollback_completion_evidence_sha256",
+                "str",
+                completion["evidence_sha256"],
+            ),
+            ("firewall.rollback_ledger_retired", "bool", True),
             ("firewall.rollback_postimage_sha256", "str", post_sha),
             ("firewall.rollback_postimage_table_count", "int", post_counts.get("table", 0)),
             ("firewall.rollback_postimage_chain_count", "int", post_counts.get("chain", 0)),
             ("firewall.rollback_postimage_rule_count", "int", post_counts.get("rule", 0)),
         ]
     )
-    if foreign_drift or post_sha != ledger["preimage_sha256"] or post_counts != ledger["preimage_counts"]:
-        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
 
 
 def main() -> int:
