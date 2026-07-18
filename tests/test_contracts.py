@@ -524,6 +524,7 @@ validate_network_ipam_contract fixture-network after-create
             "supabase/config.toml": "1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6",
             "pins.json": "fe6105e121af3347a2de2494330d1e793a7bc3634f9d3d95964f6593ea990f50",
             "scripts/docker_api_boundary.py": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
+            "scripts/firewall_boundary.py": "594c7a18f3a521a3524f243da17986f449ebfb41b1e7517359391667a22ce599",
         }
         for relative, digest in expected.items():
             self.assertEqual(hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(), digest)
@@ -662,6 +663,150 @@ rm -f "$CLEANUP_MODE_STAGE_FILE"
             completed.stdout.splitlines(),
             ["MODE:run:false", "MODE:direct-port:false", "MODE:firewall-rehearsal:true"],
         )
+
+    def test_cleanup_docker_query_contract_distinguishes_empty_failure_partial_and_malformed(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "record_cleanup_docker_query_failure",
+            "docker_cleanup_query_ids",
+        )
+
+        def execute(resource: str, fail_call: int = 0, malformed: bool = False) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).as_posix()
+                script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root)}
+RAW="$ROOT/raw"
+STATE_FILE="$ROOT/state.tsv"
+mkdir -p "$RAW"
+CONTAINMENT_PACKET=containment
+DIRECT_PACKET=direct
+FIREWALL_PACKET=firewall
+PROJECT=project
+CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
+DOCKER_CLEANUP_QUERY_VALUES=()
+printf '0\n' >"$ROOT/docker-call"
+FAIL_CALL={fail_call}
+MALFORMED={'1' if malformed else '0'}
+docker() {{
+  DOCKER_CALL="$(<"$ROOT/docker-call")"
+  DOCKER_CALL=$((DOCKER_CALL + 1))
+  printf '%s\n' "$DOCKER_CALL" >"$ROOT/docker-call"
+  if [[ "$FAIL_CALL" != 0 && "$DOCKER_CALL" == "$FAIL_CALL" ]]; then
+    return 1
+  fi
+  if [[ "$MALFORMED" == 1 ]]; then
+    printf 'not admitted output\n'
+  fi
+}}
+{functions}
+set +e
+docker_cleanup_query_ids {resource} FINAL_RESIDUE
+rc="$?"
+printf 'RC:%s COUNT:%s CALLS:%s\n' "$rc" "${{#DOCKER_CLEANUP_QUERY_VALUES[@]}}" "$(<"$ROOT/docker-call")"
+cat "$STATE_FILE" 2>/dev/null || true
+exit "$rc"
+"""
+                return self.run_bash(script)
+
+        for resource in ("CONTAINER", "VOLUME", "NETWORK"):
+            with self.subTest(resource=resource, kind="daemon-or-command-failure"):
+                failed = execute(resource, fail_call=1)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn("RC:1 COUNT:0 CALLS:1", failed.stdout)
+                self.assertIn(f"cleanup.docker_query.resource\tstr\t{resource}", failed.stdout)
+                self.assertIn("cleanup.docker_query.failure_class\tstr\tCOMMAND_FAILED", failed.stdout)
+            with self.subTest(resource=resource, kind="partial-filter-failure"):
+                partial = execute(resource, fail_call=3)
+                self.assertNotEqual(partial.returncode, 0)
+                self.assertIn("RC:1 COUNT:0 CALLS:3", partial.stdout)
+                self.assertIn("cleanup.docker_query.operation\tstr\tLIST", partial.stdout)
+            with self.subTest(resource=resource, kind="malformed"):
+                malformed = execute(resource, malformed=True)
+                self.assertNotEqual(malformed.returncode, 0)
+                self.assertIn("MALFORMED_OUTPUT", malformed.stdout)
+            with self.subTest(resource=resource, kind="successful-empty"):
+                empty = execute(resource)
+                self.assertEqual(empty.returncode, 0, empty.stderr)
+                self.assertIn("RC:0 COUNT:0 CALLS:4", empty.stdout)
+                self.assertNotIn("cleanup.docker_query.", empty.stdout)
+
+    def test_cleanup_docker_ownership_reads_are_explicit_and_fail_closed(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "record_cleanup_docker_query_failure",
+            "docker_cleanup_verify_ownership",
+        )
+
+        def execute(fail_call: int = 0, packet: str = "containment", project: str = "project") -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).as_posix()
+                script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root)}
+RAW="$ROOT/raw"
+STATE_FILE="$ROOT/state.tsv"
+mkdir -p "$RAW"
+CONTAINMENT_PACKET=containment
+DIRECT_PACKET=direct
+FIREWALL_PACKET=firewall
+PROJECT=project
+CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
+printf '0\n' >"$ROOT/docker-call"
+FAIL_CALL={fail_call}
+docker() {{
+  DOCKER_CALL="$(<"$ROOT/docker-call")"
+  DOCKER_CALL=$((DOCKER_CALL + 1))
+  printf '%s\n' "$DOCKER_CALL" >"$ROOT/docker-call"
+  [[ "$FAIL_CALL" == 0 || "$DOCKER_CALL" != "$FAIL_CALL" ]] || return 1
+  if [[ "$DOCKER_CALL" == 1 ]]; then printf '%s\n' {shlex.quote(packet)}; else printf '%s\n' {shlex.quote(project)}; fi
+}}
+{functions}
+set +e
+docker_cleanup_verify_ownership CONTAINER "$('a' * 64)" ENUMERATE
+rc="$?"
+printf 'RC:%s CALLS:%s\n' "$rc" "$(<"$ROOT/docker-call")"
+cat "$STATE_FILE" 2>/dev/null || true
+exit "$rc"
+"""
+                return self.run_bash(script)
+
+        accepted = execute()
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("RC:0 CALLS:2", accepted.stdout)
+        for call, operation in ((1, "PACKET_LABEL_INSPECT"), (2, "PROJECT_LABEL_INSPECT")):
+            with self.subTest(call=call):
+                failed = execute(fail_call=call)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(f"cleanup.docker_query.operation\tstr\t{operation}", failed.stdout)
+                self.assertIn("COMMAND_FAILED", failed.stdout)
+        malformed = execute(packet="unclassified-value")
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertIn("MALFORMED_OUTPUT", malformed.stdout)
+        mismatch = execute(packet="<no value>", project="<no value>")
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("OWNERSHIP_MISMATCH", mismatch.stdout)
+
+    def test_cleanup_exact_requires_successful_docker_queries_before_zero_or_firewall_removal(self) -> None:
+        cleanup = self.runner_functions(
+            "record",
+            "record_cleanup_docker_query_failure",
+            "docker_cleanup_query_ids",
+            "docker_cleanup_verify_ownership",
+            "cleanup_exact",
+        )
+        self.assertNotRegex(
+            cleanup,
+            r"docker (?:ps|volume ls|network ls|inspect|volume inspect|network inspect).*\|\| true",
+        )
+        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_DOCKER_QUERY_FAILURE", cleanup)
+        self.assertIn('[[ "$cleanup_query_rc" == "0" ]] || return 1', cleanup)
+        self.assertLess(
+            cleanup.index("docker_cleanup_query_ids CONTAINER PRE_FIREWALL"),
+            cleanup.index("cleanup_firewall_boundary"),
+        )
+        self.assertNotIn('record cleanup.containers_remaining int "0"', cleanup)
+        self.assertNotIn('record cleanup.volumes_remaining int "0"', cleanup)
+        self.assertNotIn('record cleanup.networks_remaining int "0"', cleanup)
 
     def test_mode_aware_firewall_cleanup_never_uses_evidence_absence_as_the_selector(self) -> None:
         functions = self.runner_functions("record", "cleanup_firewall_boundary")
@@ -1253,7 +1398,12 @@ validate_result_receipt {q((root / 'blocked.json').as_posix())} BLOCKED
         self.assertIn('20s docker rm -f "$id"', self.runner)
         self.assertIn('20s docker volume rm "$id"', self.runner)
         self.assertIn('20s docker network rm "$id"', self.runner)
-        self.assertGreaterEqual(self.runner.count('label=io.fawxzzy.packet=${DIRECT_PACKET}'), 4)
+        query = self.runner_functions("docker_cleanup_query_ids")
+        self.assertEqual(query.count('label=io.fawxzzy.packet=${DIRECT_PACKET}'), 1)
+        cleanup = self.runner_functions("cleanup_exact")
+        for resource in ("CONTAINER", "VOLUME", "NETWORK"):
+            self.assertIn(f"docker_cleanup_query_ids {resource} ENUMERATE", cleanup)
+            self.assertIn(f"docker_cleanup_query_ids {resource} FINAL_RESIDUE", cleanup)
         self.assertIn('[[ "$listener_count" == "0" ]] || return 1', self.runner)
         self.assertRegex(
             self.runner,

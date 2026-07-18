@@ -96,6 +96,8 @@ SMOKE_PASSED=0
 FINALIZING=0
 CLEANUP_ORIGINAL_MODE=""
 CLEANUP_FIREWALL_REQUIRED=""
+CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
+DOCKER_CLEANUP_QUERY_VALUES=()
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
 EXPECTED_OUTPUT_DENIES=0
@@ -1150,10 +1152,128 @@ cleanup_firewall_boundary() {
   record cleanup.firewall.skipped_mode str "$CLEANUP_ORIGINAL_MODE"
 }
 
+record_cleanup_docker_query_failure() {
+  local phase="$1" resource="$2" operation="$3" failure_class="$4"
+  [[ "$CLEANUP_DOCKER_QUERY_FAILURE_RECORDED" == "0" ]] || return 0
+  CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=1
+  record cleanup.docker_query.phase str "$phase"
+  record cleanup.docker_query.resource str "$resource"
+  record cleanup.docker_query.operation str "$operation"
+  record cleanup.docker_query.failure_class str "$failure_class"
+}
+
+docker_cleanup_query_ids() {
+  local resource="$1" phase="$2" filter output value
+  local -a values=()
+  local -A seen=()
+  DOCKER_CLEANUP_QUERY_VALUES=()
+  for filter in \
+    "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" \
+    "label=io.fawxzzy.packet=${DIRECT_PACKET}" \
+    "label=io.fawxzzy.packet=${FIREWALL_PACKET}" \
+    "label=com.supabase.cli.project=${PROJECT}"; do
+    case "$resource" in
+      CONTAINER)
+        if ! output="$(docker ps -aq --no-trunc --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+          record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          return 1
+        fi
+        ;;
+      VOLUME)
+        if ! output="$(docker volume ls -q --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+          record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          return 1
+        fi
+        ;;
+      NETWORK)
+        if ! output="$(docker network ls --no-trunc -q --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+          record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    [[ -n "$output" ]] || continue
+    while IFS= read -r value || [[ -n "$value" ]]; do
+      case "$resource" in
+        CONTAINER|NETWORK) [[ "$value" =~ ^[0-9a-f]{64}$ ]] ;;
+        VOLUME) [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] ;;
+      esac || {
+        record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+        DOCKER_CLEANUP_QUERY_VALUES=()
+        return 1
+      }
+      if [[ -z "${seen[$value]+present}" ]]; then
+        seen["$value"]=1
+        values+=("$value")
+      fi
+    done <<<"$output"
+  done
+  DOCKER_CLEANUP_QUERY_VALUES=("${values[@]}")
+}
+
+docker_cleanup_verify_ownership() {
+  local resource="$1" reference="$2" phase="$3" packet_label project_label
+  case "$resource" in
+    CONTAINER)
+      if ! packet_label="$(docker inspect --format '{{index .Config.Labels "io.fawxzzy.packet"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PACKET_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      if ! project_label="$(docker inspect --format '{{index .Config.Labels "com.supabase.cli.project"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PROJECT_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      ;;
+    VOLUME)
+      if ! packet_label="$(docker volume inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PACKET_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      if ! project_label="$(docker volume inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PROJECT_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      ;;
+    NETWORK)
+      if ! packet_label="$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PACKET_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      if ! project_label="$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$reference" 2>>"$RAW/cleanup-docker-query.log")"; then
+        record_cleanup_docker_query_failure "$phase" "$resource" PROJECT_LABEL_INSPECT COMMAND_FAILED
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  case "$packet_label" in
+    ""|"<no value>"|"$CONTAINMENT_PACKET"|"$DIRECT_PACKET"|"$FIREWALL_PACKET") ;;
+    *)
+      record_cleanup_docker_query_failure "$phase" "$resource" PACKET_LABEL_INSPECT MALFORMED_OUTPUT
+      return 1
+      ;;
+  esac
+  case "$project_label" in
+    ""|"<no value>"|"$PROJECT") ;;
+    *)
+      record_cleanup_docker_query_failure "$phase" "$resource" PROJECT_LABEL_INSPECT MALFORMED_OUTPUT
+      return 1
+      ;;
+  esac
+  if [[ "$packet_label" != "$CONTAINMENT_PACKET" && "$packet_label" != "$DIRECT_PACKET" \
+    && "$packet_label" != "$FIREWALL_PACKET" && "$project_label" != "$PROJECT" ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" OWNERSHIP OWNERSHIP_MISMATCH
+    return 1
+  fi
+}
+
 cleanup_exact() {
-  local id label project_label count listener_count container_count volume_count pre_firewall_container_count
-  local pre_firewall_network_count
-  local cleanup_mode_rc=0 firewall_rc=0 firewall_code
+  local id listener_count="" container_count="" volume_count="" network_count=""
+  local pre_firewall_container_count="" pre_firewall_network_count=""
+  local cleanup_mode_rc=0 cleanup_query_rc=0 firewall_rc=0 firewall_code
+  local -a container_ids=() volume_names=() network_ids=()
+  CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
   if ! resolve_cleanup_mode_contract "$MODE"; then
     cleanup_mode_rc=1
     record cleanup.mode.failure_code str CLEANUP_MODE_CONTRACT_INVALID || true
@@ -1161,70 +1281,84 @@ cleanup_exact() {
   stop_docker_api_observer || true
   stop_watcher
 
-  mapfile -t container_ids < <(
-    {
-      docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
-      docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
-      docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
-      docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
-    } | awk 'NF' | sort -u
-  )
+  if docker_cleanup_query_ids CONTAINER ENUMERATE; then
+    container_ids=("${DOCKER_CLEANUP_QUERY_VALUES[@]}")
+  else
+    cleanup_query_rc=1
+  fi
   for id in "${container_ids[@]:-}"; do
     [[ -n "$id" ]] || continue
-    label="$(docker inspect --format '{{index .Config.Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
-    project_label="$(docker inspect --format '{{index .Config.Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
-      timeout --signal=TERM --kill-after=5s 20s docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
+    if ! docker_cleanup_verify_ownership CONTAINER "$id" ENUMERATE; then
+      cleanup_query_rc=1
+      continue
     fi
+    timeout --signal=TERM --kill-after=5s 20s docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
   done
 
-  mapfile -t volume_names < <(
-    {
-      docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
-      docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
-      docker volume ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
-      docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
-    } | awk 'NF' | sort -u
-  )
+  if docker_cleanup_query_ids VOLUME ENUMERATE; then
+    volume_names=("${DOCKER_CLEANUP_QUERY_VALUES[@]}")
+  else
+    cleanup_query_rc=1
+  fi
   for id in "${volume_names[@]:-}"; do
     [[ -n "$id" ]] || continue
-    label="$(docker volume inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
-    project_label="$(docker volume inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
-      timeout --signal=TERM --kill-after=5s 20s docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
+    if ! docker_cleanup_verify_ownership VOLUME "$id" ENUMERATE; then
+      cleanup_query_rc=1
+      continue
     fi
+    timeout --signal=TERM --kill-after=5s 20s docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
   done
 
   stop_host_test_listener
-  mapfile -t network_ids < <(
-    {
-      docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
-      docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
-      docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
-      docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
-    } | awk 'NF' | sort -u
-  )
+  if docker_cleanup_query_ids NETWORK ENUMERATE; then
+    network_ids=("${DOCKER_CLEANUP_QUERY_VALUES[@]}")
+  else
+    cleanup_query_rc=1
+  fi
   for id in "${network_ids[@]:-}"; do
     [[ -n "$id" ]] || continue
-    label="$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
-    project_label="$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
-      timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
+    if ! docker_cleanup_verify_ownership NETWORK "$id" ENUMERATE; then
+      cleanup_query_rc=1
+      continue
     fi
+    timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
   done
 
-  pre_firewall_container_count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  pre_firewall_network_count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" "$pre_firewall_network_count" || firewall_rc=1
+  if docker_cleanup_query_ids CONTAINER PRE_FIREWALL; then
+    pre_firewall_container_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+  else
+    cleanup_query_rc=1
+  fi
+  if docker_cleanup_query_ids NETWORK PRE_FIREWALL; then
+    pre_firewall_network_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+  else
+    cleanup_query_rc=1
+  fi
+  if [[ -n "$pre_firewall_container_count" && -n "$pre_firewall_network_count" ]]; then
+    cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" "$pre_firewall_network_count" || firewall_rc=1
+  else
+    firewall_rc=1
+    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_DOCKER_QUERY_FAILURE
+  fi
 
-  count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  record cleanup.containers_remaining int "$count"
-  container_count="$count"
-  count="$({ docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  record cleanup.volumes_remaining int "$count"
-  volume_count="$count"
-  count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  record cleanup.networks_remaining int "$count"
+  if docker_cleanup_query_ids CONTAINER FINAL_RESIDUE; then
+    container_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+    record cleanup.containers_remaining int "$container_count"
+  else
+    cleanup_query_rc=1
+  fi
+  if docker_cleanup_query_ids VOLUME FINAL_RESIDUE; then
+    volume_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+    record cleanup.volumes_remaining int "$volume_count"
+  else
+    cleanup_query_rc=1
+  fi
+  if docker_cleanup_query_ids NETWORK FINAL_RESIDUE; then
+    network_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+    record cleanup.networks_remaining int "$network_count"
+  else
+    cleanup_query_rc=1
+  fi
   if capture_listener_snapshot cleanup "$DB_PORT"; then
     listener_count="$LISTENER_SNAPSHOT_COUNT"
     record cleanup.listeners_remaining int "$listener_count"
@@ -1236,7 +1370,8 @@ cleanup_exact() {
 
   [[ "$container_count" == "0" ]] || return 1
   [[ "$volume_count" == "0" ]] || return 1
-  [[ "$count" == "0" ]] || return 1
+  [[ "$network_count" == "0" ]] || return 1
+  [[ "$cleanup_query_rc" == "0" ]] || return 1
   [[ "$cleanup_mode_rc" == "0" ]] || return 1
   [[ "$firewall_rc" == "0" && ! -e "$FIREWALL_LEDGER" ]] || return 1
   [[ "$listener_count" == "0" ]] || return 1
