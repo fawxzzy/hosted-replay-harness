@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import gzip
 import hashlib
@@ -467,8 +468,9 @@ validate_network_ipam_contract fixture-network after-create
             )
         ]
         for fragment in (
+            "same_network_resolution",
             "same_network_connect",
-            "external_dns forward_deny",
+            "external_dns output_deny",
             "literal_ip forward_deny",
             "metadata forward_deny",
             "gateway input_deny",
@@ -3970,9 +3972,62 @@ def owned_firewall_entries() -> list[dict]:
         nft_entry("table"),
         nft_entry("counter", name=firewall_boundary.INPUT_COUNTER, packets=0, bytes=0),
         nft_entry("counter", name=firewall_boundary.FORWARD_COUNTER, packets=0, bytes=0),
-        nft_entry("chain", name=firewall_boundary.INPUT_CHAIN),
-        nft_entry("chain", name=firewall_boundary.FORWARD_CHAIN),
-        *[nft_entry("rule", chain="packet", expr=[]) for _ in range(5)],
+        nft_entry("counter", name=firewall_boundary.OUTPUT_COUNTER, packets=0, bytes=0),
+        nft_entry(
+            "chain",
+            name=firewall_boundary.INPUT_CHAIN,
+            type="filter",
+            hook="input",
+            prio=-10,
+            policy="accept",
+        ),
+        nft_entry(
+            "chain",
+            name=firewall_boundary.FORWARD_CHAIN,
+            type="filter",
+            hook="forward",
+            prio=-10,
+            policy="accept",
+        ),
+        nft_entry(
+            "chain",
+            name=firewall_boundary.OUTPUT_CHAIN,
+            type="filter",
+            hook="output",
+            prio=-10,
+            policy="accept",
+        ),
+        nft_entry("rule", chain=firewall_boundary.INPUT_CHAIN, expr=[{"accept": None}]),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.INPUT_CHAIN,
+            expr=[{"counter": {"name": firewall_boundary.INPUT_COUNTER}}, {"drop": None}],
+        ),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.FORWARD_CHAIN,
+            expr=[{"match": {"class": "same-bridge"}}, {"accept": None}],
+        ),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.FORWARD_CHAIN,
+            expr=[{"match": {"class": "established-related"}}, {"accept": None}],
+        ),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.FORWARD_CHAIN,
+            expr=[{"counter": {"name": firewall_boundary.FORWARD_COUNTER}}, {"drop": None}],
+        ),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.OUTPUT_CHAIN,
+            expr=[{"match": {"protocol": "udp", "uid": 0, "port": 53}}, {"counter": {"name": firewall_boundary.OUTPUT_COUNTER}}, {"drop": None}],
+        ),
+        nft_entry(
+            "rule",
+            chain=firewall_boundary.OUTPUT_CHAIN,
+            expr=[{"match": {"protocol": "tcp", "uid": 0, "port": 53}}, {"counter": {"name": firewall_boundary.OUTPUT_COUNTER}}, {"drop": None}],
+        ),
     ]
 
 
@@ -3987,10 +4042,177 @@ class FirewallBoundaryTests(unittest.TestCase):
         self.assertIn("ct state established,related accept", batch)
         self.assertLess(batch.index("established,related accept"), batch.index("packet_input_deny drop"))
         self.assertLess(batch.index('oifname "br-fpro001"'), batch.index("packet_forward_deny drop"))
+        self.assertIn(
+            "packet_output meta skuid 0 udp dport 53 counter name packet_output_deny drop",
+            batch,
+        )
+        self.assertIn(
+            "packet_output meta skuid 0 tcp dport 53 counter name packet_output_deny drop",
+            batch,
+        )
+        self.assertLess(batch.index("meta skuid 0 udp"), batch.index("meta skuid 0 tcp"))
         for forbidden in ("flush ruleset", "flush table", "policy drop", "delete chain", "delete rule"):
             self.assertNotIn(forbidden, batch)
         self.assertEqual(batch.count(" iifname "), 5)
         self.assertEqual(batch.count("172.31.253.0/24"), 6)
+        self.assertEqual(batch.count("meta skuid 0"), 2)
+        self.assertEqual(batch.count("packet_output_deny"), 3)
+
+    def test_process_identity_preflight_is_closed_and_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            daemon = proc / "101"
+            daemon.mkdir()
+            (daemon / "comm").write_text("dockerd\n", encoding="utf-8")
+            (daemon / "status").write_text("Name:\tdockerd\nUid:\t0\t0\t0\t0\n", encoding="utf-8")
+            other = proc / "202"
+            other.mkdir()
+            (other / "comm").write_text("Runner.Worker\n", encoding="utf-8")
+            observed = firewall_boundary.process_ownership_preflight(proc, runner_euid=1001)
+            self.assertEqual(observed, ("single-root-owned-dockerd", True, True))
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_RUNNER_IDENTITY_UNAVAILABLE"
+            ):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=-1)
+            with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_RUNNER_ROOT"):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=0)
+            (daemon / "status").write_text("Name:\tdockerd\nUid:\t1001\t1001\t1001\t1001\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_DOCKER_DAEMON_NOT_ROOT"
+            ):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=1001)
+            (daemon / "status").unlink()
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_DOCKER_DAEMON_IDENTITY_UNAVAILABLE",
+            ):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=1001)
+
+    def test_process_identity_preflight_rejects_missing_and_ambiguous_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_DOCKER_DAEMON_MISSING"
+            ):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=1001)
+            for pid in ("101", "202"):
+                daemon = proc / pid
+                daemon.mkdir()
+                (daemon / "comm").write_text("dockerd\n", encoding="utf-8")
+                (daemon / "status").write_text(
+                    "Name:\tdockerd\nUid:\t0\t0\t0\t0\n", encoding="utf-8"
+                )
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_DOCKER_DAEMON_AMBIGUOUS"
+            ):
+                firewall_boundary.process_ownership_preflight(proc, runner_euid=1001)
+
+    def test_owned_table_shape_is_exact_and_digest_is_deterministic(self) -> None:
+        entries = owned_firewall_entries()
+        first = firewall_boundary.validate_owned(entries, firewall_boundary.TABLE)
+        second = firewall_boundary.validate_owned(copy.deepcopy(entries), firewall_boundary.TABLE)
+        self.assertEqual(first, second)
+        self.assertEqual(first[1], {"chain": 3, "counter": 3, "rule": 7, "table": 1})
+        self.assertEqual(first[0], "22d68c21dec10ab4828727fb601006e31a1da6bfc96b7e6505a6aa570c013944")
+
+    def test_owned_table_rejects_unknown_duplicate_and_malformed_objects(self) -> None:
+        cases = []
+        duplicate_counter = owned_firewall_entries()
+        duplicate_counter[3]["counter"]["name"] = firewall_boundary.INPUT_COUNTER
+        cases.append(duplicate_counter)
+        duplicate_rule = owned_firewall_entries()
+        duplicate_rule[-1]["rule"]["expr"] = copy.deepcopy(duplicate_rule[-2]["rule"]["expr"])
+        cases.append(duplicate_rule)
+        unknown_chain = owned_firewall_entries()
+        unknown_chain[6]["chain"]["name"] = "packet_unknown"
+        cases.append(unknown_chain)
+        unknown_field = owned_firewall_entries()
+        unknown_field[4]["chain"]["unexpected"] = True
+        cases.append(unknown_field)
+        unknown_object = owned_firewall_entries()
+        unknown_object.append(
+            {"flowtable": {"family": "inet", "table": firewall_boundary.TABLE, "name": "unexpected"}}
+        )
+        cases.append(unknown_object)
+        missing_rule = owned_firewall_entries()[:-1]
+        cases.append(missing_rule)
+        malformed_rule = owned_firewall_entries()
+        malformed_rule[-1]["rule"]["expr"] = []
+        cases.append(malformed_rule)
+        for entries in cases:
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_INSTALLATION_MISMATCH"
+                ):
+                    firewall_boundary.validate_owned(entries, firewall_boundary.TABLE)
+
+    def test_runner_correlates_embedded_dns_only_to_output_counter(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        self.assertIn("EXPECTED_OUTPUT_DENIES=0", runner)
+        self.assertIn('[[ "$(wc -l <"$counter_file" | tr -d \' \')" == "3" ]]', runner)
+        self.assertIn(
+            "expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED",
+            runner,
+        )
+        self.assertIn('docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME"', runner)
+        self.assertIn("record canaries.firewall.same_network_resolution bool true", runner)
+        self.assertIn('output_before="$(firewall_counter_value output_deny)"', runner)
+        self.assertIn('record firewall.final_output_deny_count int "$output_after"', runner)
+        self.assertNotIn('expect_firewall_block external_dns forward_deny', runner)
+        self.assertNotIn('cat "$RAW/canary-', runner)
+
+    def test_output_canary_rejects_any_simultaneous_unrelated_counter_hit(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        start = runner.index("expect_firewall_block() {")
+        end = runner.index("\n}\n\nwait_healthy_container()", start) + 2
+        function = runner[start:end]
+
+        def execute(after_input: int, after_forward: int, after_output: int) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                script = f"""set -Eeuo pipefail
+RAW={shlex.quote(directory)}
+PHASE_FILE="$RAW/after"
+EXPECTED_INPUT_DENIES=0
+EXPECTED_FORWARD_DENIES=0
+EXPECTED_OUTPUT_DENIES=0
+BEFORE_INPUT=0
+BEFORE_FORWARD=0
+BEFORE_OUTPUT=0
+AFTER_INPUT={after_input}
+AFTER_FORWARD={after_forward}
+AFTER_OUTPUT={after_output}
+firewall_counter_value() {{
+  local name="$1" prefix=BEFORE variable
+  [[ ! -e "$PHASE_FILE" ]] || prefix=AFTER
+  case "$name" in
+    input_deny) variable="${{prefix}}_INPUT" ;;
+    forward_deny) variable="${{prefix}}_FORWARD" ;;
+    output_deny) variable="${{prefix}}_OUTPUT" ;;
+  esac
+  printf '%s\\n' "${{!variable}}"
+}}
+record() {{ :; }}
+block() {{ printf '%s\\n' "$1"; exit 91; }}
+trigger() {{ : >"$PHASE_FILE"; return 1; }}
+{function}
+expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED trigger
+printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
+"""
+                return subprocess.run(
+                    [bash_executable()],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+        accepted = execute(0, 0, 2)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("expected-output=2", accepted.stdout)
+        rejected = execute(1, 0, 2)
+        self.assertEqual(rejected.returncode, 91, rejected.stderr)
+        self.assertEqual(rejected.stdout.strip(), "EXTERNAL_DNS_NOT_FIREWALL_CORRELATED")
 
     def test_backend_tool_and_privilege_absence_fail_before_mutation(self) -> None:
         with mock.patch.object(firewall_boundary.shutil, "which", return_value=None):
@@ -4028,14 +4250,14 @@ class FirewallBoundaryTests(unittest.TestCase):
     def test_install_rejects_collision_and_atomic_check_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
-            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+            with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", return_value=owned_firewall_entries()
             ):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_TABLE_COLLISION"):
                     firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
             foreign = [{"table": {"family": "ip", "name": "foreign"}}]
             failed = subprocess.CompletedProcess([], 1, stdout="", stderr="invalid")
-            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+            with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", return_value=foreign
             ), mock.patch.object(firewall_boundary, "_run", return_value=failed):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_CHECK_FAILED"):
@@ -4047,13 +4269,20 @@ class FirewallBoundaryTests(unittest.TestCase):
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
-            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+            sanitized = io.StringIO()
+            with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", side_effect=[foreign, foreign + owned_firewall_entries()]
-            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(io.StringIO()):
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(sanitized):
                 firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
             saved = firewall_boundary.read_ledger(ledger)
             self.assertTrue(saved["installed"])
             self.assertRegex(saved["owned_sha256"], r"^[0-9a-f]{64}$")
+            state = sanitized.getvalue()
+            self.assertIn("firewall.daemon_class\tstr\tsingle-root-owned-dockerd", state)
+            self.assertIn("firewall.docker_daemon_root_owned\tbool\ttrue", state)
+            self.assertIn("firewall.runner_nonroot\tbool\ttrue", state)
+            self.assertIn("firewall.owned_counter_count\tint\t3", state)
+            self.assertNotIn("dockerd\nUid:", state)
             expected_mode = "0o666" if os.name == "nt" else "0o600"
             self.assertEqual(oct(ledger.stat().st_mode & 0o777), expected_mode)
 
@@ -4064,14 +4293,14 @@ class FirewallBoundaryTests(unittest.TestCase):
         failed = subprocess.CompletedProcess([], 1, stdout="", stderr="rejected")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
-            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+            with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", return_value=foreign
             ), mock.patch.object(firewall_boundary, "_run", side_effect=[success, failed]):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_INSTALL_FAILED"):
                     firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
             self.assertTrue(ledger.exists())
             ledger.unlink()
-            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+            with mock.patch.object(firewall_boundary, "process_ownership_preflight", return_value=("single-root-owned-dockerd", True, True)), mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
                 firewall_boundary, "read_ruleset", side_effect=[foreign, changed + owned_firewall_entries()]
             ), mock.patch.object(firewall_boundary, "_run", return_value=success):
                 with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_FOREIGN_STATE_DRIFT"):
@@ -4081,8 +4310,12 @@ class FirewallBoundaryTests(unittest.TestCase):
     def test_counter_schema_is_closed_and_exact(self) -> None:
         entries = owned_firewall_entries()
         entries[1]["counter"]["packets"] = 7
+        entries[3]["counter"]["packets"] = 11
         self.assertEqual(
             firewall_boundary.counter_packets(entries, firewall_boundary.INPUT_COUNTER), 7
+        )
+        self.assertEqual(
+            firewall_boundary.counter_packets(entries, firewall_boundary.OUTPUT_COUNTER), 11
         )
         entries.append(nft_entry("counter", name=firewall_boundary.INPUT_COUNTER, packets=8, bytes=0))
         with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_COUNTER_INVALID"):

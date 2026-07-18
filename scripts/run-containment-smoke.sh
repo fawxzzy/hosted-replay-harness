@@ -87,6 +87,7 @@ SMOKE_PASSED=0
 FINALIZING=0
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
+EXPECTED_OUTPUT_DENIES=0
 
 CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
@@ -1127,7 +1128,7 @@ firewall_counter_value() {
   local counter="$1" counter_file="$RUNTIME/firewall-counters.tsv" value
   python3 -B "$ROOT/scripts/firewall_boundary.py" counters --ledger "$FIREWALL_LEDGER" \
     >"$counter_file" 2>"$RAW/firewall-counters.log" || block FIREWALL_COUNTER_READ_FAILED
-  [[ "$(wc -l <"$counter_file" | tr -d ' ')" == "2" ]] || block FIREWALL_COUNTER_INVALID
+  [[ "$(wc -l <"$counter_file" | tr -d ' ')" == "3" ]] || block FIREWALL_COUNTER_INVALID
   value="$(awk -F '\t' -v key="firewall.counters.${counter}" '$1==key && $2=="int"{print $3; exit}' "$counter_file")"
   [[ "$value" =~ ^[0-9]+$ ]] || block FIREWALL_COUNTER_INVALID
   printf '%s\n' "$value"
@@ -1136,21 +1137,48 @@ firewall_counter_value() {
 expect_firewall_block() {
   local receipt_key="$1" counter="$2" success_code="$3" correlation_code="$4"
   shift 4
-  local before after command_rc
-  before="$(firewall_counter_value "$counter")"
+  local before_input before_forward before_output after_input after_forward after_output before after command_rc
+  before_input="$(firewall_counter_value input_deny)"
+  before_forward="$(firewall_counter_value forward_deny)"
+  before_output="$(firewall_counter_value output_deny)"
   set +e
   "$@" >"$RAW/canary-${receipt_key}.log" 2>&1
   command_rc="$?"
   set -e
-  after="$(firewall_counter_value "$counter")"
+  after_input="$(firewall_counter_value input_deny)"
+  after_forward="$(firewall_counter_value forward_deny)"
+  after_output="$(firewall_counter_value output_deny)"
   [[ "$command_rc" != "0" ]] || block "$success_code"
+  case "$counter" in
+    input_deny)
+      before="$before_input"
+      after="$after_input"
+      [[ "$after_forward" == "$before_forward" && "$after_output" == "$before_output" ]] \
+        || block "$correlation_code"
+      ;;
+    forward_deny)
+      before="$before_forward"
+      after="$after_forward"
+      [[ "$after_input" == "$before_input" && "$after_output" == "$before_output" ]] \
+        || block "$correlation_code"
+      ;;
+    output_deny)
+      before="$before_output"
+      after="$after_output"
+      [[ "$after_input" == "$before_input" && "$after_forward" == "$before_forward" ]] \
+        || block "$correlation_code"
+      ;;
+    *) block FIREWALL_COUNTER_INVALID ;;
+  esac
   (( after > before )) || block "$correlation_code"
   record "canaries.firewall.${receipt_key}_failed" bool true
   record "canaries.firewall.${receipt_key}_deny_delta" int "$(( after - before ))"
   if [[ "$counter" == "input_deny" ]]; then
     EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + after - before ))"
-  else
+  elif [[ "$counter" == "forward_deny" ]]; then
     EXPECTED_FORWARD_DENIES="$(( EXPECTED_FORWARD_DENIES + after - before ))"
+  else
+    EXPECTED_OUTPUT_DENIES="$(( EXPECTED_OUTPUT_DENIES + after - before ))"
   fi
 }
 
@@ -1238,7 +1266,7 @@ raise SystemExit(0 if legacy_tmpfs_matches(payload, sys.argv[2]) else 1)
 run_firewall_publication_rehearsal() {
   local db_password service_id foreign_id client_id foreign_ip probe_rc failure_code
   local probe_state="$RUNTIME/firewall-port-probe.tsv" firewall_install_state="$RUNTIME/firewall-install.tsv"
-  local input_before forward_before input_after forward_after
+  local input_before forward_before output_before input_after forward_after output_after
 
   record diagnostic.timing.started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   freeze_precli_objects_and_listeners
@@ -1380,17 +1408,27 @@ while True:
 
   input_before="$(firewall_counter_value input_deny)"
   forward_before="$(firewall_counter_value forward_deny)"
-  [[ "$input_before" == "0" && "$forward_before" == "0" ]] \
+  output_before="$(firewall_counter_value output_deny)"
+  [[ "$input_before" == "0" && "$forward_before" == "0" && "$output_before" == "0" ]] \
     || block FIREWALL_UNEXPECTED_PRECANARY_HIT
+  docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME" \
+    >"$RAW/same-network-resolution.log" 2>&1 || block SAME_NETWORK_SERVICE_DISCOVERY_FAILED
+  input_after="$(firewall_counter_value input_deny)"
+  forward_after="$(firewall_counter_value forward_deny)"
+  output_after="$(firewall_counter_value output_deny)"
+  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" && "$output_after" == "$output_before" ]] \
+    || block SAME_NETWORK_RESOLUTION_HIT_DENY_RULE
+  record canaries.firewall.same_network_resolution bool true
   docker exec "$client_id" pg_isready -h "$FIREWALL_DB_NAME" -p 5432 -t 5 \
     >"$RAW/same-network-connect.log" 2>&1 || block SAME_NETWORK_CONTAINER_CONNECT_FAILED
   input_after="$(firewall_counter_value input_deny)"
   forward_after="$(firewall_counter_value forward_deny)"
-  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" ]] \
+  output_after="$(firewall_counter_value output_deny)"
+  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" && "$output_after" == "$output_before" ]] \
     || block SAME_NETWORK_TRAFFIC_HIT_DENY_RULE
   record canaries.firewall.same_network_connect bool true
 
-  expect_firewall_block external_dns forward_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 5 getent ahostsv4 example.com
   expect_firewall_block literal_ip forward_deny LITERAL_IP_EGRESS_SUCCEEDED LITERAL_IP_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 3 bash -ceu '</dev/tcp/1.1.1.1/443'
@@ -1412,10 +1450,12 @@ while True:
   record canaries.firewall.docker_control_available bool true
   input_after="$(firewall_counter_value input_deny)"
   forward_after="$(firewall_counter_value forward_deny)"
-  [[ "$input_after" == "$EXPECTED_INPUT_DENIES" && "$forward_after" == "$EXPECTED_FORWARD_DENIES" ]] \
+  output_after="$(firewall_counter_value output_deny)"
+  [[ "$input_after" == "$EXPECTED_INPUT_DENIES" && "$forward_after" == "$EXPECTED_FORWARD_DENIES" && "$output_after" == "$EXPECTED_OUTPUT_DENIES" ]] \
     || block FIREWALL_UNEXPECTED_DENY_HIT
   record firewall.final_input_deny_count int "$input_after"
   record firewall.final_forward_deny_count int "$forward_after"
+  record firewall.final_output_deny_count int "$output_after"
   record firewall.unexpected_deny_hit_count int 0
   native_listener_contract post_cli \
     || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"

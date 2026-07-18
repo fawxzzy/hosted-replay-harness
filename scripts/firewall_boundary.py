@@ -20,12 +20,14 @@ import sys
 from typing import Any
 
 
-SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v1"
+SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v2"
 TABLE = "fp_hosted_replay_ro_001"
 INPUT_CHAIN = "packet_input"
 FORWARD_CHAIN = "packet_forward"
+OUTPUT_CHAIN = "packet_output"
 INPUT_COUNTER = "packet_input_deny"
 FORWARD_COUNTER = "packet_forward_deny"
+OUTPUT_COUNTER = "packet_output_deny"
 VERSION_RE = re.compile(r"^nftables v([0-9]+)\.([0-9]+)\.([0-9]+)(?:[ -].*)?$")
 SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 SAFE_IFACE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
@@ -96,6 +98,55 @@ def privileged_prefix() -> tuple[list[str], str]:
     if compatibility.returncode != 0 or "(nf_tables)" not in compatibility.stdout:
         raise BoundaryError("FIREWALL_BACKEND_AMBIGUOUS")
     return [sudo, "-n", nft], f"nftables-v{match.group(1)}-iptables-nft"
+
+
+def _process_uids(status: str) -> tuple[int, int]:
+    lines = [line for line in status.splitlines() if line.startswith("Uid:")]
+    if len(lines) != 1:
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_IDENTITY_UNAVAILABLE")
+    fields = lines[0].split()
+    if len(fields) != 5 or any(not field.isdigit() for field in fields[1:]):
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_IDENTITY_UNAVAILABLE")
+    return int(fields[1]), int(fields[2])
+
+
+def process_ownership_preflight(
+    proc_root: Path = Path("/proc"), *, runner_euid: int | None = None
+) -> tuple[str, bool, bool]:
+    if runner_euid is None:
+        if not hasattr(os, "geteuid"):
+            raise BoundaryError("FIREWALL_RUNNER_IDENTITY_UNAVAILABLE")
+        runner_euid = os.geteuid()
+    if not isinstance(runner_euid, int) or runner_euid < 0:
+        raise BoundaryError("FIREWALL_RUNNER_IDENTITY_UNAVAILABLE")
+    if runner_euid == 0:
+        raise BoundaryError("FIREWALL_RUNNER_ROOT")
+
+    daemon_uids: list[tuple[int, int]] = []
+    try:
+        candidates = list(proc_root.iterdir())
+    except OSError as exc:
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_IDENTITY_UNAVAILABLE") from exc
+    for candidate in candidates:
+        if not candidate.name.isdigit():
+            continue
+        try:
+            command_name = (candidate / "comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if command_name != "dockerd":
+            continue
+        try:
+            daemon_uids.append(_process_uids((candidate / "status").read_text(encoding="utf-8")))
+        except OSError as exc:
+            raise BoundaryError("FIREWALL_DOCKER_DAEMON_IDENTITY_UNAVAILABLE") from exc
+    if not daemon_uids:
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_MISSING")
+    if len(daemon_uids) != 1:
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_AMBIGUOUS")
+    if daemon_uids[0] != (0, 0):
+        raise BoundaryError("FIREWALL_DOCKER_DAEMON_NOT_ROOT")
+    return "single-root-owned-dockerd", True, True
 
 
 def parse_ruleset(raw: str) -> list[dict[str, Any]]:
@@ -177,23 +228,119 @@ def build_batch(table_name: str, interface: str, subnet: str) -> str:
             f"add table inet {table_name}",
             f"add counter inet {table_name} {INPUT_COUNTER}",
             f"add counter inet {table_name} {FORWARD_COUNTER}",
+            f"add counter inet {table_name} {OUTPUT_COUNTER}",
             f"add chain inet {table_name} {INPUT_CHAIN} {{ type filter hook input priority -10; policy accept; }}",
             f"add chain inet {table_name} {FORWARD_CHAIN} {{ type filter hook forward priority -10; policy accept; }}",
+            f"add chain inet {table_name} {OUTPUT_CHAIN} {{ type filter hook output priority -10; policy accept; }}",
             f'add rule inet {table_name} {INPUT_CHAIN} iifname "{interface}" ip saddr {subnet} ct state established,related accept',
             f'add rule inet {table_name} {INPUT_CHAIN} iifname "{interface}" ip saddr {subnet} counter name {INPUT_COUNTER} drop',
             f'add rule inet {table_name} {FORWARD_CHAIN} iifname "{interface}" oifname "{interface}" ip saddr {subnet} ip daddr {subnet} accept',
             f'add rule inet {table_name} {FORWARD_CHAIN} iifname "{interface}" ip saddr {subnet} ct state established,related accept',
             f'add rule inet {table_name} {FORWARD_CHAIN} iifname "{interface}" ip saddr {subnet} counter name {FORWARD_COUNTER} drop',
+            f"add rule inet {table_name} {OUTPUT_CHAIN} meta skuid 0 udp dport 53 counter name {OUTPUT_COUNTER} drop",
+            f"add rule inet {table_name} {OUTPUT_CHAIN} meta skuid 0 tcp dport 53 counter name {OUTPUT_COUNTER} drop",
             "",
         )
     )
 
 
+def _require_exact_keys(payload: dict[str, Any], required: set[str], optional: set[str]) -> None:
+    keys = set(payload)
+    if not required.issubset(keys) or not keys.issubset(required | optional):
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+
+
 def validate_owned(entries: list[dict[str, Any]], table_name: str) -> tuple[str, dict[str, int]]:
     selected = owned_entries(entries, table_name)
     digest, counts = canonical_snapshot(selected)
-    expected = {"chain": 2, "counter": 2, "rule": 5, "table": 1}
+    expected = {"chain": 3, "counter": 3, "rule": 7, "table": 1}
     if counts != expected:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+
+    by_kind: dict[str, list[dict[str, Any]]] = {kind: [] for kind in expected}
+    for entry in selected:
+        if len(entry) != 1:
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        kind = next(iter(entry))
+        payload = entry[kind]
+        if kind not in by_kind or not isinstance(payload, dict):
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        by_kind[kind].append(payload)
+
+    table = by_kind["table"][0]
+    _require_exact_keys(table, {"family", "name"}, {"handle"})
+    if table.get("family") != "inet" or table.get("name") != table_name:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+
+    expected_counters = {INPUT_COUNTER, FORWARD_COUNTER, OUTPUT_COUNTER}
+    counter_names: list[str] = []
+    for counter in by_kind["counter"]:
+        _require_exact_keys(
+            counter,
+            {"family", "table", "name", "packets", "bytes"},
+            {"handle"},
+        )
+        if counter.get("family") != "inet" or counter.get("table") != table_name:
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        if any(
+            not isinstance(counter.get(field), int) or counter[field] < 0
+            for field in ("packets", "bytes")
+        ):
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        counter_names.append(counter.get("name"))
+    if len(set(counter_names)) != 3 or set(counter_names) != expected_counters:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+
+    expected_chains = {
+        INPUT_CHAIN: "input",
+        FORWARD_CHAIN: "forward",
+        OUTPUT_CHAIN: "output",
+    }
+    chain_names: list[str] = []
+    for chain in by_kind["chain"]:
+        _require_exact_keys(
+            chain,
+            {"family", "table", "name", "type", "hook", "prio", "policy"},
+            {"handle"},
+        )
+        name = chain.get("name")
+        if (
+            chain.get("family") != "inet"
+            or chain.get("table") != table_name
+            or name not in expected_chains
+            or chain.get("type") != "filter"
+            or chain.get("hook") != expected_chains[name]
+            or chain.get("prio") != -10
+            or chain.get("policy") != "accept"
+        ):
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        chain_names.append(name)
+    if len(set(chain_names)) != 3 or set(chain_names) != set(expected_chains):
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+
+    expected_rule_counts = {INPUT_CHAIN: 2, FORWARD_CHAIN: 3, OUTPUT_CHAIN: 2}
+    observed_rule_counts = {name: 0 for name in expected_rule_counts}
+    expression_digests: dict[str, set[str]] = {name: set() for name in expected_rule_counts}
+    for rule in by_kind["rule"]:
+        _require_exact_keys(rule, {"family", "table", "chain", "expr"}, {"handle"})
+        chain = rule.get("chain")
+        expressions = rule.get("expr")
+        if (
+            rule.get("family") != "inet"
+            or rule.get("table") != table_name
+            or chain not in expected_rule_counts
+            or not isinstance(expressions, list)
+            or not expressions
+        ):
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        observed_rule_counts[chain] += 1
+        expression_digest = hashlib.sha256(
+            json.dumps(expressions, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if expression_digest in expression_digests[chain]:
+            raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+        expression_digests[chain].add(expression_digest)
+    if observed_rule_counts != expected_rule_counts:
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
     return digest, counts
 
@@ -257,6 +404,7 @@ def read_ledger(path: Path) -> dict[str, Any]:
 def install(ledger_path: Path, interface: str, subnet: str) -> None:
     if os.path.lexists(ledger_path):
         raise BoundaryError("FIREWALL_LEDGER_COLLISION")
+    daemon_class, daemon_root_owned, runner_nonroot = process_ownership_preflight()
     prefix, backend_class = privileged_prefix()
     entries = read_ruleset(prefix)
     if owned_entries(entries, TABLE):
@@ -292,6 +440,9 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     emit(
         [
             ("firewall.backend_class", "str", backend_class),
+            ("firewall.daemon_class", "str", daemon_class),
+            ("firewall.docker_daemon_root_owned", "bool", daemon_root_owned),
+            ("firewall.runner_nonroot", "bool", runner_nonroot),
             ("firewall.atomic_install", "bool", True),
             ("firewall.preimage_sha256", "str", pre_sha),
             ("firewall.preimage_table_count", "int", pre_counts.get("table", 0)),
@@ -299,6 +450,7 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
             ("firewall.preimage_rule_count", "int", pre_counts.get("rule", 0)),
             ("firewall.owned_sha256", "str", owned_sha),
             ("firewall.owned_chain_count", "int", owned_counts["chain"]),
+            ("firewall.owned_counter_count", "int", owned_counts["counter"]),
             ("firewall.owned_rule_count", "int", owned_counts["rule"]),
         ]
     )
@@ -331,6 +483,7 @@ def counters(ledger_path: Path) -> None:
         [
             ("firewall.counters.input_deny", "int", counter_packets(entries, INPUT_COUNTER)),
             ("firewall.counters.forward_deny", "int", counter_packets(entries, FORWARD_COUNTER)),
+            ("firewall.counters.output_deny", "int", counter_packets(entries, OUTPUT_COUNTER)),
         ]
     )
 
