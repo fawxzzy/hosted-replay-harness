@@ -25,6 +25,7 @@ ROLE = "direct-postgres"
 CONTAINER_NAME = f"{PROJECT}-direct-postgres"
 DB_PORT = "56422"
 DB_DESTINATION = "/var/lib/postgresql/data"
+DB_CONTAINER_PORT = "5432/tcp"
 LEGACY_TMPFS_BASE_OPTIONS = frozenset({"rw", "nosuid", "nodev", "noexec"})
 EXPECTED_LABELS = {
     "io.fawxzzy.packet": PACKET,
@@ -56,7 +57,9 @@ def _template() -> str:
             "cap_add": "__CAP_ADD__",
             "security_opt": "__SECURITY_OPT__",
             "extra_hosts": "__EXTRA_HOSTS__",
+            "config_exposed_ports": "__CONFIG_EXPOSED_PORTS__",
             "port_bindings": "__PORT_BINDINGS__",
+            "publish_all_ports": "__PUBLISH_ALL_PORTS__",
             "restart_policy": "__RESTART_POLICY__",
             "mounts": "__MOUNTS__",
             "networks": "__NETWORKS__",
@@ -91,7 +94,9 @@ def _template() -> str:
         '"__CAP_ADD__"': "{{json .HostConfig.CapAdd}}",
         '"__SECURITY_OPT__"': "{{json .HostConfig.SecurityOpt}}",
         '"__EXTRA_HOSTS__"': "{{json .HostConfig.ExtraHosts}}",
+        '"__CONFIG_EXPOSED_PORTS__"': "{{json .Config.ExposedPorts}}",
         '"__PORT_BINDINGS__"': "{{json .HostConfig.PortBindings}}",
+        '"__PUBLISH_ALL_PORTS__"': "{{json .HostConfig.PublishAllPorts}}",
         '"__RESTART_POLICY__"': "{{json .HostConfig.RestartPolicy}}",
         '"__MOUNTS__"': "{{json .Mounts}}",
         '"__NETWORKS__"': "{{json .NetworkSettings.Networks}}",
@@ -110,6 +115,36 @@ def _template() -> str:
 
 
 INSPECT_TEMPLATE = _template()
+
+
+def _publication_template() -> str:
+    template = json.dumps(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "config": {"exposed_ports": "__CONFIG_EXPOSED_PORTS__"},
+            "host_config": {
+                "port_bindings": "__PORT_BINDINGS__",
+                "publish_all_ports": "__PUBLISH_ALL_PORTS__",
+            },
+            "network_settings": {"ports": "__PUBLISHED_PORTS__"},
+        },
+        separators=(",", ":"),
+    )
+    replacements = {
+        '"__CONFIG_EXPOSED_PORTS__"': "{{json .Config.ExposedPorts}}",
+        '"__PORT_BINDINGS__"': "{{json .HostConfig.PortBindings}}",
+        '"__PUBLISH_ALL_PORTS__"': "{{json .HostConfig.PublishAllPorts}}",
+        '"__PUBLISHED_PORTS__"': "{{json .NetworkSettings.Ports}}",
+    }
+    for placeholder, expression in replacements.items():
+        template = template.replace(placeholder, expression)
+    return template
+
+
+PUBLICATION_INSPECT_TEMPLATE = _publication_template()
+PUBLICATION_VALUE_CLASSES = frozenset(
+    {"ABSENT", "NULL", "EMPTY_LIST", "NONEMPTY_LIST", "WRONG_TYPE"}
+)
 
 
 def identity_digest(value: str) -> str:
@@ -134,6 +169,194 @@ def legacy_tmpfs_matches(value: Any, expected_size: str) -> bool:
     if len(options) != len(set(options)):
         return False
     return set(options) == LEGACY_TMPFS_BASE_OPTIONS | {f"size={expected_size}"}
+
+
+class DuplicateJsonKeyError(ValueError):
+    """Raised when an inspected JSON object contains an ambiguous duplicate key."""
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(key)
+        result[key] = value
+    return result
+
+
+def strict_json_object(raw: bytes | str) -> dict[str, Any]:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="strict")
+    value = json.loads(raw, object_pairs_hook=_strict_object)
+    if not isinstance(value, dict):
+        raise ValueError("top-level JSON value is not an object")
+    return value
+
+
+def _valid_port_key(value: Any) -> bool:
+    if not isinstance(value, str) or "/" not in value:
+        return False
+    port, protocol = value.rsplit("/", 1)
+    return (
+        port.isascii()
+        and port.isdigit()
+        and 1 <= int(port) <= 65535
+        and protocol in {"tcp", "udp", "sctp"}
+    )
+
+
+def _exposed_port_summary(value: Any) -> tuple[dict[str, int | bool], bool]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        return {}, False
+    for key, marker in value.items():
+        if not _valid_port_key(key) or marker not in (None, {}):
+            return {}, False
+    return {
+        "config_exposed_ports_key_count": len(value),
+        "config_exposed_ports_5432_present": DB_CONTAINER_PORT in value,
+    }, True
+
+
+def _binding_map_summary(
+    value: Any,
+) -> tuple[dict[str, int | bool], dict[str, tuple[tuple[str, str], ...]], bool]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        return {}, {}, False
+    signatures: dict[str, tuple[tuple[str, str], ...]] = {}
+    total = 0
+    for key, bindings in value.items():
+        if not _valid_port_key(key):
+            return {}, {}, False
+        if bindings is None:
+            signatures[key] = ()
+            continue
+        if not isinstance(bindings, list):
+            return {}, {}, False
+        normalized: list[tuple[str, str]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict) or set(binding) != {"HostIp", "HostPort"}:
+                return {}, {}, False
+            host_ip = binding.get("HostIp")
+            host_port = binding.get("HostPort")
+            if not isinstance(host_ip, str) or not isinstance(host_port, str):
+                return {}, {}, False
+            normalized.append((host_ip, host_port))
+        signatures[key] = tuple(normalized)
+        total += len(normalized)
+    db_bindings = signatures.get(DB_CONTAINER_PORT, ())
+    return {
+        "key_count": len(value),
+        "port_5432_present": DB_CONTAINER_PORT in value,
+        "port_5432_binding_count": len(db_bindings),
+        "total_binding_count": total,
+    }, signatures, True
+
+
+def _network_5432_value_class(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "WRONG_TYPE"
+    if DB_CONTAINER_PORT not in value:
+        return "ABSENT"
+    bindings = value[DB_CONTAINER_PORT]
+    if bindings is None:
+        return "NULL"
+    if not isinstance(bindings, list):
+        return "WRONG_TYPE"
+    return "EMPTY_LIST" if not bindings else "NONEMPTY_LIST"
+
+
+def _publication_digest(summary: dict[str, Any]) -> str:
+    canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def classify_unpublished_publication_shape(
+    data: dict[str, Any], *, subject: str = "FIREWALL_CLIENT"
+) -> dict[str, Any]:
+    """Classify every Docker publication surface without retaining binding values."""
+
+    schema_failure = f"{subject}_PUBLICATION_SCHEMA_REJECTED"
+    expected_top = {"schema_version", "config", "host_config", "network_settings"}
+    if set(data) != expected_top or data.get("schema_version") != SCHEMA_VERSION:
+        return {"class": schema_failure}
+    config = data.get("config")
+    host_config = data.get("host_config")
+    network_settings = data.get("network_settings")
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"exposed_ports"}
+        or not isinstance(host_config, dict)
+        or set(host_config) != {"port_bindings", "publish_all_ports"}
+        or not isinstance(network_settings, dict)
+        or set(network_settings) != {"ports"}
+    ):
+        return {"class": schema_failure}
+
+    exposed, exposed_valid = _exposed_port_summary(config["exposed_ports"])
+    requested, request_signatures, requested_valid = _binding_map_summary(
+        host_config["port_bindings"]
+    )
+    published_value = network_settings["ports"]
+    value_class = _network_5432_value_class(published_value)
+    published, published_signatures, published_valid = _binding_map_summary(
+        published_value
+    )
+    publish_all = host_config["publish_all_ports"]
+    if (
+        not exposed_valid
+        or not requested_valid
+        or not published_valid
+        or not isinstance(publish_all, bool)
+        or value_class not in PUBLICATION_VALUE_CLASSES
+        or value_class == "WRONG_TYPE"
+    ):
+        return {"class": schema_failure, "network_ports_5432_value_class": value_class}
+
+    summary: dict[str, Any] = {
+        **exposed,
+        "host_port_bindings_key_count": requested["key_count"],
+        "host_port_bindings_5432_present": requested["port_5432_present"],
+        "host_port_bindings_5432_binding_count": requested[
+            "port_5432_binding_count"
+        ],
+        "host_port_bindings_total_binding_count": requested[
+            "total_binding_count"
+        ],
+        "host_publish_all_ports": publish_all,
+        "network_ports_key_count": published["key_count"],
+        "network_ports_5432_value_class": value_class,
+        "network_ports_5432_binding_count": published["port_5432_binding_count"],
+        "network_ports_total_binding_count": published["total_binding_count"],
+    }
+    summary["digest"] = _publication_digest(summary)
+
+    requested_nonempty = {
+        key: tuple(sorted(host_port for _, host_port in bindings))
+        for key, bindings in request_signatures.items()
+        if bindings
+    }
+    published_nonempty = {
+        key: tuple(sorted(host_port for _, host_port in bindings))
+        for key, bindings in published_signatures.items()
+        if bindings
+    }
+    if (
+        requested_nonempty
+        and published_nonempty
+        and requested_nonempty != published_nonempty
+    ):
+        classification = schema_failure
+    elif publish_all or requested_nonempty:
+        classification = f"{subject}_PUBLICATION_REQUEST_REJECTED"
+    elif published_nonempty:
+        classification = f"{subject}_PUBLICATION_RUNTIME_REJECTED"
+    else:
+        classification = f"{subject}_PUBLICATION_SHAPE_SAFE"
+    return {"class": classification, **summary}
 
 
 def _contains_docker_socket(value: Any) -> bool:
@@ -214,11 +437,29 @@ def validate_inspection(
     if not legacy_tmpfs_matches(tmpfs, "1g"):
         violations.append("DIRECT_TMPFS_CONTRACT_MISMATCH")
 
+    publication = classify_unpublished_publication_shape(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "config": {"exposed_ports": data.get("config_exposed_ports")},
+            "host_config": {
+                "port_bindings": data.get("port_bindings"),
+                "publish_all_ports": data.get("publish_all_ports"),
+            },
+            "network_settings": {"ports": data.get("published_ports")},
+        },
+        subject="DIRECT",
+    )
+    if publication.get("class") == "DIRECT_PUBLICATION_SCHEMA_REJECTED":
+        violations.append("DIRECT_PUBLICATION_SCHEMA_INVALID")
+    if data.get("publish_all_ports") is not False:
+        violations.append("DIRECT_PUBLISH_ALL_PORTS_REJECTED")
     requested = data.get("port_bindings")
-    if requested != {"5432/tcp": [{"HostIp": "", "HostPort": DB_PORT}]}:
+    if requested != {DB_CONTAINER_PORT: [{"HostIp": "", "HostPort": DB_PORT}]}:
         violations.append("DIRECT_PORT_REQUEST_MISMATCH")
     published = data.get("published_ports")
-    if published != {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": DB_PORT}]}:
+    if published != {
+        DB_CONTAINER_PORT: [{"HostIp": "127.0.0.1", "HostPort": DB_PORT}]
+    }:
         violations.append("DIRECT_PORT_BINDING_MISMATCH")
     restart_policy = data.get("restart_policy")
     if not isinstance(restart_policy, dict) or restart_policy.get("Name") not in (None, "", "no"):
@@ -247,16 +488,15 @@ def safe_inspect(container_id: str) -> dict[str, Any] | None:
     completed = subprocess.run(
         ["docker", "inspect", "--format", INSPECT_TEMPLATE, container_id],
         capture_output=True,
-        text=True,
         check=False,
     )
     if completed.returncode != 0:
         return None
     try:
-        payload = json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError):
+        payload = strict_json_object(completed.stdout)
+    except (DuplicateJsonKeyError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
-    return payload if isinstance(payload, dict) else None
+    return payload
 
 
 def global_ip_addresses() -> list[str]:
@@ -313,7 +553,116 @@ def state_line(key: str, kind: str, value: Any) -> str:
     return f"{key}\t{kind}\t{rendered}"
 
 
+def inspect_unpublished_publication(
+    container_id: str, subject: str
+) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["docker", "inspect", "--format", PUBLICATION_INSPECT_TEMPLATE, container_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {"class": f"{subject}_PUBLICATION_INSPECT_FAILED"}
+    try:
+        payload = strict_json_object(completed.stdout)
+    except (
+        DuplicateJsonKeyError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        return {"class": f"{subject}_PUBLICATION_PARSE_FAILED"}
+    return classify_unpublished_publication_shape(payload, subject=subject)
+
+
+def publication_state_lines(prefix: str, result: dict[str, Any]) -> list[str]:
+    allowed = {
+        "class": "str",
+        "config_exposed_ports_key_count": "int",
+        "config_exposed_ports_5432_present": "bool",
+        "host_port_bindings_key_count": "int",
+        "host_port_bindings_5432_present": "bool",
+        "host_port_bindings_5432_binding_count": "int",
+        "host_port_bindings_total_binding_count": "int",
+        "host_publish_all_ports": "bool",
+        "network_ports_key_count": "int",
+        "network_ports_5432_value_class": "str",
+        "network_ports_5432_binding_count": "int",
+        "network_ports_total_binding_count": "int",
+        "digest": "str",
+    }
+    if set(result) - set(allowed):
+        raise ValueError("publication result contains an unallowlisted key")
+    classes = {
+        f"{subject}_PUBLICATION_{suffix}"
+        for subject in ("FIREWALL_CLIENT", "FOREIGN_CANARY")
+        for suffix in (
+            "SHAPE_SAFE",
+            "REQUEST_REJECTED",
+            "RUNTIME_REJECTED",
+            "SCHEMA_REJECTED",
+            "INSPECT_FAILED",
+            "PARSE_FAILED",
+        )
+    }
+    classification = result.get("class")
+    if classification not in classes:
+        raise ValueError("publication result contains an invalid class")
+    for key, value in result.items():
+        kind = allowed[key]
+        if kind == "bool" and not isinstance(value, bool):
+            raise ValueError("publication boolean field has an invalid type")
+        if kind == "int" and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError("publication integer field has an invalid type")
+        if kind == "str" and not isinstance(value, str):
+            raise ValueError("publication string field has an invalid type")
+    if "network_ports_5432_value_class" in result and result[
+        "network_ports_5432_value_class"
+    ] not in PUBLICATION_VALUE_CLASSES:
+        raise ValueError("publication value class is not allowlisted")
+    if "digest" in result and (
+        len(result["digest"]) != 64
+        or any(character not in "0123456789abcdef" for character in result["digest"])
+    ):
+        raise ValueError("publication digest is invalid")
+    return [
+        state_line(f"diagnostic.publication.{prefix}.{key}", allowed[key], result[key])
+        for key in allowed
+        if key in result
+    ]
+
+
+def publication_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--container-id", required=True)
+    parser.add_argument(
+        "--subject", required=True, choices=("FIREWALL_CLIENT", "FOREIGN_CANARY")
+    )
+    parser.add_argument(
+        "--receipt-prefix",
+        required=True,
+        choices=("firewall_client", "foreign_canary"),
+    )
+    args = parser.parse_args(argv)
+    expected_prefix = {
+        "FIREWALL_CLIENT": "firewall_client",
+        "FOREIGN_CANARY": "foreign_canary",
+    }[args.subject]
+    if args.receipt_prefix != expected_prefix:
+        return 1
+    result = inspect_unpublished_publication(args.container_id, args.subject)
+    for line in publication_state_lines(args.receipt_prefix, result):
+        print(line)
+    return 0 if result.get("class") == f"{args.subject}_PUBLICATION_SHAPE_SAFE" else 1
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "validate-unpublished":
+        return publication_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--container-id", required=True)
     parser.add_argument("--network-id", required=True)

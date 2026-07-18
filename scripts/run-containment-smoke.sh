@@ -1170,6 +1170,7 @@ wait_healthy_container() {
 validate_unpublished_container() {
   local container_id="$1" expected_network_mode="$2" expected_tmpfs_size="$3" code_prefix="$4"
   local tmpfs_json
+  local publication_key publication_state publication_class publication_rc
   [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == "$expected_network_mode" ]] \
     || block "${code_prefix}_NETWORK_MISMATCH"
   [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container_id")" == "false" ]] \
@@ -1209,8 +1210,29 @@ except (TypeError, ValueError):
     raise SystemExit(1)
 raise SystemExit(0 if legacy_tmpfs_matches(payload, sys.argv[2]) else 1)
 ' "$ROOT/scripts" "$expected_tmpfs_size" || block "${code_prefix}_MOUNT_REJECTED"
-  [[ "$(docker inspect --format '{{len (index .NetworkSettings.Ports "5432/tcp")}}' "$container_id")" == "0" ]] \
-    || block "${code_prefix}_PUBLICATION_REJECTED"
+  case "$code_prefix" in
+    FIREWALL_CLIENT) publication_key=firewall_client ;;
+    FOREIGN_CANARY) publication_key=foreign_canary ;;
+    *) block "${code_prefix}_PUBLICATION_SCHEMA_REJECTED" ;;
+  esac
+  publication_state="$RUNTIME/publication-${publication_key}.tsv"
+  set +e
+  python3 -B "$ROOT/scripts/direct_port_probe.py" validate-unpublished \
+    --container-id "$container_id" \
+    --subject "$code_prefix" \
+    --receipt-prefix "$publication_key" \
+    >"$publication_state" 2>"$RAW/publication-${publication_key}.log"
+  publication_rc="$?"
+  set -e
+  [[ -s "$publication_state" ]] || block "${code_prefix}_PUBLICATION_INSPECT_FAILED"
+  cat "$publication_state" >>"$STATE_FILE"
+  publication_class="$(awk -F '\t' -v key="diagnostic.publication.${publication_key}.class" \
+    '$1==key && $2=="str"{print $3; exit}' "$publication_state")"
+  [[ "$publication_class" =~ ^${code_prefix}_PUBLICATION_[A-Z0-9_]+$ ]] \
+    || block "${code_prefix}_PUBLICATION_SCHEMA_REJECTED"
+  [[ "$publication_rc" == "0" ]] || block "$publication_class"
+  [[ "$publication_class" == "${code_prefix}_PUBLICATION_SHAPE_SAFE" ]] \
+    || block "$publication_class"
 }
 
 run_firewall_publication_rehearsal() {

@@ -311,6 +311,37 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner,
         )
 
+    def test_unpublished_container_uses_shared_closed_publication_shape_contract(self) -> None:
+        validator = self.runner[
+            self.runner.index("validate_unpublished_container() {") : self.runner.index(
+                "run_firewall_publication_rehearsal() {"
+            )
+        ]
+        self.assertIn('direct_port_probe.py" validate-unpublished', validator)
+        self.assertIn('cat "$publication_state" >>"$STATE_FILE"', validator)
+        self.assertIn("PUBLICATION_SHAPE_SAFE", validator)
+        self.assertNotIn("len (index .NetworkSettings.Ports", validator)
+
+    def test_firewall_client_launcher_remains_exactly_unpublished(self) -> None:
+        rehearsal = self.runner[
+            self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        client = rehearsal[
+            rehearsal.index('client_id="$(timeout') : rehearsal.index(
+                'validate_unpublished_container "$client_id"'
+            )
+        ]
+        self.assertIn('--network "$NETWORK_ID"', client)
+        self.assertIn(
+            '--tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=64m"',
+            client,
+        )
+        self.assertIn('"$POSTGRES_PULL" sleep 300', client)
+        for forbidden in ("--publish ", "--publish-all", "--expose", "-P "):
+            self.assertNotIn(forbidden, client)
+
     def test_firewall_gateway_request_and_exact_ipam_readback_precede_mutation(self) -> None:
         request_check = 'gateway_contract request "$SUBNET" "$SUBNET_GATEWAY"'
         network_create = 'NETWORK_ID="$(docker network create "${network_args[@]}" "$NETWORK_NAME"'
@@ -3111,7 +3142,9 @@ def direct_inspection() -> dict:
         "cap_add": [],
         "security_opt": [],
         "extra_hosts": [],
+        "config_exposed_ports": {"5432/tcp": {}},
         "port_bindings": {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]},
+        "publish_all_ports": False,
         "restart_policy": {"Name": "no", "MaximumRetryCount": 0},
         "mounts": [],
         "networks": {"packet": {"NetworkID": network_id}},
@@ -3143,6 +3176,8 @@ class DirectPortProbeTests(unittest.TestCase):
         self.assertNotIn("__ENV__", direct_port.INSPECT_TEMPLATE)
         self.assertIn("{{json .HostConfig.Mounts}}", direct_port.INSPECT_TEMPLATE)
         self.assertIn("{{json .HostConfig.VolumesFrom}}", direct_port.INSPECT_TEMPLATE)
+        self.assertIn("{{json .Config.ExposedPorts}}", direct_port.INSPECT_TEMPLATE)
+        self.assertIn("{{json .HostConfig.PublishAllPorts}}", direct_port.INSPECT_TEMPLATE)
 
     def test_legacy_tmpfs_requires_one_exact_destination_and_normalized_options(self) -> None:
         destination = "/var/lib/postgresql/data"
@@ -3177,6 +3212,179 @@ class DirectPortProbeTests(unittest.TestCase):
                         {destination: ",".join(remaining)}, "1g"
                     )
                 )
+
+    def publication_shape(
+        self,
+        *,
+        exposed_ports: object = None,
+        port_bindings: object = None,
+        publish_all_ports: object = False,
+        published_ports: object = None,
+    ) -> dict:
+        if port_bindings is None:
+            port_bindings = {}
+        if published_ports is None:
+            published_ports = {}
+        return {
+            "schema_version": 1,
+            "config": {"exposed_ports": exposed_ports},
+            "host_config": {
+                "port_bindings": port_bindings,
+                "publish_all_ports": publish_all_ports,
+            },
+            "network_settings": {"ports": published_ports},
+        }
+
+    def classify_publication(self, payload: dict) -> dict:
+        return direct_port.classify_unpublished_publication_shape(payload)
+
+    def test_unpublished_shape_accepts_absent_null_empty_and_exposed_only(self) -> None:
+        fixtures = (
+            ({}, "ABSENT", False),
+            ({"5432/tcp": None}, "NULL", False),
+            ({"5432/tcp": []}, "EMPTY_LIST", False),
+            ({"5432/tcp": None}, "NULL", True),
+        )
+        digests: list[str] = []
+        for ports, value_class, exposed in fixtures:
+            with self.subTest(value_class=value_class, exposed=exposed):
+                payload = self.publication_shape(
+                    exposed_ports={"5432/tcp": {}} if exposed else None,
+                    published_ports=ports,
+                )
+                result = self.classify_publication(payload)
+                self.assertEqual(result["class"], "FIREWALL_CLIENT_PUBLICATION_SHAPE_SAFE")
+                self.assertEqual(result["network_ports_5432_value_class"], value_class)
+                self.assertEqual(result["config_exposed_ports_5432_present"], exposed)
+                self.assertRegex(result["digest"], r"^[0-9a-f]{64}$")
+                self.assertEqual(
+                    result["digest"], self.classify_publication(payload)["digest"]
+                )
+                digests.append(result["digest"])
+        self.assertEqual(len(digests), len(set(digests)))
+        null_request = self.publication_shape()
+        null_request["host_config"]["port_bindings"] = None
+        self.assertEqual(
+            self.classify_publication(null_request)["class"],
+            "FIREWALL_CLIENT_PUBLICATION_SHAPE_SAFE",
+        )
+
+    def test_unpublished_shape_rejects_every_nonempty_binding_class(self) -> None:
+        bindings = (
+            {"HostIp": "127.0.0.1", "HostPort": "56422"},
+            {"HostIp": "0.0.0.0", "HostPort": "56422"},
+            {"HostIp": "::", "HostPort": "56422"},
+            {"HostIp": "2001:db8::10", "HostPort": "56422"},
+        )
+        for binding in bindings:
+            with self.subTest(binding_class=binding["HostIp"]):
+                mapping = {"5432/tcp": [binding]}
+                result = self.classify_publication(
+                    self.publication_shape(
+                        port_bindings=mapping,
+                        published_ports=mapping,
+                    )
+                )
+                self.assertEqual(
+                    result["class"], "FIREWALL_CLIENT_PUBLICATION_REQUEST_REJECTED"
+                )
+                self.assertEqual(result["host_port_bindings_total_binding_count"], 1)
+                self.assertEqual(result["network_ports_total_binding_count"], 1)
+                self.assertNotIn(binding["HostIp"], json.dumps(result))
+
+    def test_unpublished_shape_rejects_publish_all_other_port_and_one_sided_bindings(self) -> None:
+        other = {"8080/tcp": [{"HostIp": "", "HostPort": "49152"}]}
+        request = {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]}
+        cases = (
+            (
+                self.publication_shape(publish_all_ports=True),
+                "FIREWALL_CLIENT_PUBLICATION_REQUEST_REJECTED",
+            ),
+            (
+                self.publication_shape(port_bindings=other, published_ports=other),
+                "FIREWALL_CLIENT_PUBLICATION_REQUEST_REJECTED",
+            ),
+            (
+                self.publication_shape(port_bindings=request),
+                "FIREWALL_CLIENT_PUBLICATION_REQUEST_REJECTED",
+            ),
+            (
+                self.publication_shape(published_ports=request),
+                "FIREWALL_CLIENT_PUBLICATION_RUNTIME_REJECTED",
+            ),
+        )
+        for payload, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.classify_publication(payload)["class"], expected)
+
+    def test_unpublished_shape_rejects_conflicts_wrong_types_and_missing_objects(self) -> None:
+        request = {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]}
+        conflicting = {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}]}
+        fixtures = [
+            self.publication_shape(port_bindings=request, published_ports=conflicting),
+            self.publication_shape(
+                port_bindings=request,
+                published_ports={
+                    "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56423"}]
+                },
+            ),
+            self.publication_shape(exposed_ports=[]),
+            self.publication_shape(port_bindings=[]),
+            self.publication_shape(publish_all_ports="false"),
+            self.publication_shape(published_ports=[]),
+            self.publication_shape(published_ports={"5432/tcp": "wrong"}),
+            self.publication_shape(port_bindings={"5432/tcp": [{}]}),
+            {"schema_version": 1},
+        ]
+        for payload in fixtures:
+            with self.subTest(payload=payload):
+                result = self.classify_publication(payload)
+                self.assertEqual(
+                    result["class"], "FIREWALL_CLIENT_PUBLICATION_SCHEMA_REJECTED"
+                )
+
+    def test_publication_json_parser_rejects_malformed_duplicate_and_invalid_utf8(self) -> None:
+        malformed = (
+            b"{",
+            b'{"schema_version":1,"schema_version":1}',
+            b'{"schema_version":"\xff"}',
+        )
+        for raw in malformed:
+            with self.subTest(raw_hash=hashlib.sha256(raw).hexdigest()):
+                with self.assertRaises((ValueError, UnicodeDecodeError)):
+                    direct_port.strict_json_object(raw)
+
+    def test_publication_inspect_failure_and_state_schema_never_emit_raw_values(self) -> None:
+        failed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"sensitive")
+        with mock.patch.object(direct_port.subprocess, "run", return_value=failed):
+            result = direct_port.inspect_unpublished_publication(
+                "opaque-container-id", "FIREWALL_CLIENT"
+            )
+        self.assertEqual(
+            result, {"class": "FIREWALL_CLIENT_PUBLICATION_INSPECT_FAILED"}
+        )
+        lines = direct_port.publication_state_lines("firewall_client", result)
+        self.assertEqual(len(lines), 1)
+        rendered = "\n".join(lines)
+        self.assertNotIn("opaque-container-id", rendered)
+        self.assertNotIn("sensitive", rendered)
+        malformed = subprocess.CompletedProcess([], 0, stdout=b"{", stderr=b"")
+        with mock.patch.object(direct_port.subprocess, "run", return_value=malformed):
+            result = direct_port.inspect_unpublished_publication(
+                "opaque-container-id", "FIREWALL_CLIENT"
+            )
+        self.assertEqual(
+            result, {"class": "FIREWALL_CLIENT_PUBLICATION_PARSE_FAILED"}
+        )
+        with self.assertRaises(ValueError):
+            direct_port.publication_state_lines(
+                "firewall_client",
+                {"class": "FIREWALL_CLIENT_PUBLICATION_SHAPE_SAFE", "raw": "forbidden"},
+            )
+        with self.assertRaises(ValueError):
+            direct_port.publication_state_lines(
+                "firewall_client", {"class": "arbitrary-unclassified-text"}
+            )
 
     def test_rejects_every_mount_substitution_and_requires_empty_top_level_mounts(self) -> None:
         substitutions = (
