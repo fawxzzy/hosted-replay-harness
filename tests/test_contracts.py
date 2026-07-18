@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -54,6 +56,7 @@ direct_port = load_module("direct_port_probe", "scripts/direct_port_probe.py")
 docker_api_boundary = load_module(
     "docker_api_boundary", "scripts/docker_api_boundary.py"
 )
+firewall_boundary = load_module("firewall_boundary", "scripts/firewall_boundary.py")
 
 
 class PinContractTests(unittest.TestCase):
@@ -147,10 +150,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(upload_paths, ["artifacts/containment-smoke.json"])
         self.assertNotIn("supabase-db-start.log", self.workflow)
 
-    def test_manual_workflow_selects_only_fixed_cli_containment_mode(self) -> None:
+    def test_manual_workflow_selects_only_fixed_firewall_rehearsal_mode(self) -> None:
         self.assertIn("Hosted replay containment smoke", self.workflow)
         self.assertEqual(self.workflow.count("./scripts/run-containment-smoke.sh\n"), 1)
         self.assertNotIn("run-containment-smoke.sh direct-port", self.workflow)
+        self.assertNotIn("run-containment-smoke.sh run", self.workflow)
         self.assertEqual(self.workflow.count("run-containment-smoke.sh cleanup-only"), 1)
         self.assertNotIn("RESULT_PROFILE=", self.workflow)
 
@@ -191,11 +195,11 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn('record images.pull_count int 2', self.runner)
 
     def test_direct_mode_isolated_from_cli_and_uses_one_exact_target(self) -> None:
-        self.assertIn('run|direct-port|cleanup-only', self.runner)
+        self.assertIn('run|direct-port|firewall-rehearsal|cleanup-only', self.runner)
         self.assertRegex(self.runner, r'(?s)if \[\[ "\$MODE" == "direct-port" \]\]; then\s+run_direct_port_probe\s+exit 0\s+fi')
         direct_function = self.runner[
             self.runner.index("run_direct_port_probe() {") : self.runner.index(
-                "packet_object_counts() {"
+                "firewall_counter_value() {"
             )
         ]
         self.assertEqual(direct_function.count("docker run -d"), 1)
@@ -207,6 +211,94 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertNotIn(":::", direct_function)
         self.assertNotIn("$RUNTIME/bin/supabase", direct_function)
         self.assertNotIn("db start", direct_function)
+
+    def test_default_mode_is_fixed_firewall_rehearsal_without_cli(self) -> None:
+        self.assertIn('MODE="${1:-firewall-rehearsal}"', self.runner)
+        rehearsal = self.runner[
+            self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        self.assertNotIn("$RUNTIME/bin/supabase", rehearsal)
+        self.assertNotIn("db start", rehearsal)
+        self.assertNotIn('"$GOTRUE_PULL"', rehearsal)
+        dispatch = 'if [[ "$MODE" == "firewall-rehearsal" ]]; then\n  run_firewall_publication_rehearsal\n  exit 0\nfi'
+        self.assertIn(dispatch, self.runner)
+        self.assertLess(self.runner.index(dispatch), self.runner.index('host_ips="$(hostname -I'))
+
+    def test_firewall_rehearsal_uses_nat_loopback_network_and_one_pinned_image(self) -> None:
+        for fragment in (
+            'record network.internal bool false',
+            'com.docker.network.bridge.gateway_mode_ipv4=nat',
+            'com.docker.network.bridge.host_binding_ipv4=127.0.0.1',
+            'com.docker.network.bridge.name=${FIREWALL_BRIDGE_NAME}',
+            'record network.default_route_present bool true',
+            'record images.pull_count int 1',
+        ):
+            self.assertIn(fragment, self.runner)
+        rehearsal = self.runner[
+            self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        self.assertEqual(rehearsal.count("docker run -d"), 3)
+        self.assertEqual(rehearsal.count('"$POSTGRES_PULL"'), 4)
+        self.assertEqual(rehearsal.count("--tmpfs"), 3)
+        self.assertNotIn('"$GOTRUE_PULL"', rehearsal)
+        self.assertNotRegex(rehearsal, r"docker (pull|build|network create|volume create)")
+
+    def test_firewall_is_active_before_first_container_and_removed_after_all_containers(self) -> None:
+        rehearsal = self.runner[
+            self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        self.assertLess(
+            rehearsal.index('firewall_boundary.py" install'),
+            rehearsal.index("docker run -d"),
+        )
+        cleanup = self.runner[
+            self.runner.index("cleanup_exact() {") : self.runner.index("finalize() {")
+        ]
+        self.assertLess(cleanup.index("docker rm -f"), cleanup.index('firewall_boundary.py" remove'))
+        self.assertLess(cleanup.index('firewall_boundary.py" remove'), cleanup.index("docker network rm"))
+        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE", cleanup)
+        self.assertLess(
+            cleanup.index('record cleanup.containers_before_firewall_remove'),
+            cleanup.index('firewall_boundary.py" remove'),
+        )
+        self.assertNotIn("docker system prune", cleanup)
+        self.assertNotIn("docker stop --all", cleanup)
+
+    def test_firewall_rehearsal_has_every_effective_canary_and_counter_correlation(self) -> None:
+        rehearsal = self.runner[
+            self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        for fragment in (
+            "same_network_connect",
+            "external_dns forward_deny",
+            "literal_ip forward_deny",
+            "metadata forward_deny",
+            "gateway input_deny",
+            "host_listener input_deny",
+            "foreign_network forward_deny",
+            "docker_control_available",
+            "native_listener_contract post_cli",
+        ):
+            self.assertIn(fragment, rehearsal)
+        self.assertIn("(( after > before ))", self.runner)
+
+    def test_immutable_workflow_config_pins_and_observer_hashes(self) -> None:
+        expected = {
+            ".github/workflows/containment-smoke.yml": "e0440e1748c4655c559fc82f5882e73b11c37b9cfd3e389bdbddf4ddecc7db99",
+            "supabase/config.toml": "1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6",
+            "pins.json": "fe6105e121af3347a2de2494330d1e793a7bc3634f9d3d95964f6593ea990f50",
+            "scripts/docker_api_boundary.py": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
+        }
+        for relative, digest in expected.items():
+            self.assertEqual(hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(), digest)
 
     def test_direct_credential_is_masked_before_env_only_use(self) -> None:
         mask = "printf '::add-mask::%s\\n' \"$db_password\""
@@ -1028,6 +1120,44 @@ done
 
 
 class ResultWriterTests(unittest.TestCase):
+    def test_firewall_rehearsal_uses_existing_schema_with_null_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text(
+                "result.profile\tstr\tcontainment-smoke-v1\n"
+                "status\tstr\tFIREWALL_PUBLICATION_REHEARSAL_PASS\n"
+                "failure\tjson\tnull\n"
+                "packet\tstr\tFP-HOSTED-REPLAY-FIREWALL-PUBLICATION-REHEARSAL-001\n"
+                "source_contract.command\tstr\tfirewall-publication-rehearsal\n"
+                "source_contract.supabase_cli_invoked\tbool\tfalse\n",
+                encoding="utf-8",
+            )
+            audit.write_text("", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["schema"], "fawxzzy.hosted-replay-harness.result.v1")
+            self.assertEqual(result["status"], "FIREWALL_PUBLICATION_REHEARSAL_PASS")
+            self.assertIsNone(result["failure"])
+            self.assertFalse(result["source_contract"]["supabase_cli_invoked"])
+
     def test_cli_result_preserves_lifecycle_counts_and_only_hashed_object_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -2870,6 +3000,17 @@ class DirectPortProbeTests(unittest.TestCase):
         self.assertIn("DIRECT_MOUNT_CONTRACT_MISMATCH", violations)
         self.assertIn("DIRECT_RESTART_POLICY_MISMATCH", violations)
 
+    def test_global_host_address_denominator_includes_ipv4_and_ipv6(self) -> None:
+        fixture = json.dumps(
+            [
+                {"addr_info": [{"local": "192.0.2.10"}, {"local": "2001:db8::10"}]},
+                {"addr_info": [{"local": "127.0.0.1"}, {"local": "fe80::1"}]},
+            ]
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout=fixture, stderr="")
+        with mock.patch.object(direct_port.subprocess, "run", return_value=completed):
+            self.assertEqual(direct_port.global_ip_addresses(), ["192.0.2.10", "2001:db8::10"])
+
     def test_rejects_privilege_namespaces_devices_capabilities_and_socket(self) -> None:
         data = direct_inspection()
         data.update(privileged=True, pid_mode="host", ipc_mode="host")
@@ -2916,6 +3057,202 @@ class DirectPortProbeTests(unittest.TestCase):
         self.assertIn("DIRECT_RESTART_COUNT_NONZERO", violations)
         self.assertIn("DIRECT_CONTAINER_OOM_KILLED", violations)
         self.assertIn("DIRECT_MOUNT_CONTRACT_MISMATCH", violations)
+
+
+def nft_entry(kind: str, **values: object) -> dict:
+    payload = {"family": "inet", "table": firewall_boundary.TABLE, **values}
+    if kind == "table":
+        payload.pop("table")
+        payload["name"] = firewall_boundary.TABLE
+    return {kind: payload}
+
+
+def owned_firewall_entries() -> list[dict]:
+    return [
+        nft_entry("table"),
+        nft_entry("counter", name=firewall_boundary.INPUT_COUNTER, packets=0, bytes=0),
+        nft_entry("counter", name=firewall_boundary.FORWARD_COUNTER, packets=0, bytes=0),
+        nft_entry("chain", name=firewall_boundary.INPUT_CHAIN),
+        nft_entry("chain", name=firewall_boundary.FORWARD_CHAIN),
+        *[nft_entry("rule", chain="packet", expr=[]) for _ in range(5)],
+    ]
+
+
+class FirewallBoundaryTests(unittest.TestCase):
+    def test_rule_batch_is_packet_scoped_ordered_and_never_broad(self) -> None:
+        batch = firewall_boundary.build_batch(
+            firewall_boundary.TABLE, "br-fpro001", "172.31.253.0/24"
+        )
+        lines = batch.splitlines()
+        self.assertEqual(lines[0], f"add table inet {firewall_boundary.TABLE}")
+        self.assertIn('iifname "br-fpro001" oifname "br-fpro001" ip saddr 172.31.253.0/24 ip daddr 172.31.253.0/24 accept', batch)
+        self.assertIn("ct state established,related accept", batch)
+        self.assertLess(batch.index("established,related accept"), batch.index("packet_input_deny drop"))
+        self.assertLess(batch.index('oifname "br-fpro001"'), batch.index("packet_forward_deny drop"))
+        for forbidden in ("flush ruleset", "flush table", "policy drop", "delete chain", "delete rule"):
+            self.assertNotIn(forbidden, batch)
+        self.assertEqual(batch.count(" iifname "), 5)
+        self.assertEqual(batch.count("172.31.253.0/24"), 6)
+
+    def test_backend_tool_and_privilege_absence_fail_before_mutation(self) -> None:
+        with mock.patch.object(firewall_boundary.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_TOOL_UNAVAILABLE"):
+                firewall_boundary.locate_tools()
+        denied = subprocess.CompletedProcess([], 1, stdout="", stderr="denied")
+        with mock.patch.object(firewall_boundary, "locate_tools", return_value=("sudo", "nft")), mock.patch.object(
+            firewall_boundary.shutil, "which", return_value="iptables"
+        ), mock.patch.object(firewall_boundary, "_run", return_value=denied):
+            with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_PRIVILEGE_UNAVAILABLE"):
+                firewall_boundary.privileged_prefix()
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        nft_version = subprocess.CompletedProcess([], 0, stdout="nftables v1.0.9 (stable)\n", stderr="")
+        legacy = subprocess.CompletedProcess([], 0, stdout="iptables v1.8.10 (legacy)\n", stderr="")
+        with mock.patch.object(firewall_boundary, "locate_tools", return_value=("sudo", "nft")), mock.patch.object(
+            firewall_boundary.shutil, "which", return_value="iptables"
+        ), mock.patch.object(firewall_boundary, "_run", side_effect=[success, nft_version, legacy]):
+            with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_BACKEND_AMBIGUOUS"):
+                firewall_boundary.privileged_prefix()
+
+    def test_canonical_foreign_preimage_ignores_only_dynamic_metadata(self) -> None:
+        first = [
+            {"metainfo": {"version": "1"}},
+            {"rule": {"family": "ip", "table": "foreign", "chain": "x", "handle": 1, "counter": {"packets": 2, "bytes": 9}}},
+        ]
+        second = [
+            {"metainfo": {"version": "2"}},
+            {"rule": {"family": "ip", "table": "foreign", "chain": "x", "handle": 99, "counter": {"packets": 200, "bytes": 900}}},
+        ]
+        self.assertEqual(
+            firewall_boundary.canonical_snapshot(first),
+            firewall_boundary.canonical_snapshot(second),
+        )
+
+    def test_install_rejects_collision_and_atomic_check_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=owned_firewall_entries()
+            ):
+                with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_TABLE_COLLISION"):
+                    firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+            failed = subprocess.CompletedProcess([], 1, stdout="", stderr="invalid")
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), mock.patch.object(firewall_boundary, "_run", return_value=failed):
+                with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_CHECK_FAILED"):
+                    firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            self.assertFalse(ledger.exists())
+
+    def test_atomic_install_and_exact_foreign_preservation(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", side_effect=[foreign, foreign + owned_firewall_entries()]
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            saved = firewall_boundary.read_ledger(ledger)
+            self.assertTrue(saved["installed"])
+            self.assertRegex(saved["owned_sha256"], r"^[0-9a-f]{64}$")
+            expected_mode = "0o666" if os.name == "nt" else "0o600"
+            self.assertEqual(oct(ledger.stat().st_mode & 0o777), expected_mode)
+
+    def test_apply_failure_and_foreign_drift_retain_cleanup_ledger(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        changed = foreign + [{"chain": {"family": "ip", "table": "foreign", "name": "changed"}}]
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="rejected")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), mock.patch.object(firewall_boundary, "_run", side_effect=[success, failed]):
+                with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_INSTALL_FAILED"):
+                    firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            self.assertTrue(ledger.exists())
+            ledger.unlink()
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", side_effect=[foreign, changed + owned_firewall_entries()]
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success):
+                with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_FOREIGN_STATE_DRIFT"):
+                    firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
+            self.assertTrue(ledger.exists())
+
+    def test_counter_schema_is_closed_and_exact(self) -> None:
+        entries = owned_firewall_entries()
+        entries[1]["counter"]["packets"] = 7
+        self.assertEqual(
+            firewall_boundary.counter_packets(entries, firewall_boundary.INPUT_COUNTER), 7
+        )
+        entries.append(nft_entry("counter", name=firewall_boundary.INPUT_COUNTER, packets=8, bytes=0))
+        with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_COUNTER_INVALID"):
+            firewall_boundary.counter_packets(entries, firewall_boundary.INPUT_COUNTER)
+
+    def test_exact_atomic_rollback_and_duplicate_cleanup(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                {
+                    "schema": firewall_boundary.SCHEMA,
+                    "table": firewall_boundary.TABLE,
+                    "interface": "br-fpro001",
+                    "subnet": "172.31.253.0/24",
+                    "preimage_sha256": pre_sha,
+                    "preimage_counts": pre_counts,
+                    "installed": True,
+                    "owned_sha256": "a" * 64,
+                },
+            )
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", side_effect=[foreign + owned_firewall_entries(), foreign]
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.remove(ledger)
+            self.assertFalse(ledger.exists())
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign
+            ), contextlib.redirect_stdout(io.StringIO()):
+                firewall_boundary.remove(ledger)
+
+    def test_rollback_check_failure_retains_ledger_for_always_cleanup(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="invalid")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                {
+                    "schema": firewall_boundary.SCHEMA,
+                    "table": firewall_boundary.TABLE,
+                    "interface": "br-fpro001",
+                    "subnet": "172.31.253.0/24",
+                    "preimage_sha256": pre_sha,
+                    "preimage_counts": pre_counts,
+                    "installed": True,
+                    "owned_sha256": "a" * 64,
+                },
+            )
+            with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=foreign + owned_firewall_entries()
+            ), mock.patch.object(firewall_boundary, "_run", return_value=failed):
+                with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_ATOMIC_ROLLBACK_CHECK_FAILED"):
+                    firewall_boundary.remove(ledger)
+            self.assertTrue(ledger.exists())
+
+    def test_inspection_and_ledger_schema_fail_closed_without_raw_output(self) -> None:
+        with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_INSPECTION_FAILED"):
+            firewall_boundary.parse_ruleset("not-json")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            ledger.write_text('{"unexpected":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(firewall_boundary.BoundaryError, "FIREWALL_LEDGER_INVALID"):
+                firewall_boundary.read_ledger(ledger)
 
 
 class SubnetTests(unittest.TestCase):

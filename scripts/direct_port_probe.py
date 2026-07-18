@@ -116,7 +116,13 @@ def _empty(value: Any) -> bool:
 
 
 def validate_inspection(
-    data: dict[str, Any], network_id: str, image_id: str, image_reference: str
+    data: dict[str, Any],
+    network_id: str,
+    image_id: str,
+    image_reference: str,
+    *,
+    container_name: str = CONTAINER_NAME,
+    expected_labels: dict[str, str] | None = None,
 ) -> list[str]:
     """Return stable, sorted violation codes for an allowlisted inspection."""
 
@@ -124,13 +130,14 @@ def validate_inspection(
         return ["DIRECT_INSPECTION_SCHEMA_INVALID"]
 
     violations: list[str] = []
-    if str(data.get("name", "")).lstrip("/") != CONTAINER_NAME:
+    if str(data.get("name", "")).lstrip("/") != container_name:
         violations.append("DIRECT_CONTAINER_IDENTITY_MISMATCH")
     if data.get("image_id") != image_id or data.get("config_image") != image_reference:
         violations.append("DIRECT_IMAGE_IDENTITY_MISMATCH")
 
     labels = data.get("labels")
-    if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in EXPECTED_LABELS.items()):
+    required_labels = EXPECTED_LABELS if expected_labels is None else expected_labels
+    if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in required_labels.items()):
         violations.append("DIRECT_LABEL_CONTRACT_MISMATCH")
 
     networks = data.get("networks")
@@ -228,9 +235,9 @@ def safe_inspect(container_id: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def global_ipv4_addresses() -> list[str]:
+def global_ip_addresses() -> list[str]:
     completed = subprocess.run(
-        ["ip", "-j", "-4", "addr", "show", "scope", "global"],
+        ["ip", "-j", "addr", "show", "scope", "global"],
         capture_output=True,
         text=True,
         check=False,
@@ -253,11 +260,19 @@ def global_ipv4_addresses() -> list[str]:
                 parsed = ipaddress.ip_address(candidate)
             except (TypeError, ValueError):
                 continue
-            if isinstance(parsed, ipaddress.IPv4Address) and not (
+            if not (
                 parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified
             ):
                 addresses.add(str(parsed))
     return sorted(addresses)
+
+
+def global_ipv4_addresses() -> list[str]:
+    return [
+        address
+        for address in global_ip_addresses()
+        if isinstance(ipaddress.ip_address(address), ipaddress.IPv4Address)
+    ]
 
 
 def tcp_connects(host: str, port: int, timeout_seconds: float = 2.0) -> bool:
@@ -280,6 +295,9 @@ def main() -> int:
     parser.add_argument("--network-id", required=True)
     parser.add_argument("--image-id", required=True)
     parser.add_argument("--image-reference", required=True)
+    parser.add_argument("--packet", default=PACKET)
+    parser.add_argument("--role", default=ROLE)
+    parser.add_argument("--container-name", default=CONTAINER_NAME)
     parser.add_argument("--health-timeout-seconds", type=int, default=120)
     parser.add_argument("--stable-seconds", type=int, default=10)
     args = parser.parse_args()
@@ -322,8 +340,19 @@ def main() -> int:
         print(state_line("diagnostic.probe.failure_code", "str", failure_code))
         return 1
 
+    expected_labels = {
+        "io.fawxzzy.packet": args.packet,
+        "io.fawxzzy.role": args.role,
+        "com.supabase.cli.project": PROJECT,
+        "com.docker.compose.project": PROJECT,
+    }
     violations = validate_inspection(
-        final_data, args.network_id, args.image_id, args.image_reference
+        final_data,
+        args.network_id,
+        args.image_id,
+        args.image_reference,
+        container_name=args.container_name,
+        expected_labels=expected_labels,
     )
     if violations:
         print(state_line("diagnostic.probe.failure_code", "str", violations[0]))
@@ -334,7 +363,7 @@ def main() -> int:
         print(state_line("diagnostic.probe.failure_code", "str", "DIRECT_LOOPBACK_CONNECT_FAILED"))
         return 1
 
-    host_addresses = global_ipv4_addresses()
+    host_addresses = global_ip_addresses()
     nonloopback_successes = sum(tcp_connects(address, int(DB_PORT)) for address in host_addresses)
     if nonloopback_successes:
         print(state_line("diagnostic.probe.failure_code", "str", "DIRECT_NONLOOPBACK_CONNECT_SUCCEEDED"))

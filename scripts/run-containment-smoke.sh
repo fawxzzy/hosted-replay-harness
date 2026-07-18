@@ -3,21 +3,25 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-MODE="${1:-run}"
+MODE="${1:-firewall-rehearsal}"
 RESULT_PROFILE="${RESULT_PROFILE:-}"
 [[ "$#" -le 1 ]] || exit 2
 case "$MODE" in
-  run|direct-port|cleanup-only) ;;
+  run|direct-port|firewall-rehearsal|cleanup-only) ;;
   *) exit 2 ;;
 esac
 case "$RESULT_PROFILE" in
-  ""|direct-docker-port-v1) ;;
+  ""|direct-docker-port-v1|firewall-publication-rehearsal-v1) ;;
   *) exit 2 ;;
 esac
 CONTAINMENT_PACKET="FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001"
 DIRECT_PACKET="FP-HOSTED-REPLAY-DIRECT-PORT-DIAG-001"
+FIREWALL_PACKET="FP-HOSTED-REPLAY-FIREWALL-PUBLICATION-REHEARSAL-001"
 PACKET="$CONTAINMENT_PACKET"
 [[ "$MODE" != "direct-port" ]] || PACKET="$DIRECT_PACKET"
+[[ "$MODE" != "firewall-rehearsal" ]] || PACKET="$FIREWALL_PACKET"
+NETWORK_ROLE="containment-network"
+[[ "$MODE" != "firewall-rehearsal" ]] || NETWORK_ROLE="firewall-publication-network"
 PROJECT="fp-hosted-replay-ro-001"
 NETWORK_NAME="fp-hosted-replay-ro-001-net"
 SUBNET="172.31.253.0/24"
@@ -25,6 +29,11 @@ SUBNET_GATEWAY="172.31.253.1"
 DB_NAME="supabase_db_${PROJECT}"
 DB_VOLUME="$DB_NAME"
 DIRECT_DB_NAME="${PROJECT}-direct-postgres"
+FIREWALL_DB_NAME="${PROJECT}-firewall-postgres"
+FIREWALL_CLIENT_NAME="${PROJECT}-firewall-client"
+FIREWALL_FOREIGN_NAME="${PROJECT}-firewall-foreign"
+FIREWALL_BRIDGE_NAME="br-fpro001"
+HOST_TEST_PORT="56423"
 DB_PORT="56422"
 RUNTIME="$ROOT/.smoke-runtime"
 RUNTIME_HOME="$RUNTIME/home"
@@ -52,8 +61,13 @@ VOLUME_EVENTS_FILE="$RAW/docker-volume-events.jsonl"
 NETWORK_EVENTS_FILE="$RAW/docker-network-events.jsonl"
 STATE_FILE="$ROOT/artifacts/.state.tsv"
 RESULT_FILE="$ROOT/artifacts/containment-smoke.json"
+FIREWALL_LEDGER="$ROOT/artifacts/.firewall-ledger.json"
+FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/.firewall-rollback.tsv"
+FIREWALL_STATE_FILE="$RUNTIME/firewall-state.tsv"
+HOST_TEST_READY="$RUNTIME/host-test-listener.ready"
 WATCH_PID=""
 DOCKER_API_OBSERVER_PID=""
+HOST_TEST_LISTENER_PID=""
 NETWORK_ID=""
 POSTGRES_IMAGE_ID=""
 GOTRUE_IMAGE_ID=""
@@ -71,6 +85,8 @@ LISTENER_COUNT_BIN="awk"
 LISTENER_HASH_BIN="sha256sum"
 SMOKE_PASSED=0
 FINALIZING=0
+EXPECTED_INPUT_DENIES=0
+EXPECTED_FORWARD_DENIES=0
 
 CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
@@ -629,19 +645,31 @@ network_contract_code() {
     || { printf 'NETWORK_DRIVER_MISMATCH\n'; return 1; }
   [[ "$(docker network inspect --format '{{.Scope}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "local" ]] \
     || { printf 'NETWORK_SCOPE_MISMATCH\n'; return 1; }
-  [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "true" ]] \
-    || { printf 'NETWORK_NOT_INTERNAL\n'; return 1; }
+  if [[ "$MODE" == "firewall-rehearsal" ]]; then
+    [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "false" ]] \
+      || { printf 'NETWORK_UNEXPECTEDLY_INTERNAL\n'; return 1; }
+  else
+    [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "true" ]] \
+      || { printf 'NETWORK_NOT_INTERNAL\n'; return 1; }
+  fi
   [[ "$(docker network inspect --format '{{.EnableIPv6}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "false" ]] \
     || { printf 'NETWORK_IPV6_ENABLED\n'; return 1; }
   [[ "$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$SUBNET" ]] \
     || { printf 'NETWORK_SUBNET_MISMATCH\n'; return 1; }
   [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "127.0.0.1" ]] \
     || { printf 'NETWORK_HOST_BINDING_MISMATCH\n'; return 1; }
-  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "isolated" ]] \
-    || { printf 'NETWORK_GATEWAY_MODE_MISMATCH\n'; return 1; }
+  if [[ "$MODE" == "firewall-rehearsal" ]]; then
+    [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "nat" ]] \
+      || { printf 'NETWORK_GATEWAY_MODE_MISMATCH\n'; return 1; }
+    [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.name"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$FIREWALL_BRIDGE_NAME" ]] \
+      || { printf 'NETWORK_BRIDGE_NAME_MISMATCH\n'; return 1; }
+  else
+    [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "isolated" ]] \
+      || { printf 'NETWORK_GATEWAY_MODE_MISMATCH\n'; return 1; }
+  fi
   [[ "$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$PACKET" ]] \
     || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
-  [[ "$(docker network inspect --format '{{index .Labels "io.fawxzzy.role"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "containment-network" ]] \
+  [[ "$(docker network inspect --format '{{index .Labels "io.fawxzzy.role"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$NETWORK_ROLE" ]] \
     || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
   [[ "$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$NETWORK_NAME" 2>>"$RAW/network-contract.log")" == "$PROJECT" ]] \
     || { printf 'NETWORK_LABEL_MISMATCH\n'; return 1; }
@@ -723,8 +751,22 @@ stop_docker_api_observer() {
   return "$observer_rc"
 }
 
+stop_host_test_listener() {
+  if [[ -n "$HOST_TEST_LISTENER_PID" ]] && kill -0 "$HOST_TEST_LISTENER_PID" 2>/dev/null; then
+    kill "$HOST_TEST_LISTENER_PID" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$HOST_TEST_LISTENER_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$HOST_TEST_LISTENER_PID" 2>/dev/null || true
+    wait "$HOST_TEST_LISTENER_PID" 2>/dev/null || true
+  fi
+  HOST_TEST_LISTENER_PID=""
+  rm -f -- "$HOST_TEST_READY"
+}
+
 cleanup_exact() {
-  local id label project_label count listener_count container_count volume_count
+  local id label project_label count listener_count container_count volume_count pre_firewall_container_count firewall_rc=0 firewall_code
   stop_docker_api_observer || true
   stop_watcher
 
@@ -732,6 +774,7 @@ cleanup_exact() {
     {
       docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
       docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
+      docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
       docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -739,7 +782,7 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker inspect --format '{{index .Config.Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker inspect --format '{{index .Config.Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker rm -f "$id" >"$RAW/cleanup-container-${id:0:12}.log" 2>&1 || true
     fi
   done
@@ -748,6 +791,7 @@ cleanup_exact() {
     {
       docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
       docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
+      docker volume ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
       docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -755,15 +799,39 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker volume inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker volume inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker volume rm "$id" >"$RAW/cleanup-volume.log" 2>&1 || true
     fi
   done
+
+  stop_host_test_listener
+  pre_firewall_container_count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  record cleanup.containers_before_firewall_remove int "$pre_firewall_container_count"
+  if [[ "$pre_firewall_container_count" != "0" ]]; then
+    firewall_rc=1
+    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE
+  elif python3 -B "$ROOT/scripts/firewall_boundary.py" remove --ledger "$FIREWALL_LEDGER" \
+    >"$FIREWALL_STATE_FILE" 2>"$RAW/firewall-rollback.log"; then
+    sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE"
+    if [[ "$MODE" != "cleanup-only" ]]; then
+      sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >"$FIREWALL_ROLLBACK_RECEIPT"
+      chmod 0600 "$FIREWALL_ROLLBACK_RECEIPT"
+    elif [[ -f "$FIREWALL_ROLLBACK_RECEIPT" ]]; then
+      cat "$FIREWALL_ROLLBACK_RECEIPT" >>"$STATE_FILE"
+    fi
+  else
+    firewall_rc=1
+    sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE" 2>/dev/null || true
+    firewall_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$FIREWALL_STATE_FILE" 2>/dev/null || true)"
+    [[ "$firewall_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || firewall_code=FIREWALL_ROLLBACK_FAILED
+    record cleanup.firewall.failure_code str "$firewall_code"
+  fi
 
   mapfile -t network_ids < <(
     {
       docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null || true
       docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null || true
+      docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null || true
       docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null || true
     } | awk 'NF' | sort -u
   )
@@ -771,18 +839,18 @@ cleanup_exact() {
     [[ -n "$id" ]] || continue
     label="$(docker network inspect --format '{{index .Labels "io.fawxzzy.packet"}}' "$id" 2>/dev/null || true)"
     project_label="$(docker network inspect --format '{{index .Labels "com.supabase.cli.project"}}' "$id" 2>/dev/null || true)"
-    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$project_label" == "$PROJECT" ]]; then
+    if [[ "$label" == "$CONTAINMENT_PACKET" || "$label" == "$DIRECT_PACKET" || "$label" == "$FIREWALL_PACKET" || "$project_label" == "$PROJECT" ]]; then
       timeout --signal=TERM --kill-after=5s 20s docker network rm "$id" >"$RAW/cleanup-network-${id:0:12}.log" 2>&1 || true
     fi
   done
 
-  count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.containers_remaining int "$count"
   container_count="$count"
-  count="$({ docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker volume ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.volumes_remaining int "$count"
   volume_count="$count"
-  count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
+  count="$({ docker network ls -q --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker network ls -q --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker network ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
   record cleanup.networks_remaining int "$count"
   if capture_listener_snapshot cleanup "$DB_PORT"; then
     listener_count="$LISTENER_SNAPSHOT_COUNT"
@@ -796,6 +864,7 @@ cleanup_exact() {
   [[ "$container_count" == "0" ]] || return 1
   [[ "$volume_count" == "0" ]] || return 1
   [[ "$count" == "0" ]] || return 1
+  [[ "$firewall_rc" == "0" && ! -e "$FIREWALL_LEDGER" ]] || return 1
   [[ "$listener_count" == "0" ]] || return 1
   timeout 2 bash -c "</dev/tcp/127.0.0.1/${DB_PORT}" >/dev/null 2>&1 && return 1
   native_listener_contract cleanup || return 1
@@ -819,7 +888,7 @@ finalize() {
     fi
   fi
 
-  if [[ "$MODE" == "run" && -n "$NETWORK_ID" ]]; then
+  if [[ ( "$MODE" == "run" || "$MODE" == "firewall-rehearsal" ) && -n "$NETWORK_ID" ]]; then
     network_code="$(network_contract_code active)" || true
     if [[ "$network_code" != "PASS" ]]; then
       network_contract_ok=0
@@ -848,6 +917,10 @@ finalize() {
     if [[ "$MODE" == "direct-port" ]]; then
       record status str DIRECT_DOCKER_PORT_PATH_PASS
       final_status=DIRECT_DOCKER_PORT_PATH_PASS
+    elif [[ "$MODE" == "firewall-rehearsal" ]]; then
+      record status str FIREWALL_PUBLICATION_REHEARSAL_PASS
+      record failure json null
+      final_status=FIREWALL_PUBLICATION_REHEARSAL_PASS
     else
       record status str CONTAINMENT_SMOKE_PASS
       final_status=CONTAINMENT_SMOKE_PASS
@@ -906,6 +979,7 @@ cleanup_only() {
     --merge-existing >"$RAW/cleanup-result-writer.log" 2>&1 || cleanup_rc=1
 
   rm -f -- "$STATE_FILE"
+  rm -f -- "$FIREWALL_ROLLBACK_RECEIPT"
   case "$RUNTIME" in
     "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
   esac
@@ -973,6 +1047,267 @@ run_direct_port_probe() {
     block "$failure_code"
   fi
 
+  record diagnostic.timing.completed_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  SMOKE_PASSED=1
+}
+
+firewall_counter_value() {
+  local counter="$1" counter_file="$RUNTIME/firewall-counters.tsv" value
+  python3 -B "$ROOT/scripts/firewall_boundary.py" counters --ledger "$FIREWALL_LEDGER" \
+    >"$counter_file" 2>"$RAW/firewall-counters.log" || block FIREWALL_COUNTER_READ_FAILED
+  [[ "$(wc -l <"$counter_file" | tr -d ' ')" == "2" ]] || block FIREWALL_COUNTER_INVALID
+  value="$(awk -F '\t' -v key="firewall.counters.${counter}" '$1==key && $2=="int"{print $3; exit}' "$counter_file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || block FIREWALL_COUNTER_INVALID
+  printf '%s\n' "$value"
+}
+
+expect_firewall_block() {
+  local receipt_key="$1" counter="$2" success_code="$3" correlation_code="$4"
+  shift 4
+  local before after command_rc
+  before="$(firewall_counter_value "$counter")"
+  set +e
+  "$@" >"$RAW/canary-${receipt_key}.log" 2>&1
+  command_rc="$?"
+  set -e
+  after="$(firewall_counter_value "$counter")"
+  [[ "$command_rc" != "0" ]] || block "$success_code"
+  (( after > before )) || block "$correlation_code"
+  record "canaries.firewall.${receipt_key}_failed" bool true
+  record "canaries.firewall.${receipt_key}_deny_delta" int "$(( after - before ))"
+  if [[ "$counter" == "input_deny" ]]; then
+    EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + after - before ))"
+  else
+    EXPECTED_FORWARD_DENIES="$(( EXPECTED_FORWARD_DENIES + after - before ))"
+  fi
+}
+
+wait_healthy_container() {
+  local container_id="$1" failure_code="$2" status="" running=""
+  for _ in $(seq 1 120); do
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+    running="$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)"
+    [[ "$running" == "true" ]] || block "$failure_code"
+    [[ "$status" != "unhealthy" ]] || block "$failure_code"
+    [[ "$status" == "healthy" ]] && return 0
+    sleep 1
+  done
+  block "$failure_code"
+}
+
+validate_unpublished_container() {
+  local container_id="$1" expected_network_mode="$2" expected_mount_count="$3" code_prefix="$4"
+  [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == "$expected_network_mode" ]] \
+    || block "${code_prefix}_NETWORK_MISMATCH"
+  [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container_id")" == "false" ]] \
+    || block "${code_prefix}_PRIVILEGE_REJECTED"
+  [[ "$(docker inspect --format '{{.HostConfig.PidMode}}' "$container_id")" =~ ^(|private)$ ]] \
+    || block "${code_prefix}_PID_MODE_REJECTED"
+  [[ "$(docker inspect --format '{{.HostConfig.IpcMode}}' "$container_id")" =~ ^(|private)$ ]] \
+    || block "${code_prefix}_IPC_MODE_REJECTED"
+  [[ "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$container_id")" == "1" ]] \
+    || block "${code_prefix}_EXTRA_NETWORK_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.Binds}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_BIND_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.CapAdd}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_CAPABILITY_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.Devices}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_DEVICE_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.SecurityOpt}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_SECURITY_OPTION_REJECTED"
+  [[ "$(docker inspect --format '{{len .Mounts}}' "$container_id")" == "$expected_mount_count" ]] \
+    || block "${code_prefix}_MOUNT_REJECTED"
+  [[ "$(docker inspect --format '{{len (index .NetworkSettings.Ports "5432/tcp")}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_PUBLICATION_REJECTED"
+}
+
+run_firewall_publication_rehearsal() {
+  local db_password service_id foreign_id client_id foreign_ip probe_rc failure_code
+  local probe_state="$RUNTIME/firewall-port-probe.tsv" firewall_install_state="$RUNTIME/firewall-install.tsv"
+  local input_before forward_before input_after forward_after
+
+  record diagnostic.timing.started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  freeze_precli_objects_and_listeners
+  [[ ! -e "$FIREWALL_LEDGER" ]] || block FIREWALL_LEDGER_COLLISION
+  python3 -B "$ROOT/scripts/firewall_boundary.py" install \
+    --ledger "$FIREWALL_LEDGER" \
+    --interface "$FIREWALL_BRIDGE_NAME" \
+    --subnet "$SUBNET" >"$firewall_install_state" 2>"$RAW/firewall-install.log" \
+    || {
+      failure_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$firewall_install_state" 2>/dev/null || true)"
+      [[ "$failure_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || failure_code=FIREWALL_INSTALL_FAILED
+      block "$failure_code"
+    }
+  cat "$firewall_install_state" >>"$STATE_FILE"
+  record firewall.active_before_first_container bool true
+
+  python3 -B -c '
+import pathlib, socket, sys
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((sys.argv[1], int(sys.argv[2])))
+listener.listen(8)
+listener.settimeout(0.5)
+pathlib.Path(sys.argv[3]).write_text("ready\n", encoding="utf-8")
+while True:
+    try:
+        connection, _ = listener.accept()
+    except TimeoutError:
+        continue
+    connection.close()
+' "$SUBNET_GATEWAY" "$HOST_TEST_PORT" "$HOST_TEST_READY" \
+    >"$RAW/host-test-listener.log" 2>&1 &
+  HOST_TEST_LISTENER_PID="$!"
+  for _ in $(seq 1 50); do
+    [[ -f "$HOST_TEST_READY" ]] && break
+    kill -0 "$HOST_TEST_LISTENER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -f "$HOST_TEST_READY" ]] || block HOST_TEST_LISTENER_UNAVAILABLE
+
+  db_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" \
+    || block DIRECT_CREDENTIAL_GENERATION_FAILED
+  [[ -n "$db_password" ]] || block DIRECT_CREDENTIAL_GENERATION_FAILED
+  printf '::add-mask::%s\n' "$db_password"
+  export POSTGRES_PASSWORD="$db_password"
+
+  foreign_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
+    --pull=never \
+    --platform linux/amd64 \
+    --name "$FIREWALL_FOREIGN_NAME" \
+    --label "io.fawxzzy.packet=${FIREWALL_PACKET}" \
+    --label "io.fawxzzy.role=foreign-network-canary" \
+    --label "com.supabase.cli.project=${PROJECT}" \
+    --label "com.docker.compose.project=${PROJECT}" \
+    --network bridge \
+    --tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=1g" \
+    --restart=no \
+    --health-cmd='pg_isready -U postgres -h 127.0.0.1' \
+    --health-interval=1s \
+    --health-timeout=2s \
+    --health-start-period=30s \
+    --health-retries=30 \
+    --env POSTGRES_PASSWORD \
+    "$POSTGRES_PULL" 2>"$RAW/foreign-container-create.log")" \
+    || block FOREIGN_CANARY_CONTAINER_CREATE_FAILED
+
+  service_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
+    --pull=never \
+    --platform linux/amd64 \
+    --name "$FIREWALL_DB_NAME" \
+    --label "io.fawxzzy.packet=${FIREWALL_PACKET}" \
+    --label "io.fawxzzy.role=firewall-postgres" \
+    --label "com.supabase.cli.project=${PROJECT}" \
+    --label "com.docker.compose.project=${PROJECT}" \
+    --network "$NETWORK_ID" \
+    --publish "${DB_PORT}:5432" \
+    --tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=1g" \
+    --restart=no \
+    --health-cmd='pg_isready -U postgres -h 127.0.0.1' \
+    --health-interval=1s \
+    --health-timeout=2s \
+    --health-start-period=30s \
+    --health-retries=30 \
+    --env POSTGRES_PASSWORD \
+    "$POSTGRES_PULL" 2>"$RAW/firewall-container-create.log")" \
+    || block FIREWALL_SERVICE_CONTAINER_CREATE_FAILED
+  unset POSTGRES_PASSWORD db_password
+
+  client_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
+    --pull=never \
+    --platform linux/amd64 \
+    --name "$FIREWALL_CLIENT_NAME" \
+    --label "io.fawxzzy.packet=${FIREWALL_PACKET}" \
+    --label "io.fawxzzy.role=firewall-canary-client" \
+    --label "com.supabase.cli.project=${PROJECT}" \
+    --label "com.docker.compose.project=${PROJECT}" \
+    --network "$NETWORK_ID" \
+    --tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=64m" \
+    "$POSTGRES_PULL" sleep 300 2>"$RAW/firewall-client-create.log")" \
+    || block FIREWALL_CLIENT_CONTAINER_CREATE_FAILED
+
+  validate_unpublished_container "$client_id" "$NETWORK_ID" 1 FIREWALL_CLIENT
+  validate_unpublished_container "$foreign_id" bridge 1 FOREIGN_CANARY
+
+  wait_healthy_container "$foreign_id" FOREIGN_CANARY_NOT_HEALTHY
+  wait_healthy_container "$service_id" FIREWALL_SERVICE_NOT_HEALTHY
+  assert_frozen_network rehearsal_active active
+
+  set +e
+  python3 -B "$ROOT/scripts/direct_port_probe.py" \
+    --container-id "$service_id" \
+    --network-id "$NETWORK_ID" \
+    --image-id "$POSTGRES_IMAGE_ID" \
+    --image-reference "$POSTGRES_PULL" \
+    --packet "$FIREWALL_PACKET" \
+    --role firewall-postgres \
+    --container-name "$FIREWALL_DB_NAME" \
+    --health-timeout-seconds 120 \
+    --stable-seconds 10 >"$probe_state" 2>"$RAW/firewall-port-probe.log"
+  probe_rc="$?"
+  set -e
+  [[ -f "$probe_state" ]] || block FIREWALL_PORT_PROBE_RESULT_MISSING
+  cat "$probe_state" >>"$STATE_FILE"
+  if [[ "$probe_rc" != "0" ]]; then
+    failure_code="$(awk -F '\t' '$1=="diagnostic.probe.failure_code"{print $3; exit}' "$probe_state")"
+    [[ "$failure_code" =~ ^[A-Z0-9_]+$ ]] || failure_code=FIREWALL_PORT_PROBE_FAILED
+    block "$failure_code"
+  fi
+
+  docker exec "$client_id" bash -ceu '
+    command -v ip >/dev/null
+    command -v getent >/dev/null
+    command -v ping >/dev/null
+    command -v timeout >/dev/null
+    command -v pg_isready >/dev/null
+    test -n "$(ip -4 route show default)"
+  ' >"$RAW/firewall-client-preflight.log" 2>&1 || block FIREWALL_CLIENT_TOOLING_MISMATCH
+  record network.default_route_present bool true
+
+  input_before="$(firewall_counter_value input_deny)"
+  forward_before="$(firewall_counter_value forward_deny)"
+  [[ "$input_before" == "0" && "$forward_before" == "0" ]] \
+    || block FIREWALL_UNEXPECTED_PRECANARY_HIT
+  docker exec "$client_id" pg_isready -h "$FIREWALL_DB_NAME" -p 5432 -t 5 \
+    >"$RAW/same-network-connect.log" 2>&1 || block SAME_NETWORK_CONTAINER_CONNECT_FAILED
+  input_after="$(firewall_counter_value input_deny)"
+  forward_after="$(firewall_counter_value forward_deny)"
+  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" ]] \
+    || block SAME_NETWORK_TRAFFIC_HIT_DENY_RULE
+  record canaries.firewall.same_network_connect bool true
+
+  expect_firewall_block external_dns forward_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 5 getent ahostsv4 example.com
+  expect_firewall_block literal_ip forward_deny LITERAL_IP_EGRESS_SUCCEEDED LITERAL_IP_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 3 bash -ceu '</dev/tcp/1.1.1.1/443'
+  expect_firewall_block metadata forward_deny METADATA_EGRESS_SUCCEEDED METADATA_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 3 bash -ceu '</dev/tcp/169.254.169.254/80'
+  expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" ping -c 1 -W 1 "$SUBNET_GATEWAY"
+  expect_firewall_block host_listener input_deny HOST_TEST_LISTENER_REACHABLE HOST_TEST_LISTENER_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 3 bash -ceu "</dev/tcp/${SUBNET_GATEWAY}/${HOST_TEST_PORT}"
+
+  foreign_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$foreign_id" 2>/dev/null || true)"
+  [[ "$foreign_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || block FOREIGN_CANARY_ADDRESS_UNAVAILABLE
+  expect_firewall_block foreign_network forward_deny FOREIGN_NETWORK_REACHABLE FOREIGN_NETWORK_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 3 bash -ceu "</dev/tcp/${foreign_ip}/5432"
+  unset foreign_ip
+
+  docker version --format '{{.Server.Version}}' >"$RAW/docker-control-after-firewall.log" 2>&1 \
+    || block DOCKER_CONTROL_UNAVAILABLE_UNDER_FIREWALL
+  record canaries.firewall.docker_control_available bool true
+  input_after="$(firewall_counter_value input_deny)"
+  forward_after="$(firewall_counter_value forward_deny)"
+  [[ "$input_after" == "$EXPECTED_INPUT_DENIES" && "$forward_after" == "$EXPECTED_FORWARD_DENIES" ]] \
+    || block FIREWALL_UNEXPECTED_DENY_HIT
+  record firewall.final_input_deny_count int "$input_after"
+  record firewall.final_forward_deny_count int "$forward_after"
+  record firewall.unexpected_deny_hit_count int 0
+  native_listener_contract post_cli \
+    || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"
+  record source_contract.supabase_cli_invoked bool false
+  record source_contract.gotrue_invoked bool false
+  record source_contract.application_replay_invoked bool false
   record diagnostic.timing.completed_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SMOKE_PASSED=1
 }
@@ -1296,6 +1631,20 @@ record failure.code str HARNESS_INTERRUPTED
 record failure.detail str preterminal-state
 if [[ "$MODE" == "direct-port" ]]; then
   record result.profile str direct-docker-port-v1
+elif [[ "$MODE" == "firewall-rehearsal" ]]; then
+  record result.profile str containment-smoke-v1
+  record packet str "$FIREWALL_PACKET"
+  record diagnostic.profile str firewall-publication-rehearsal-v1
+  record source_contract.command str firewall-publication-rehearsal
+  record source_contract.root_persistent_prerun bool false
+  record source_contract.load_config bool false
+  record source_contract.docker_access_expected bool true
+  record source_contract.provider_access_enabled bool false
+  record source_contract.telemetry_endpoint_enabled bool false
+  record source_contract.database_only bool false
+  record source_contract.application_migrations_enabled bool false
+  record source_contract.seed_enabled bool false
+  record source_contract.gotrue_enabled bool false
 else
   record result.profile str containment-smoke-v1
   record diagnostic.profile str db-start-policy-v1
@@ -1399,7 +1748,11 @@ postgres_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "
 docker image inspect --format '{{json .RepoDigests}}' "$POSTGRES_PULL" | grep -Fq "${POSTGRES_TAG%:*}@${POSTGRES_DIGEST}" || block POSTGRES_REPODIGEST_MISMATCH
 POSTGRES_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$POSTGRES_PULL")"
 record images.postgres.digest str "$POSTGRES_DIGEST"
-record images.postgres.image_id str "$POSTGRES_IMAGE_ID"
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  record images.postgres.image_id_sha256 str "$(hash_identifier "$POSTGRES_IMAGE_ID")"
+else
+  record images.postgres.image_id str "$POSTGRES_IMAGE_ID"
+fi
 record images.postgres.platform str "$postgres_platform"
 if [[ "$MODE" == "run" ]]; then
   docker pull --platform linux/amd64 "$GOTRUE_PULL" >"$RAW/gotrue-pull.log" 2>&1 || block GOTRUE_PULL_FAILED
@@ -1429,42 +1782,84 @@ mapfile -t existing_prefixes < <(
 )
 python3 "$ROOT/scripts/check_subnet.py" "$SUBNET" "${existing_prefixes[@]:-}" || block FIXED_SUBNET_COLLISION
 
-NETWORK_ID="$(docker network create \
-  --driver bridge \
-  --internal \
-  --ipv6=false \
-  --subnet "$SUBNET" \
-  --label "io.fawxzzy.packet=${PACKET}" \
-  --label "io.fawxzzy.role=containment-network" \
-  --label "com.supabase.cli.project=${PROJECT}" \
-  --label "com.docker.compose.project=${PROJECT}" \
-  --opt "com.docker.network.bridge.host_binding_ipv4=127.0.0.1" \
-  --opt "com.docker.network.bridge.gateway_mode_ipv4=isolated" \
-  "$NETWORK_NAME" 2>"$RAW/network-create.log")" || block NETWORK_CREATE_FAILED
+network_args=(
+  --driver bridge
+  --ipv6=false
+  --subnet "$SUBNET"
+  --label "io.fawxzzy.packet=${PACKET}"
+  --label "io.fawxzzy.role=${NETWORK_ROLE}"
+  --label "com.supabase.cli.project=${PROJECT}"
+  --label "com.docker.compose.project=${PROJECT}"
+  --opt "com.docker.network.bridge.host_binding_ipv4=127.0.0.1"
+)
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  ip link show dev "$FIREWALL_BRIDGE_NAME" >"$RAW/bridge-collision.log" 2>&1 \
+    && block FIREWALL_BRIDGE_COLLISION
+  network_args+=(
+    --opt "com.docker.network.bridge.gateway_mode_ipv4=nat"
+    --opt "com.docker.network.bridge.name=${FIREWALL_BRIDGE_NAME}"
+  )
+else
+  network_args+=(
+    --internal
+    --opt "com.docker.network.bridge.gateway_mode_ipv4=isolated"
+  )
+fi
+NETWORK_ID="$(docker network create "${network_args[@]}" "$NETWORK_NAME" 2>"$RAW/network-create.log")" \
+  || block NETWORK_CREATE_FAILED
 [[ -n "$NETWORK_ID" ]] || block NETWORK_ID_EMPTY
 record network.id_sha256 str "$(hash_identifier "$NETWORK_ID")"
 record network.name str "$NETWORK_NAME"
 record network.subnet str "$SUBNET"
-record network.internal bool true
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  record network.internal bool false
+else
+  record network.internal bool true
+fi
 record network.ipv6 bool false
 record network.host_binding_ipv4 str 127.0.0.1
-record network.gateway_mode_ipv4 str isolated
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  record network.gateway_mode_ipv4 str nat
+  record network.bridge_name str "$FIREWALL_BRIDGE_NAME"
+else
+  record network.gateway_mode_ipv4 str isolated
+fi
 ipam_gateway="$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' "$NETWORK_ID")"
 record network.ipam_gateway str "${ipam_gateway:-none}"
 
 [[ "$(docker network inspect --format '{{.Id}}' "$NETWORK_ID")" == "$NETWORK_ID" ]] || block NETWORK_ID_MISMATCH
 [[ "$(docker network inspect --format '{{.Driver}}' "$NETWORK_ID")" == "bridge" ]] || block NETWORK_DRIVER_MISMATCH
-[[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_ID")" == "true" ]] || block NETWORK_NOT_INTERNAL
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_ID")" == "false" ]] || block NETWORK_UNEXPECTEDLY_INTERNAL
+else
+  [[ "$(docker network inspect --format '{{.Internal}}' "$NETWORK_ID")" == "true" ]] || block NETWORK_NOT_INTERNAL
+fi
 [[ "$(docker network inspect --format '{{.EnableIPv6}}' "$NETWORK_ID")" == "false" ]] || block NETWORK_IPV6_ENABLED
 [[ "$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$NETWORK_ID")" == "$SUBNET" ]] || block NETWORK_SUBNET_MISMATCH
 [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$NETWORK_ID")" == "127.0.0.1" ]] || block NETWORK_HOST_BINDING_MISMATCH
-[[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_ID")" == "isolated" ]] || block NETWORK_GATEWAY_MODE_MISMATCH
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_ID")" == "nat" ]] || block NETWORK_GATEWAY_MODE_MISMATCH
+  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.name"}}' "$NETWORK_ID")" == "$FIREWALL_BRIDGE_NAME" ]] || block NETWORK_BRIDGE_NAME_MISMATCH
+else
+  [[ "$(docker network inspect --format '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' "$NETWORK_ID")" == "isolated" ]] || block NETWORK_GATEWAY_MODE_MISMATCH
+fi
 [[ "$(docker network ls -q --filter "label=io.fawxzzy.packet=${PACKET}" | awk 'NF' | wc -l)" == "1" ]] || block PACKET_NETWORK_COUNT_MISMATCH
 assert_frozen_network after_create empty
 bridge_name="br-${NETWORK_ID:0:12}"
+[[ "$MODE" != "firewall-rehearsal" ]] || bridge_name="$FIREWALL_BRIDGE_NAME"
 ip link show dev "$bridge_name" >"$RAW/bridge-link.log" 2>&1 || block PACKET_BRIDGE_MISSING
-if ip -4 -o addr show dev "$bridge_name" | grep -q ' inet '; then
-  block ISOLATED_BRIDGE_HAS_HOST_ADDRESS
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  [[ -n "$ipam_gateway" ]] || block PACKET_GATEWAY_MISSING
+  ip -4 -o addr show dev "$bridge_name" | grep -Fq " ${ipam_gateway}/" || block PACKET_GATEWAY_ADDRESS_MISMATCH
+else
+  if ip -4 -o addr show dev "$bridge_name" | grep -q ' inet '; then
+    block ISOLATED_BRIDGE_HAS_HOST_ADDRESS
+  fi
+fi
+
+if [[ "$MODE" == "firewall-rehearsal" ]]; then
+  run_firewall_publication_rehearsal
+  exit 0
 fi
 
 host_ips="$(hostname -I 2>/dev/null | xargs)"

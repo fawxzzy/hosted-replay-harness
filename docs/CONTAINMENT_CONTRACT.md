@@ -6,9 +6,31 @@
 
 No application repository, application migration, source data, Auth row, provider API, Supabase remote command, production environment, secret, or inherited workflow environment is in scope.
 
-## Current stateful DB-start policy
+## Active firewall-publication rehearsal
 
-The manual workflow has one fixed `run` path. It invokes the pinned v2.109.1 CLI exactly once as `supabase --workdir <packet-project> --network-id <frozen-name> --yes db start`. The public config remains byte-frozen at SHA-256 `1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6`; database migrations and seed are disabled, Auth is enabled only for its one-shot migration, and every other persistent service is disabled.
+`FP-HOSTED-REPLAY-FIREWALL-PUBLICATION-REHEARSAL-001` is the manual workflow's single fixed default path. It never downloads or invokes the Supabase CLI, never starts GoTrue, never executes SQL, and never reads an application or provider value. The preserved CLI containment and direct-port diagnostic remain inactive script modes.
+
+This rehearsal is an explicit structural amendment, not a containment pass. Its single packet-owned bridge is `Internal=false`, IPv6-disabled, fixed-subnet, and explicit `nat` gateway mode. Docker's bridge default binding remains `127.0.0.1`, and the bridge has one collision-checked fixed interface name. A default route is expected; acceptance depends on effective packet firewall denial, not route absence.
+
+Before the first packet container starts, the harness requires the existing native `nft` tool, the host `iptables` compatibility frontend to identify the `nf_tables` backend, noninteractive root authority, JSON inspection, and atomic check/apply support. Any missing tool, ambiguous or legacy backend, privilege failure, table/ledger/interface collision, inspection failure, or atomic check failure stops before firewall mutation. No package is installed.
+
+The helper creates one fixed `inet` table in a single atomic batch. It creates exactly two accept-policy base chains and two named deny counters. Every rule is scoped to the exact bridge and subnet. INPUT admits only established or related replies for host-initiated traffic, then drops packet-originated host traffic. FORWARD admits same-bridge traffic and established or related replies, then drops all other packet-originated forwarding. It never flushes a ruleset or table, changes a foreign policy, edits a foreign chain, or grants image, Docker-socket, device, capability, host, PID, IPC, bind, or extra-network access.
+
+The full foreign ruleset is held only in memory and reduced to canonical object counts plus SHA-256. Dynamic handles, packet/byte counter values, and nft metadata are excluded; rule order and all semantic fields remain in the digest. The private mode-`0600` ledger is written before mutation and records only the packet table identity plus those sanitized preimage fields. Installation must leave the foreign canonical digest and counts unchanged.
+
+Only the pinned `linux/amd64` PostgreSQL digest is acquired before the boundary. After firewall activation, the rehearsal starts one tmpfs-backed packet service with an unreported transient password, one same-network client, and one pinned-image foreign-network canary target on Docker's pre-existing default bridge. No container is privileged or uses host/PID/IPC mode, a bind, Docker socket, device, added capability, security option, extra network, or unexpected publication.
+
+The service's requested `5432/tcp -> 56422` publication must resolve to exactly `127.0.0.1:56422`. Loopback must connect, while every discoverable non-loopback IPv4 and IPv6 host address must fail. The same-network client must reach the service by packet service name and port without incrementing either deny counter. Docker host control must remain available.
+
+Each negative canary must both fail and increment the expected packet-owned deny counter: Docker embedded DNS for an external name, literal `1.1.1.1:443`, metadata `169.254.169.254`, the bridge gateway, an exact host listener, and a target on a foreign Docker network. A failed canary with no counter correlation is rejected; this prevents DNS failure from being masked by missing tooling, an inert resolver, or another boundary. Only sanitized booleans and deny-count deltas are retained.
+
+Cleanup first removes exact packet containers and volumes while the firewall remains active, then atomically deletes only the recorded packet table, proves the canonical foreign firewall digest/count preimage restored, and finally removes the exact packet network. Rollback-check failure retains the ledger for the explicit `if: always()` cleanup attempt. Duplicate cleanup is an exact no-op only when both ledger and packet table are absent. Final acceptance additionally requires zero packet containers, volumes, networks, listener `56422`, firewall rules/chains/ledger, unchanged native `5432`/`5433` fingerprints, and no packet process or raw scratch.
+
+Only `FIREWALL_PUBLICATION_REHEARSAL_PASS` proves this rehearsal. It does not prove the Supabase CLI, GoTrue migration, extensions, application replay, target bootstrap, or provider access.
+
+## Preserved inactive stateful DB-start policy
+
+The inactive `run` script mode invokes the pinned v2.109.1 CLI exactly once as `supabase --workdir <packet-project> --network-id <frozen-name> --yes db start`. The manual workflow does not select it in this rehearsal. The public config remains byte-frozen at SHA-256 `1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6`; database migrations and seed are disabled, Auth is enabled only for its one-shot migration, and every other persistent service is disabled.
 
 The earlier loader diagnostic proved `Config.Load` succeeds under a fresh child environment. Database start therefore uses the same `env -i` boundary: fixed system `PATH`, packet-local `HOME`, XDG roots and `TMPDIR`, `DO_NOT_TRACK=1`, and child-only `DOCKER_HOST`. It inherits no `SUPABASE_*`, CI, runner home/config, linked state, credential, provider, or application value. The local CLI upgrade cache is pre-seeded with the pinned version.
 
