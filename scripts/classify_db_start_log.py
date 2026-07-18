@@ -16,7 +16,9 @@ ALLOWED_CATEGORIES: Final = (
     "CLI_USAGE_ERROR",
     "IMAGE_RESOLUTION_FAILED",
     "NETWORK_CONFIGURATION_REJECTED",
+    "VOLUME_PREPARATION_FAILED",
     "CONTAINER_CREATE_FAILED",
+    "CONTAINER_START_FAILED",
     "PORT_BIND_FAILED",
     "DATABASE_HEALTH_FAILED",
     "GOTRUE_MIGRATION_FAILED",
@@ -70,6 +72,13 @@ RULES: Final = (
         ),
     ),
     (
+        "VOLUME_PREPARATION_FAILED",
+        (
+            r"\bfailed to parse docker volume\b",
+            r"\bfailed to create volume\b",
+        ),
+    ),
+    (
         "GOTRUE_MIGRATION_FAILED",
         (
             r"\bgotrue\b[^\r\n]{0,160}\bmigrat\w*\b[^\r\n]{0,160}\b(?:fail|error|exit)\w*\b",
@@ -90,10 +99,18 @@ RULES: Final = (
     (
         "CONTAINER_CREATE_FAILED",
         (
+            r"\bfailed to create docker container\b",
             r"\bfailed to create (?:the )?container\b",
             r"\bcontainer name\b[^\r\n]{0,160}\balready in use\b",
             r"\binvalid mount config\b",
             r"\bcontainer create failed\b",
+        ),
+    ),
+    (
+        "CONTAINER_START_FAILED",
+        (
+            r"\bfailed to start docker container\b",
+            r"\bcontainer start failed\b",
         ),
     ),
     (
@@ -110,17 +127,27 @@ RULES: Final = (
 def classify(raw: bytes, exit_code: int) -> dict[str, int | str]:
     text = raw.decode("utf-8", errors="replace").lower()
     category = UNKNOWN
+    matching_lines: list[int] = []
     for candidate, patterns in RULES:
-        if any(re.search(pattern, text) for pattern in patterns):
+        matching_lines = [
+            line_number
+            for line_number, line in enumerate(text.splitlines(), start=1)
+            if any(re.search(pattern, line) for pattern in patterns)
+        ]
+        if matching_lines:
             category = candidate
             break
-    return {
+    result: dict[str, int | str] = {
         "category": category,
         "exit_code": exit_code,
+        "match_count": len(matching_lines),
         "raw_byte_count": len(raw),
         "raw_line_count": len(raw.splitlines()),
         "raw_sha256": hashlib.sha256(raw).hexdigest(),
     }
+    if matching_lines:
+        result["first_match_line"] = matching_lines[0]
+    return result
 
 
 def format_state_lines(result: dict[str, int | str]) -> str:
@@ -129,11 +156,18 @@ def format_state_lines(result: dict[str, int | str]) -> str:
     fields = (
         ("supabase_cli.db_start_diagnostic.category", "str", result["category"]),
         ("supabase_cli.db_start_diagnostic.exit_code", "int", result["exit_code"]),
+        ("supabase_cli.db_start_diagnostic.match_count", "int", result["match_count"]),
         ("supabase_cli.db_start_diagnostic.raw_byte_count", "int", result["raw_byte_count"]),
         ("supabase_cli.db_start_diagnostic.raw_line_count", "int", result["raw_line_count"]),
         ("supabase_cli.db_start_diagnostic.raw_sha256", "str", result["raw_sha256"]),
     )
-    return "".join(f"{key}\t{kind}\t{value}\n" for key, kind, value in fields)
+    rendered = "".join(f"{key}\t{kind}\t{value}\n" for key, kind, value in fields)
+    if "first_match_line" in result:
+        rendered += (
+            "supabase_cli.db_start_diagnostic.first_match_line\tint\t"
+            f"{result['first_match_line']}\n"
+        )
+    return rendered
 
 
 def main() -> None:

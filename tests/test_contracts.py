@@ -24,6 +24,7 @@ def load_module(name: str, relative: str):
 watch = load_module("container_watch", "scripts/container_watch.py")
 subnets = load_module("check_subnet", "scripts/check_subnet.py")
 db_start_log = load_module("classify_db_start_log", "scripts/classify_db_start_log.py")
+docker_events = load_module("classify_docker_events", "scripts/classify_docker_events.py")
 direct_port = load_module("direct_port_probe", "scripts/direct_port_probe.py")
 
 
@@ -234,6 +235,51 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner.index(classifier),
             self.runner.index('block SUPABASE_DB_START_FAILED'),
         )
+
+    def test_precli_object_listener_and_event_history_boundaries(self) -> None:
+        freeze = "freeze_precli_objects_and_listeners"
+        boundary = 'EVENT_SINCE="$(date -u +%s)"'
+        cli_start = 'db start >"$RAW/supabase-db-start.log"'
+        self.assertIn(freeze, self.runner)
+        self.assertIn('ss -H -ltn "sport = :${port}"', self.runner)
+        self.assertIn("pre_cli.packet_db_container_count", self.runner)
+        self.assertIn("pre_cli.packet_db_volume_count", self.runner)
+        self.assertIn("pre_cli.db_listener_count", self.runner)
+        self.assertIn("native_listener_contract post_cli", self.runner)
+        self.assertIn("native_listener_contract cleanup", self.runner)
+        self.assertLess(self.runner.index(freeze), self.runner.index(boundary))
+        self.assertLess(self.runner.index(boundary), self.runner.index(cli_start))
+
+    def test_event_history_is_bounded_correlated_and_sanitized(self) -> None:
+        classifier = 'python3 -B "$ROOT/scripts/classify_docker_events.py"'
+        self.assertIn(classifier, self.runner)
+        self.assertEqual(self.runner.count("docker events \\"), 3)
+        self.assertGreaterEqual(
+            self.runner.count('--filter "label=com.supabase.cli.project=${PROJECT}"'),
+            2,
+        )
+        self.assertIn('--filter "network=${NETWORK_NAME}"', self.runner)
+        self.assertGreaterEqual(self.runner.count('--since "$EVENT_SINCE"'), 3)
+        self.assertGreaterEqual(self.runner.count('--until "$EVENT_UNTIL"'), 3)
+        self.assertNotIn('cat "$CONTAINER_EVENTS_FILE" >>"$STATE_FILE"', self.runner)
+        self.assertNotIn('cat "$VOLUME_EVENTS_FILE" >>"$STATE_FILE"', self.runner)
+        self.assertNotIn('cat "$NETWORK_EVENTS_FILE" >>"$STATE_FILE"', self.runner)
+        self.assertLess(
+            self.runner.index(classifier),
+            self.runner.index('block SUPABASE_DB_START_FAILED'),
+        )
+
+    def test_event_classification_routes_fail_closed(self) -> None:
+        for code in (
+            "OBSERVER_COVERAGE_GAP",
+            "CONTAINER_CREATE_FAILED",
+            "CONTAINER_CREATED_NOT_STARTED",
+            "DATABASE_HEALTH_FAILED",
+            "GOTRUE_MIGRATION_FAILED",
+            "EVENT_HISTORY_IMAGE_IDENTITY_FAILED",
+            "EVENT_HISTORY_NETWORK_CORRELATION_FAILED",
+        ):
+            self.assertIn(code, self.runner)
 
     def test_prohibited_operations_are_absent(self) -> None:
         prohibited = (
@@ -466,7 +512,9 @@ class DbStartLogClassifierTests(unittest.TestCase):
             "CLI_USAGE_ERROR": b"unknown flag: --not-real\n",
             "IMAGE_RESOLUTION_FAILED": b"manifest unknown\n",
             "NETWORK_CONFIGURATION_REJECTED": b"failed to create docker network\n",
-            "CONTAINER_CREATE_FAILED": b"failed to create the container\n",
+            "VOLUME_PREPARATION_FAILED": b"failed to create volume\n",
+            "CONTAINER_CREATE_FAILED": b"failed to create docker container\n",
+            "CONTAINER_START_FAILED": b"failed to start docker container\n",
             "PORT_BIND_FAILED": b"port is already allocated\n",
             "DATABASE_HEALTH_FAILED": b"database is not healthy\n",
             "GOTRUE_MIGRATION_FAILED": b"gotrue migrate failed\n",
@@ -482,10 +530,21 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 self.assertEqual(result["raw_byte_count"], len(raw))
                 self.assertEqual(result["raw_line_count"], 1)
                 self.assertRegex(result["raw_sha256"], r"^[0-9a-f]{64}$")
-                self.assertEqual(
-                    set(result),
-                    {"category", "exit_code", "raw_byte_count", "raw_line_count", "raw_sha256"},
-                )
+                expected_keys = {
+                    "category",
+                    "exit_code",
+                    "match_count",
+                    "raw_byte_count",
+                    "raw_line_count",
+                    "raw_sha256",
+                }
+                if expected != "UNKNOWN_SANITIZED":
+                    expected_keys.add("first_match_line")
+                    self.assertEqual(result["first_match_line"], 1)
+                    self.assertEqual(result["match_count"], 1)
+                else:
+                    self.assertEqual(result["match_count"], 0)
+                self.assertEqual(set(result), expected_keys)
 
     def test_specific_network_rule_precedes_generic_daemon_rule(self) -> None:
         raw = b"Error response from daemon: failed to create docker network\n"
@@ -497,10 +556,25 @@ class DbStartLogClassifierTests(unittest.TestCase):
     def test_empty_log_defaults_without_leaking_input(self) -> None:
         result = db_start_log.classify(b"", 7)
         self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
+        self.assertEqual(result["match_count"], 0)
         self.assertEqual(result["raw_byte_count"], 0)
         self.assertEqual(result["raw_line_count"], 0)
         rendered = db_start_log.format_state_lines(result)
-        self.assertEqual(len(rendered.splitlines()), 5)
+        self.assertEqual(len(rendered.splitlines()), 6)
+
+    def test_exact_cli_source_wrappers_and_match_location(self) -> None:
+        fixtures = {
+            b"failed to parse docker volume: fixture\n": "VOLUME_PREPARATION_FAILED",
+            b"failed to create volume: fixture\n": "VOLUME_PREPARATION_FAILED",
+            b"failed to create docker container: fixture\n": "CONTAINER_CREATE_FAILED",
+            b"failed to start docker container fixture: fixture\n": "CONTAINER_START_FAILED",
+        }
+        for raw, expected in fixtures.items():
+            with self.subTest(expected=expected):
+                result = db_start_log.classify(b"prefix\n" + raw + raw, 1)
+                self.assertEqual(result["category"], expected)
+                self.assertEqual(result["match_count"], 2)
+                self.assertEqual(result["first_match_line"], 2)
 
     def test_executable_path_emits_only_sanitized_state(self) -> None:
         raw = b"failed to create docker network opaque-fixture-text\n"
@@ -521,10 +595,205 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-        self.assertEqual(len(completed.stdout.splitlines()), 5)
+        self.assertEqual(len(completed.stdout.splitlines()), 7)
         self.assertIn("NETWORK_CONFIGURATION_REJECTED", completed.stdout)
         self.assertNotIn("opaque-fixture-text", completed.stdout)
         self.assertEqual(completed.stderr, "")
+
+
+def docker_event_line(event_type: str, action: str, object_id: str, **attributes: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "Type": event_type,
+                "Action": action,
+                "Actor": {"ID": object_id, "Attributes": attributes},
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+class DockerEventHistoryClassifierTests(unittest.TestCase):
+    project = "fp-hosted-replay-ro-001"
+    network_name = "fp-hosted-replay-ro-001-net"
+    network_id = "a" * 64
+    volume = "supabase_db_fp-hosted-replay-ro-001"
+    postgres_image = "public.ecr.aws/supabase/postgres:17.6.1.143"
+    postgres_image_id = "sha256:postgres"
+    gotrue_image = "public.ecr.aws/supabase/gotrue:v2.192.0"
+    gotrue_image_id = "sha256:gotrue"
+    database_id = "b" * 64
+    gotrue_id = "c" * 64
+
+    def container(self, action: str, object_id: str, image: str, **attributes: str) -> bytes:
+        return docker_event_line(
+            "container",
+            action,
+            object_id,
+            **{
+                "com.supabase.cli.project": self.project,
+                "image": image,
+                **attributes,
+            },
+        )
+
+    def volume_event(self, action: str = "create") -> bytes:
+        return docker_event_line(
+            "volume",
+            action,
+            self.volume,
+            **{"com.supabase.cli.project": self.project},
+        )
+
+    def network(self, action: str, container_id: str, network_id: str | None = None) -> bytes:
+        return docker_event_line(
+            "network",
+            action,
+            network_id or self.network_id,
+            name=self.network_name,
+            container=container_id,
+        )
+
+    def live(self, *observations: tuple[str, str]) -> bytes:
+        return b"".join(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "container_id": docker_events.identity_digest(container_id),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+            for phase, container_id in observations
+        )
+
+    def analyze(
+        self,
+        container_raw: bytes = b"",
+        volume_raw: bytes = b"",
+        network_raw: bytes = b"",
+        live_raw: bytes = b"",
+    ) -> dict:
+        return docker_events.analyze(
+            container_raw,
+            volume_raw,
+            network_raw,
+            live_raw,
+            project=self.project,
+            network_name=self.network_name,
+            network_id=self.network_id,
+            db_volume=self.volume,
+            postgres_image=self.postgres_image,
+            postgres_image_id=self.postgres_image_id,
+            gotrue_image=self.gotrue_image,
+            gotrue_image_id=self.gotrue_image_id,
+        )
+
+    def database_create_start(self) -> tuple[bytes, bytes, bytes]:
+        containers = self.container("create", self.database_id, self.postgres_image)
+        containers += self.container("start", self.database_id, self.postgres_image)
+        network = self.network("connect", self.database_id)
+        live = self.live(("create", self.database_id), ("start", self.database_id))
+        return containers, network, live
+
+    def test_every_event_classification_has_a_deterministic_fixture(self) -> None:
+        containers, network, live = self.database_create_start()
+        fixtures = {
+            "NO_DOCKER_MUTATION_OBSERVED": self.analyze(),
+            "EVENT_HISTORY_CONSISTENT": self.analyze(
+                containers, self.volume_event(), network, live
+            ),
+            "OBSERVER_COVERAGE_GAP": self.analyze(
+                containers, self.volume_event(), network, b""
+            ),
+            "CONTAINER_CREATE_FAILED": self.analyze(
+                b"", self.volume_event(), b"", b""
+            ),
+            "CONTAINER_CREATED_NOT_STARTED": self.analyze(
+                self.container("create", self.database_id, self.postgres_image),
+                self.volume_event(),
+                self.network("connect", self.database_id),
+                self.live(("create", self.database_id)),
+            ),
+            "DATABASE_HEALTH_FAILED": self.analyze(
+                containers
+                + self.container(
+                    "die", self.database_id, self.postgres_image, exitCode="1"
+                ),
+                self.volume_event(),
+                network,
+                live,
+            ),
+            "GOTRUE_MIGRATION_FAILED": self.analyze(
+                containers
+                + self.container("create", self.gotrue_id, self.gotrue_image)
+                + self.container("start", self.gotrue_id, self.gotrue_image)
+                + self.container("die", self.gotrue_id, self.gotrue_image, exitCode="1"),
+                self.volume_event(),
+                network + self.network("connect", self.gotrue_id),
+                live
+                + self.live(("create", self.gotrue_id), ("start", self.gotrue_id)),
+            ),
+        }
+        self.assertEqual(set(fixtures), docker_events.ALLOWED_CLASSIFICATIONS)
+        for expected, result in fixtures.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(result["classification"], expected)
+
+    def test_action_counts_and_correlations_are_sanitized(self) -> None:
+        containers, network, live = self.database_create_start()
+        result = self.analyze(containers, self.volume_event(), network, live)
+        self.assertEqual(result["container_create_count"], 1)
+        self.assertEqual(result["container_start_count"], 1)
+        self.assertEqual(result["volume_create_count"], 1)
+        self.assertEqual(result["network_connect_count"], 1)
+        self.assertTrue(result["pinned_image_identity_correlated"])
+        self.assertTrue(result["frozen_network_id_correlated"])
+        self.assertTrue(result["live_observer_correlated"])
+        rendered = docker_events.format_state_lines(result)
+        for raw_value in (
+            self.database_id,
+            self.volume,
+            self.project,
+            self.network_name,
+            self.postgres_image,
+        ):
+            self.assertNotIn(raw_value, rendered)
+        self.assertRegex(result["container_id_set_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(result["raw_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_identity_or_network_drift_is_not_accepted(self) -> None:
+        unknown_image = self.container("create", self.database_id, "foreign:image")
+        image_result = self.analyze(
+            unknown_image,
+            self.volume_event(),
+            self.network("connect", self.database_id),
+            self.live(("create", self.database_id)),
+        )
+        self.assertFalse(image_result["pinned_image_identity_correlated"])
+
+        containers, _, live = self.database_create_start()
+        network_result = self.analyze(
+            containers,
+            self.volume_event(),
+            self.network("connect", self.database_id, network_id="d" * 64),
+            live,
+        )
+        self.assertFalse(network_result["frozen_network_id_correlated"])
+
+    def test_wrong_project_label_or_raw_event_is_rejected(self) -> None:
+        wrong_label = docker_event_line(
+            "container",
+            "create",
+            self.database_id,
+            **{"com.supabase.cli.project": "foreign", "image": self.postgres_image},
+        )
+        with self.assertRaises(docker_events.EventHistoryError):
+            self.analyze(wrong_label)
+        with self.assertRaises(docker_events.EventHistoryError):
+            self.analyze(b"raw opaque event\n")
 
 
 def base_inspection() -> dict:

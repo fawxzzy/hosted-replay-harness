@@ -33,12 +33,22 @@ PROJECT_DIR="$RUNTIME/project"
 AUDIT_FILE="$RUNTIME/container-audit.jsonl"
 VIOLATION_FILE="$RUNTIME/container-violations.jsonl"
 WATCH_READY="$RUNTIME/watcher.ready"
+DB_START_DIAGNOSTIC_FILE="$RUNTIME/db-start-diagnostic.tsv"
+EVENT_HISTORY_STATE_FILE="$RUNTIME/docker-event-history.tsv"
+CONTAINER_EVENTS_FILE="$RAW/docker-container-events.jsonl"
+VOLUME_EVENTS_FILE="$RAW/docker-volume-events.jsonl"
+NETWORK_EVENTS_FILE="$RAW/docker-network-events.jsonl"
 STATE_FILE="$ROOT/artifacts/.state.tsv"
 RESULT_FILE="$ROOT/artifacts/containment-smoke.json"
 WATCH_PID=""
 NETWORK_ID=""
 POSTGRES_IMAGE_ID=""
 GOTRUE_IMAGE_ID=""
+EVENT_SINCE=""
+NATIVE_5432_COUNT=""
+NATIVE_5432_SHA256=""
+NATIVE_5433_COUNT=""
+NATIVE_5433_SHA256=""
 SMOKE_PASSED=0
 FINALIZING=0
 
@@ -79,6 +89,67 @@ version_at_least() {
 
 hash_identifier() {
   printf 'sha256:%s' "$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
+}
+
+capture_listener_snapshot() {
+  local stage="$1" port="$2" snapshot="$RAW/listeners-${stage}-${port}.txt"
+  ss -H -ltn "sport = :${port}" 2>"$RAW/listeners-${stage}-${port}.log" \
+    | awk 'NF{print $1 "|" $4 "|" $5}' \
+    | LC_ALL=C sort -u >"$snapshot" || return 1
+  LISTENER_SNAPSHOT_COUNT="$(awk 'NF' "$snapshot" | wc -l)"
+  LISTENER_SNAPSHOT_SHA256="$(sha256sum "$snapshot" | awk '{print $1}')"
+}
+
+freeze_precli_objects_and_listeners() {
+  local container_count volume_count
+  container_count="$({
+    docker ps -aq --no-trunc --filter "name=^/${DB_NAME}$" 2>/dev/null
+    docker ps -aq --no-trunc --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u | wc -l)"
+  volume_count="$({
+    docker volume ls -q --filter "name=^${DB_VOLUME}$" 2>/dev/null
+    docker volume ls -q --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null
+  } | awk 'NF' | sort -u | wc -l)"
+  record pre_cli.packet_db_container_count int "$container_count"
+  record pre_cli.packet_db_volume_count int "$volume_count"
+  [[ "$container_count" == "0" ]] || block PRESTART_DB_CONTAINER_PRESENT
+  [[ "$volume_count" == "0" ]] || block PRESTART_DB_VOLUME_PRESENT
+
+  capture_listener_snapshot pre_cli "$DB_PORT" || block LISTENER_INSPECTION_FAILED
+  record pre_cli.db_listener_count int "$LISTENER_SNAPSHOT_COUNT"
+  [[ "$LISTENER_SNAPSHOT_COUNT" == "0" ]] || block PRESTART_DB_PORT_LISTENER_PRESENT
+
+  capture_listener_snapshot pre_cli 5432 || block LISTENER_INSPECTION_FAILED
+  NATIVE_5432_COUNT="$LISTENER_SNAPSHOT_COUNT"
+  NATIVE_5432_SHA256="$LISTENER_SNAPSHOT_SHA256"
+  record native_listeners.port_5432.pre_cli_count int "$NATIVE_5432_COUNT"
+  record native_listeners.port_5432.pre_cli_sha256 str "$NATIVE_5432_SHA256"
+
+  capture_listener_snapshot pre_cli 5433 || block LISTENER_INSPECTION_FAILED
+  NATIVE_5433_COUNT="$LISTENER_SNAPSHOT_COUNT"
+  NATIVE_5433_SHA256="$LISTENER_SNAPSHOT_SHA256"
+  record native_listeners.port_5433.pre_cli_count int "$NATIVE_5433_COUNT"
+  record native_listeners.port_5433.pre_cli_sha256 str "$NATIVE_5433_SHA256"
+}
+
+native_listener_contract() {
+  local stage="$1" matched=true
+  [[ -n "$NATIVE_5432_COUNT" && -n "$NATIVE_5433_COUNT" ]] || return 0
+
+  capture_listener_snapshot "$stage" 5432 || return 1
+  record "native_listeners.port_5432.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT"
+  record "native_listeners.port_5432.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256"
+  [[ "$LISTENER_SNAPSHOT_COUNT" == "$NATIVE_5432_COUNT" && "$LISTENER_SNAPSHOT_SHA256" == "$NATIVE_5432_SHA256" ]] \
+    || matched=false
+
+  capture_listener_snapshot "$stage" 5433 || return 1
+  record "native_listeners.port_5433.${stage}_count" int "$LISTENER_SNAPSHOT_COUNT"
+  record "native_listeners.port_5433.${stage}_sha256" str "$LISTENER_SNAPSHOT_SHA256"
+  [[ "$LISTENER_SNAPSHOT_COUNT" == "$NATIVE_5433_COUNT" && "$LISTENER_SNAPSHOT_SHA256" == "$NATIVE_5433_SHA256" ]] \
+    || matched=false
+
+  record "native_listeners.${stage}_unchanged" bool "$matched"
+  [[ "$matched" == "true" ]]
 }
 
 network_contract_code() {
@@ -244,6 +315,7 @@ cleanup_exact() {
   [[ "$count" == "0" ]] || return 1
   [[ "$listener_count" == "0" ]] || return 1
   timeout 2 bash -c "</dev/tcp/127.0.0.1/${DB_PORT}" >/dev/null 2>&1 && return 1
+  native_listener_contract cleanup || return 1
   return 0
 }
 
@@ -630,6 +702,9 @@ if [[ ! -f "$WATCH_READY" ]]; then
   block CONTAINER_WATCHER_NOT_READY
 fi
 assert_frozen_network pre_cli_start empty
+freeze_precli_objects_and_listeners
+EVENT_SINCE="$(date -u +%s)"
+record docker_event_history.boundary_frozen bool true
 
 set +e
 timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
@@ -645,9 +720,12 @@ kill -0 "$WATCH_PID" 2>/dev/null && watcher_alive=1
 stop_watcher
 if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
   --input "$RAW/supabase-db-start.log" \
-  --exit-code "$cli_rc" >>"$STATE_FILE"; then
+  --exit-code "$cli_rc" >"$DB_START_DIAGNOSTIC_FILE"; then
   block DB_START_LOG_SANITIZER_FAILED
 fi
+cat "$DB_START_DIAGNOSTIC_FILE" >>"$STATE_FILE"
+db_start_category="$(awk -F '\t' '$1=="supabase_cli.db_start_diagnostic.category"{print $3; exit}' "$DB_START_DIAGNOSTIC_FILE")"
+[[ "$db_start_category" =~ ^[A-Z0-9_]+$ ]] || block DB_START_LOG_SANITIZER_FAILED
 [[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 if [[ "$watcher_alive" != "1" ]]; then
   if [[ -s "$VIOLATION_FILE" ]]; then
@@ -655,9 +733,60 @@ if [[ "$watcher_alive" != "1" ]]; then
   fi
   block CONTAINER_WATCHER_EXITED
 fi
+if [[ -s "$VIOLATION_FILE" ]]; then
+  block "$(first_observer_violation)"
+fi
 
 assert_frozen_network post_cli active
 record network.correlated_count_after_cli int 1
+native_listener_contract post_cli || block NATIVE_LISTENER_DRIFT
+
+EVENT_UNTIL="$(( $(date -u +%s) + 1 ))"
+timeout --signal=TERM --kill-after=5s 20s docker events \
+  --since "$EVENT_SINCE" --until "$EVENT_UNTIL" \
+  --filter type=container \
+  --filter event=create --filter event=start --filter event=die --filter event=destroy \
+  --filter "label=com.supabase.cli.project=${PROJECT}" \
+  --format '{{json .}}' >"$CONTAINER_EVENTS_FILE" 2>"$RAW/docker-container-events.log" \
+  || block DOCKER_EVENT_HISTORY_QUERY_FAILED
+timeout --signal=TERM --kill-after=5s 20s docker events \
+  --since "$EVENT_SINCE" --until "$EVENT_UNTIL" \
+  --filter type=volume \
+  --filter event=create \
+  --filter "label=com.supabase.cli.project=${PROJECT}" \
+  --format '{{json .}}' >"$VOLUME_EVENTS_FILE" 2>"$RAW/docker-volume-events.log" \
+  || block DOCKER_EVENT_HISTORY_QUERY_FAILED
+timeout --signal=TERM --kill-after=5s 20s docker events \
+  --since "$EVENT_SINCE" --until "$EVENT_UNTIL" \
+  --filter type=network \
+  --filter event=connect \
+  --filter "network=${NETWORK_NAME}" \
+  --format '{{json .}}' >"$NETWORK_EVENTS_FILE" 2>"$RAW/docker-network-events.log" \
+  || block DOCKER_EVENT_HISTORY_QUERY_FAILED
+
+if ! python3 -B "$ROOT/scripts/classify_docker_events.py" \
+  --container-events "$CONTAINER_EVENTS_FILE" \
+  --volume-events "$VOLUME_EVENTS_FILE" \
+  --network-events "$NETWORK_EVENTS_FILE" \
+  --live-audit "$AUDIT_FILE" \
+  --project "$PROJECT" \
+  --network-name "$NETWORK_NAME" \
+  --network-id "$NETWORK_ID" \
+  --db-volume "$DB_VOLUME" \
+  --postgres-image "$POSTGRES_EXPECTED" \
+  --postgres-image-id "$POSTGRES_IMAGE_ID" \
+  --gotrue-image "$GOTRUE_EXPECTED" \
+  --gotrue-image-id "$GOTRUE_IMAGE_ID" \
+  >"$EVENT_HISTORY_STATE_FILE" 2>"$RAW/docker-event-history-sanitizer.log"; then
+  block DOCKER_EVENT_HISTORY_SANITIZER_FAILED
+fi
+cat "$EVENT_HISTORY_STATE_FILE" >>"$STATE_FILE"
+event_classification="$(awk -F '\t' '$1=="docker_event_history.classification"{print $3; exit}' "$EVENT_HISTORY_STATE_FILE")"
+event_image_correlated="$(awk -F '\t' '$1=="docker_event_history.pinned_image_identity_correlated"{print $3; exit}' "$EVENT_HISTORY_STATE_FILE")"
+event_network_correlated="$(awk -F '\t' '$1=="docker_event_history.frozen_network_id_correlated"{print $3; exit}' "$EVENT_HISTORY_STATE_FILE")"
+[[ "$event_classification" =~ ^[A-Z0-9_]+$ ]] || block DOCKER_EVENT_HISTORY_SANITIZER_FAILED
+[[ "$event_image_correlated" == "true" ]] || block EVENT_HISTORY_IMAGE_IDENTITY_FAILED
+[[ "$event_network_correlated" == "true" ]] || block EVENT_HISTORY_NETWORK_CORRELATION_FAILED
 
 database_create_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" and json.loads(x).get("phase")=="create" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
 database_start_observations="$(python3 -c 'import json,sys; print(sum(json.loads(x).get("role")=="database" and json.loads(x).get("phase")=="start" for x in open(sys.argv[1]) if x.strip()))' "$AUDIT_FILE")"
@@ -668,13 +797,27 @@ record container_lifecycle.database.start_count int "$database_start_observation
 record container_lifecycle.gotrue_migration.create_count int "$gotrue_create_observations"
 record container_lifecycle.gotrue_migration.start_count int "$gotrue_start_observations"
 record container_lifecycle.network_id_correlated bool true
-if [[ -s "$VIOLATION_FILE" ]]; then
-  block "$(first_observer_violation)"
+case "$event_classification" in
+  OBSERVER_COVERAGE_GAP|CONTAINER_CREATE_FAILED|DATABASE_HEALTH_FAILED|GOTRUE_MIGRATION_FAILED)
+    block "$event_classification" "cli-exit-${cli_rc}"
+    ;;
+  CONTAINER_CREATED_NOT_STARTED)
+    case "$db_start_category" in
+      CONTAINER_START_FAILED|PORT_BIND_FAILED|GOTRUE_MIGRATION_FAILED)
+        block "$db_start_category" "cli-exit-${cli_rc}"
+        ;;
+      *) block CONTAINER_CREATED_NOT_STARTED "cli-exit-${cli_rc}" ;;
+    esac
+    ;;
+  EVENT_HISTORY_CONSISTENT|NO_DOCKER_MUTATION_OBSERVED) ;;
+  *) block DOCKER_EVENT_HISTORY_SANITIZER_FAILED ;;
+esac
+if [[ "$cli_rc" != "0" ]]; then
+  if [[ "$db_start_category" != "UNKNOWN_SANITIZED" ]]; then
+    block "$db_start_category" "cli-exit-${cli_rc}"
+  fi
+  block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 fi
-if (( database_create_observations > database_start_observations || gotrue_create_observations > gotrue_start_observations )); then
-  block CONTAINER_CREATED_NOT_STARTED
-fi
-[[ "$cli_rc" == "0" ]] || block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 
 record database.audit_observations int "$database_start_observations"
 record gotrue.audit_observations int "$gotrue_start_observations"
