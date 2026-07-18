@@ -3432,6 +3432,227 @@ class DirectPortProbeTests(unittest.TestCase):
         self.assertIn("DIRECT_MOUNT_CONTRACT_MISMATCH", violations)
         self.assertIn("DIRECT_RESTART_POLICY_MISMATCH", violations)
 
+    def test_full_inspection_accepts_only_one_strict_json_object(self) -> None:
+        payload = direct_inspection()
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload).encode("utf-8"), stderr=b""
+        )
+        with mock.patch.object(direct_port.subprocess, "run", return_value=completed):
+            observed, diagnostic = direct_port.safe_inspect("opaque-id", 7)
+        self.assertEqual(observed, payload)
+        self.assertIsNone(diagnostic)
+
+    def test_full_inspection_parse_failures_have_exact_terminal_classes(self) -> None:
+        fixtures = (
+            (b'\xff', "INVALID_UTF8", "DIRECT_INSPECT_INVALID_UTF8"),
+            (b'{', "JSON_SYNTAX", "DIRECT_INSPECT_JSON_REJECTED"),
+            (
+                b'{"schema_version":1,"schema_version":1}',
+                "DUPLICATE_KEY",
+                "DIRECT_INSPECT_DUPLICATE_KEY_REJECTED",
+            ),
+            (b'[]', "TOPLEVEL_TYPE", "DIRECT_INSPECT_TOPLEVEL_REJECTED"),
+        )
+        for raw, parse_class, terminal_class in fixtures:
+            with self.subTest(parse_class=parse_class):
+                completed = subprocess.CompletedProcess(
+                    [], 0, stdout=raw, stderr=b"private-stderr"
+                )
+                with mock.patch.object(
+                    direct_port.subprocess, "run", return_value=completed
+                ):
+                    observed, diagnostic = direct_port.safe_inspect("opaque-id", 3)
+                self.assertIsNone(observed)
+                assert diagnostic is not None
+                self.assertEqual(diagnostic["parse_class"], parse_class)
+                self.assertEqual(diagnostic["terminal_class"], terminal_class)
+                self.assertEqual(diagnostic["attempt_index"], 3)
+                self.assertEqual(diagnostic["command_exit_class"], "ZERO")
+                self.assertEqual(diagnostic["first_failed_group"], "NONE")
+
+    def test_command_failure_distinguishes_object_loss_and_every_field_group(self) -> None:
+        failed = subprocess.CompletedProcess(
+            [], 1, stdout=b"partial\n", stderr=b"private-command-error\n"
+        )
+        valid = subprocess.CompletedProcess([], 0, stdout=b"{}\n", stderr=b"")
+
+        with mock.patch.object(
+            direct_port.subprocess, "run", side_effect=[failed, failed]
+        ):
+            observed, diagnostic = direct_port.safe_inspect("opaque-id", 1)
+        self.assertIsNone(observed)
+        assert diagnostic is not None
+        self.assertEqual(
+            diagnostic["terminal_class"], "DIRECT_INSPECT_OBJECT_UNAVAILABLE"
+        )
+        self.assertEqual(diagnostic["first_failed_group"], "IDENTITY_CONFIG")
+        self.assertEqual(diagnostic["successful_group_count"], 0)
+
+        for index, (group, terminal_class, _) in enumerate(
+            direct_port.INSPECT_FIELD_GROUPS
+        ):
+            with self.subTest(group=group):
+                sequence = [failed, valid, *([valid] * index), failed]
+                with mock.patch.object(
+                    direct_port.subprocess, "run", side_effect=sequence
+                ):
+                    observed, diagnostic = direct_port.safe_inspect("opaque-id", 2)
+                self.assertIsNone(observed)
+                assert diagnostic is not None
+                self.assertEqual(diagnostic["terminal_class"], terminal_class)
+                self.assertEqual(diagnostic["first_failed_group"], group)
+                self.assertEqual(diagnostic["successful_group_count"], index)
+
+    def test_all_fixed_groups_passing_is_composition_failure(self) -> None:
+        failed = subprocess.CompletedProcess([], -9, stdout=b"", stderr=b"private")
+        valid = subprocess.CompletedProcess([], 0, stdout=b"{}", stderr=b"")
+        sequence = [failed, valid, *([valid] * len(direct_port.INSPECT_FIELD_GROUPS))]
+        with mock.patch.object(
+            direct_port.subprocess, "run", side_effect=sequence
+        ):
+            observed, diagnostic = direct_port.safe_inspect("opaque-id", 4)
+        self.assertIsNone(observed)
+        assert diagnostic is not None
+        self.assertEqual(
+            diagnostic["terminal_class"], "DIRECT_INSPECT_COMPOSITION_FAILED"
+        )
+        self.assertEqual(diagnostic["command_exit_class"], "SIGNAL")
+        self.assertEqual(diagnostic["first_failed_group"], "NONE")
+        self.assertEqual(
+            diagnostic["successful_group_count"],
+            len(direct_port.INSPECT_FIELD_GROUPS),
+        )
+
+    def test_inspection_envelope_is_closed_deterministic_and_never_emits_raw(self) -> None:
+        stdout = b"credential-shaped-output\nsecond-line\n"
+        stderr = b"secret-shaped-error\n"
+        failed = subprocess.CompletedProcess([], 125, stdout=stdout, stderr=stderr)
+        with mock.patch.object(
+            direct_port.subprocess, "run", side_effect=[failed, failed]
+        ):
+            _, diagnostic = direct_port.safe_inspect("opaque-container-id", 5)
+        assert diagnostic is not None
+        expected_keys = {
+            "terminal_class",
+            "attempt_index",
+            "command_exit_class",
+            "command_exit_code",
+            "stdout_byte_count",
+            "stdout_line_count",
+            "stdout_sha256",
+            "stderr_byte_count",
+            "stderr_line_count",
+            "stderr_sha256",
+            "utf8_status",
+            "parse_class",
+            "first_failed_group",
+            "successful_group_count",
+            "digest",
+        }
+        self.assertEqual(set(diagnostic), expected_keys)
+        self.assertEqual(diagnostic["stdout_byte_count"], len(stdout))
+        self.assertEqual(diagnostic["stdout_line_count"], 2)
+        self.assertEqual(diagnostic["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+        self.assertEqual(diagnostic["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+        lines = direct_port.inspection_state_lines(diagnostic)
+        rendered = "\n".join(lines)
+        for forbidden in (
+            "credential-shaped-output",
+            "secret-shaped-error",
+            "opaque-container-id",
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(lines, direct_port.inspection_state_lines(dict(diagnostic)))
+        corrupted = dict(diagnostic, digest="0" * 64)
+        with self.assertRaises(ValueError):
+            direct_port.inspection_state_lines(corrupted)
+        with self.assertRaises(ValueError):
+            direct_port.inspection_state_lines(dict(diagnostic, raw="forbidden"))
+        inconsistent_cases = (
+            dict(diagnostic, command_exit_class="ZERO"),
+            dict(diagnostic, utf8_status="INVALID"),
+            dict(diagnostic, successful_group_count=1),
+            dict(diagnostic, first_failed_group="NONE"),
+        )
+        for inconsistent in inconsistent_cases:
+            canonical = json.dumps(
+                {key: value for key, value in inconsistent.items() if key != "digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            inconsistent["digest"] = hashlib.sha256(canonical.encode()).hexdigest()
+            with self.subTest(field_delta=set(inconsistent.items()) - set(diagnostic.items())):
+                with self.assertRaises(ValueError):
+                    direct_port.inspection_state_lines(inconsistent)
+
+    def test_probe_main_emits_closed_envelope_and_exact_terminal_failure(self) -> None:
+        completed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"private")
+        diagnostic = direct_port._diagnostic_envelope(
+            completed,
+            attempt_index=1,
+            terminal_class="DIRECT_INSPECT_OBJECT_UNAVAILABLE",
+            utf8_status="VALID",
+            parse_class="JSON_SYNTAX",
+            first_failed_group="IDENTITY_CONFIG",
+            successful_group_count=0,
+        )
+        output = io.StringIO()
+        argv = [
+            "direct_port_probe.py",
+            "--container-id",
+            "opaque-container-id",
+            "--network-id",
+            "opaque-network-id",
+            "--image-id",
+            "opaque-image-id",
+            "--image-reference",
+            "pinned-image-reference",
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(
+                direct_port, "safe_inspect", return_value=(None, diagnostic)
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(direct_port.main(), 1)
+        rendered = output.getvalue()
+        self.assertIn(
+            "diagnostic.inspection.terminal_class\tstr\tDIRECT_INSPECT_OBJECT_UNAVAILABLE",
+            rendered,
+        )
+        self.assertIn(
+            "diagnostic.probe.failure_code\tstr\tDIRECT_INSPECT_OBJECT_UNAVAILABLE",
+            rendered,
+        )
+        for forbidden in (
+            "opaque-container-id",
+            "opaque-network-id",
+            "opaque-image-id",
+            "pinned-image-reference",
+            "private",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_fallback_denominator_is_exact_and_never_requests_environment(self) -> None:
+        self.assertEqual(
+            [group for group, _, _ in direct_port.INSPECT_FIELD_GROUPS],
+            [
+                "IDENTITY_CONFIG",
+                "HOSTCONFIG_SECURITY_TMPFS",
+                "PUBLICATION",
+                "NETWORK_RUNTIME_MOUNTS",
+                "STATE_HEALTH",
+            ],
+        )
+        templates = [
+            direct_port.INSPECT_TEMPLATE,
+            direct_port.OBJECT_AVAILABILITY_TEMPLATE,
+            *(template for _, _, template in direct_port.INSPECT_FIELD_GROUPS),
+        ]
+        self.assertTrue(all(".Config.Env" not in template for template in templates))
+        self.assertEqual(len(direct_port.INSPECT_TERMINAL_CLASSES), 11)
+
     def test_global_host_address_denominator_includes_ipv4_and_ipv6(self) -> None:
         fixture = json.dumps(
             [

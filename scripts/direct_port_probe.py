@@ -147,6 +147,164 @@ PUBLICATION_VALUE_CLASSES = frozenset(
 )
 
 
+def _fixed_group_template(
+    payload: dict[str, Any], replacements: dict[str, str]
+) -> str:
+    template = json.dumps(payload, separators=(",", ":"))
+    for placeholder, expression in replacements.items():
+        template = template.replace(json.dumps(placeholder), expression)
+    return template
+
+
+OBJECT_AVAILABILITY_TEMPLATE = _fixed_group_template(
+    {"schema_version": SCHEMA_VERSION, "id": "__ID__"},
+    {"__ID__": "{{json .Id}}"},
+)
+
+IDENTITY_CONFIG_TEMPLATE = _fixed_group_template(
+    {
+        "schema_version": SCHEMA_VERSION,
+        "id": "__ID__",
+        "name": "__NAME__",
+        "image_id": "__IMAGE_ID__",
+        "config_image": "__CONFIG_IMAGE__",
+        "labels": "__LABELS__",
+    },
+    {
+        "__ID__": "{{json .Id}}",
+        "__NAME__": "{{json .Name}}",
+        "__IMAGE_ID__": "{{json .Image}}",
+        "__CONFIG_IMAGE__": "{{json .Config.Image}}",
+        "__LABELS__": "{{json .Config.Labels}}",
+    },
+)
+
+HOSTCONFIG_SECURITY_TMPFS_TEMPLATE = _fixed_group_template(
+    {
+        "schema_version": SCHEMA_VERSION,
+        "network_mode": "__NETWORK_MODE__",
+        "privileged": "__PRIVILEGED__",
+        "pid_mode": "__PID_MODE__",
+        "ipc_mode": "__IPC_MODE__",
+        "binds": "__BINDS__",
+        "host_mounts": "__HOST_MOUNTS__",
+        "volumes_from": "__VOLUMES_FROM__",
+        "tmpfs": "__TMPFS__",
+        "devices": "__DEVICES__",
+        "device_requests": "__DEVICE_REQUESTS__",
+        "cap_add": "__CAP_ADD__",
+        "security_opt": "__SECURITY_OPT__",
+        "extra_hosts": "__EXTRA_HOSTS__",
+        "restart_policy": "__RESTART_POLICY__",
+    },
+    {
+        "__NETWORK_MODE__": "{{json .HostConfig.NetworkMode}}",
+        "__PRIVILEGED__": "{{json .HostConfig.Privileged}}",
+        "__PID_MODE__": "{{json .HostConfig.PidMode}}",
+        "__IPC_MODE__": "{{json .HostConfig.IpcMode}}",
+        "__BINDS__": "{{json .HostConfig.Binds}}",
+        "__HOST_MOUNTS__": "{{json .HostConfig.Mounts}}",
+        "__VOLUMES_FROM__": "{{json .HostConfig.VolumesFrom}}",
+        "__TMPFS__": "{{json .HostConfig.Tmpfs}}",
+        "__DEVICES__": "{{json .HostConfig.Devices}}",
+        "__DEVICE_REQUESTS__": "{{json .HostConfig.DeviceRequests}}",
+        "__CAP_ADD__": "{{json .HostConfig.CapAdd}}",
+        "__SECURITY_OPT__": "{{json .HostConfig.SecurityOpt}}",
+        "__EXTRA_HOSTS__": "{{json .HostConfig.ExtraHosts}}",
+        "__RESTART_POLICY__": "{{json .HostConfig.RestartPolicy}}",
+    },
+)
+
+NETWORK_RUNTIME_MOUNTS_TEMPLATE = _fixed_group_template(
+    {
+        "schema_version": SCHEMA_VERSION,
+        "mounts": "__MOUNTS__",
+        "networks": "__NETWORKS__",
+    },
+    {
+        "__MOUNTS__": "{{json .Mounts}}",
+        "__NETWORKS__": "{{json .NetworkSettings.Networks}}",
+    },
+)
+
+STATE_HEALTH_TEMPLATE = _fixed_group_template(
+    {
+        "schema_version": SCHEMA_VERSION,
+        "restart_count": "__RESTART_COUNT__",
+        "state": {
+            "Status": "__STATE_STATUS__",
+            "Running": "__STATE_RUNNING__",
+            "Restarting": "__STATE_RESTARTING__",
+            "OOMKilled": "__STATE_OOM_KILLED__",
+        },
+        "health": {
+            "Status": "__HEALTH_STATUS__",
+            "FailingStreak": "__HEALTH_FAILING_STREAK__",
+        },
+    },
+    {
+        "__RESTART_COUNT__": "{{json .RestartCount}}",
+        "__STATE_STATUS__": "{{json .State.Status}}",
+        "__STATE_RUNNING__": "{{json .State.Running}}",
+        "__STATE_RESTARTING__": "{{json .State.Restarting}}",
+        "__STATE_OOM_KILLED__": "{{json .State.OOMKilled}}",
+        "__HEALTH_STATUS__": "{{json .State.Health.Status}}",
+        "__HEALTH_FAILING_STREAK__": "{{json .State.Health.FailingStreak}}",
+    },
+)
+
+INSPECT_FIELD_GROUPS = (
+    (
+        "IDENTITY_CONFIG",
+        "DIRECT_INSPECT_TEMPLATE_IDENTITY_FAILED",
+        IDENTITY_CONFIG_TEMPLATE,
+    ),
+    (
+        "HOSTCONFIG_SECURITY_TMPFS",
+        "DIRECT_INSPECT_TEMPLATE_HOSTCONFIG_FAILED",
+        HOSTCONFIG_SECURITY_TMPFS_TEMPLATE,
+    ),
+    (
+        "PUBLICATION",
+        "DIRECT_INSPECT_TEMPLATE_PUBLICATION_FAILED",
+        PUBLICATION_INSPECT_TEMPLATE,
+    ),
+    (
+        "NETWORK_RUNTIME_MOUNTS",
+        "DIRECT_INSPECT_TEMPLATE_NETWORK_FAILED",
+        NETWORK_RUNTIME_MOUNTS_TEMPLATE,
+    ),
+    (
+        "STATE_HEALTH",
+        "DIRECT_INSPECT_TEMPLATE_STATE_HEALTH_FAILED",
+        STATE_HEALTH_TEMPLATE,
+    ),
+)
+INSPECT_FIELD_GROUP_NAMES = frozenset(
+    {"NONE", *(group for group, _, _ in INSPECT_FIELD_GROUPS)}
+)
+INSPECT_PARSE_CLASSES = frozenset(
+    {"VALID_OBJECT", "INVALID_UTF8", "JSON_SYNTAX", "DUPLICATE_KEY", "TOPLEVEL_TYPE"}
+)
+INSPECT_UTF8_STATUSES = frozenset({"VALID", "INVALID"})
+INSPECT_EXIT_CLASSES = frozenset({"ZERO", "NONZERO", "SIGNAL"})
+INSPECT_TERMINAL_CLASSES = frozenset(
+    {
+        "DIRECT_INSPECT_OBJECT_UNAVAILABLE",
+        "DIRECT_INSPECT_TEMPLATE_IDENTITY_FAILED",
+        "DIRECT_INSPECT_TEMPLATE_HOSTCONFIG_FAILED",
+        "DIRECT_INSPECT_TEMPLATE_PUBLICATION_FAILED",
+        "DIRECT_INSPECT_TEMPLATE_NETWORK_FAILED",
+        "DIRECT_INSPECT_TEMPLATE_STATE_HEALTH_FAILED",
+        "DIRECT_INSPECT_INVALID_UTF8",
+        "DIRECT_INSPECT_JSON_REJECTED",
+        "DIRECT_INSPECT_DUPLICATE_KEY_REJECTED",
+        "DIRECT_INSPECT_TOPLEVEL_REJECTED",
+        "DIRECT_INSPECT_COMPOSITION_FAILED",
+    }
+)
+
+
 def identity_digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -484,19 +642,255 @@ def validate_inspection(
     return sorted(set(violations))
 
 
-def safe_inspect(container_id: str) -> dict[str, Any] | None:
-    completed = subprocess.run(
-        ["docker", "inspect", "--format", INSPECT_TEMPLATE, container_id],
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return None
+def _stream_bytes(value: bytes | str | None) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="strict")
+    return b""
+
+
+def _stream_summary(prefix: str, value: bytes | str | None) -> dict[str, Any]:
+    raw = _stream_bytes(value)
+    return {
+        f"{prefix}_byte_count": len(raw),
+        f"{prefix}_line_count": len(raw.splitlines()),
+        f"{prefix}_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def parse_inspect_output(
+    raw: bytes | str | None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    encoded = _stream_bytes(raw)
     try:
-        payload = strict_json_object(completed.stdout)
-    except (DuplicateJsonKeyError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    return payload
+        decoded = encoded.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return "INVALID", "INVALID_UTF8", None
+    try:
+        value = json.loads(decoded, object_pairs_hook=_strict_object)
+    except DuplicateJsonKeyError:
+        return "VALID", "DUPLICATE_KEY", None
+    except (json.JSONDecodeError, TypeError):
+        return "VALID", "JSON_SYNTAX", None
+    if not isinstance(value, dict):
+        return "VALID", "TOPLEVEL_TYPE", None
+    return "VALID", "VALID_OBJECT", value
+
+
+def _run_inspect(container_id: str, template: str) -> subprocess.CompletedProcess[bytes]:
+    command = ["docker", "inspect", "--format", template, container_id]
+    try:
+        return subprocess.run(command, capture_output=True, check=False)
+    except OSError:
+        return subprocess.CompletedProcess(command, 127, stdout=b"", stderr=b"")
+
+
+def _exit_class(returncode: int) -> str:
+    if returncode == 0:
+        return "ZERO"
+    return "SIGNAL" if returncode < 0 else "NONZERO"
+
+
+def _diagnostic_envelope(
+    completed: subprocess.CompletedProcess[bytes],
+    *,
+    attempt_index: int,
+    terminal_class: str,
+    utf8_status: str,
+    parse_class: str,
+    first_failed_group: str,
+    successful_group_count: int,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "terminal_class": terminal_class,
+        "attempt_index": attempt_index,
+        "command_exit_class": _exit_class(completed.returncode),
+        "command_exit_code": completed.returncode,
+        **_stream_summary("stdout", completed.stdout),
+        **_stream_summary("stderr", completed.stderr),
+        "utf8_status": utf8_status,
+        "parse_class": parse_class,
+        "first_failed_group": first_failed_group,
+        "successful_group_count": successful_group_count,
+    }
+    canonical = json.dumps(result, sort_keys=True, separators=(",", ":"))
+    result["digest"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return result
+
+
+def _group_succeeds(container_id: str, template: str) -> tuple[bool, subprocess.CompletedProcess[bytes]]:
+    completed = _run_inspect(container_id, template)
+    _, parse_class, _ = parse_inspect_output(completed.stdout)
+    return completed.returncode == 0 and parse_class == "VALID_OBJECT", completed
+
+
+def safe_inspect(
+    container_id: str, attempt_index: int = 1
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    completed = _run_inspect(container_id, INSPECT_TEMPLATE)
+    utf8_status, parse_class, payload = parse_inspect_output(completed.stdout)
+    if completed.returncode == 0 and payload is not None:
+        return payload, None
+
+    parse_terminal = {
+        "INVALID_UTF8": "DIRECT_INSPECT_INVALID_UTF8",
+        "JSON_SYNTAX": "DIRECT_INSPECT_JSON_REJECTED",
+        "DUPLICATE_KEY": "DIRECT_INSPECT_DUPLICATE_KEY_REJECTED",
+        "TOPLEVEL_TYPE": "DIRECT_INSPECT_TOPLEVEL_REJECTED",
+    }
+    if completed.returncode == 0:
+        terminal_class = parse_terminal[parse_class]
+        return None, _diagnostic_envelope(
+            completed,
+            attempt_index=attempt_index,
+            terminal_class=terminal_class,
+            utf8_status=utf8_status,
+            parse_class=parse_class,
+            first_failed_group="NONE",
+            successful_group_count=0,
+        )
+
+    available, _ = _group_succeeds(container_id, OBJECT_AVAILABILITY_TEMPLATE)
+    if not available:
+        return None, _diagnostic_envelope(
+            completed,
+            attempt_index=attempt_index,
+            terminal_class="DIRECT_INSPECT_OBJECT_UNAVAILABLE",
+            utf8_status=utf8_status,
+            parse_class=parse_class,
+            first_failed_group="IDENTITY_CONFIG",
+            successful_group_count=0,
+        )
+
+    successful_group_count = 0
+    for group, terminal_class, template in INSPECT_FIELD_GROUPS:
+        succeeded, _ = _group_succeeds(container_id, template)
+        if not succeeded:
+            return None, _diagnostic_envelope(
+                completed,
+                attempt_index=attempt_index,
+                terminal_class=terminal_class,
+                utf8_status=utf8_status,
+                parse_class=parse_class,
+                first_failed_group=group,
+                successful_group_count=successful_group_count,
+            )
+        successful_group_count += 1
+
+    return None, _diagnostic_envelope(
+        completed,
+        attempt_index=attempt_index,
+        terminal_class="DIRECT_INSPECT_COMPOSITION_FAILED",
+        utf8_status=utf8_status,
+        parse_class=parse_class,
+        first_failed_group="NONE",
+        successful_group_count=successful_group_count,
+    )
+
+
+def inspection_state_lines(result: dict[str, Any]) -> list[str]:
+    allowed = {
+        "terminal_class": "str",
+        "attempt_index": "int",
+        "command_exit_class": "str",
+        "command_exit_code": "int",
+        "stdout_byte_count": "int",
+        "stdout_line_count": "int",
+        "stdout_sha256": "str",
+        "stderr_byte_count": "int",
+        "stderr_line_count": "int",
+        "stderr_sha256": "str",
+        "utf8_status": "str",
+        "parse_class": "str",
+        "first_failed_group": "str",
+        "successful_group_count": "int",
+        "digest": "str",
+    }
+    if set(result) != set(allowed):
+        raise ValueError("inspection diagnostic contains an invalid schema")
+    if result["terminal_class"] not in INSPECT_TERMINAL_CLASSES:
+        raise ValueError("inspection diagnostic contains an invalid terminal class")
+    if result["command_exit_class"] not in INSPECT_EXIT_CLASSES:
+        raise ValueError("inspection diagnostic contains an invalid exit class")
+    if result["utf8_status"] not in INSPECT_UTF8_STATUSES:
+        raise ValueError("inspection diagnostic contains an invalid UTF-8 status")
+    if result["parse_class"] not in INSPECT_PARSE_CLASSES:
+        raise ValueError("inspection diagnostic contains an invalid parse class")
+    if result["first_failed_group"] not in INSPECT_FIELD_GROUP_NAMES:
+        raise ValueError("inspection diagnostic contains an invalid field group")
+    for key, kind in allowed.items():
+        value = result[key]
+        if kind == "int" and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("inspection diagnostic contains an invalid integer")
+        if kind == "str" and not isinstance(value, str):
+            raise ValueError("inspection diagnostic contains an invalid string")
+    if result["attempt_index"] < 1 or result["successful_group_count"] not in range(6):
+        raise ValueError("inspection diagnostic contains an invalid count")
+    if result["command_exit_class"] != _exit_class(result["command_exit_code"]):
+        raise ValueError("inspection diagnostic exit fields disagree")
+    if (result["utf8_status"] == "INVALID") != (
+        result["parse_class"] == "INVALID_UTF8"
+    ):
+        raise ValueError("inspection diagnostic parse fields disagree")
+    group_terminals = {
+        terminal: (group, index)
+        for index, (group, terminal, _) in enumerate(INSPECT_FIELD_GROUPS)
+    }
+    parse_terminals = {
+        "DIRECT_INSPECT_INVALID_UTF8": "INVALID_UTF8",
+        "DIRECT_INSPECT_JSON_REJECTED": "JSON_SYNTAX",
+        "DIRECT_INSPECT_DUPLICATE_KEY_REJECTED": "DUPLICATE_KEY",
+        "DIRECT_INSPECT_TOPLEVEL_REJECTED": "TOPLEVEL_TYPE",
+    }
+    terminal_class = result["terminal_class"]
+    if terminal_class in parse_terminals:
+        if (
+            result["command_exit_class"] != "ZERO"
+            or result["parse_class"] != parse_terminals[terminal_class]
+            or result["first_failed_group"] != "NONE"
+            or result["successful_group_count"] != 0
+        ):
+            raise ValueError("inspection diagnostic parse terminal fields disagree")
+    elif terminal_class == "DIRECT_INSPECT_OBJECT_UNAVAILABLE":
+        if (
+            result["command_exit_class"] == "ZERO"
+            or result["first_failed_group"] != "IDENTITY_CONFIG"
+            or result["successful_group_count"] != 0
+        ):
+            raise ValueError("inspection diagnostic object terminal fields disagree")
+    elif terminal_class == "DIRECT_INSPECT_COMPOSITION_FAILED":
+        if (
+            result["command_exit_class"] == "ZERO"
+            or result["first_failed_group"] != "NONE"
+            or result["successful_group_count"] != len(INSPECT_FIELD_GROUPS)
+        ):
+            raise ValueError("inspection diagnostic composition fields disagree")
+    else:
+        expected_group, expected_count = group_terminals[terminal_class]
+        if (
+            result["command_exit_class"] == "ZERO"
+            or result["first_failed_group"] != expected_group
+            or result["successful_group_count"] != expected_count
+        ):
+            raise ValueError("inspection diagnostic group terminal fields disagree")
+    for key in ("stdout_byte_count", "stdout_line_count", "stderr_byte_count", "stderr_line_count"):
+        if result[key] < 0:
+            raise ValueError("inspection diagnostic contains an invalid stream count")
+    for key in ("stdout_sha256", "stderr_sha256", "digest"):
+        if len(result[key]) != 64 or any(character not in "0123456789abcdef" for character in result[key]):
+            raise ValueError("inspection diagnostic contains an invalid digest")
+    canonical = json.dumps(
+        {key: value for key, value in result.items() if key != "digest"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if result["digest"] != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+        raise ValueError("inspection diagnostic digest mismatch")
+    return [
+        state_line(f"diagnostic.inspection.{key}", allowed[key], result[key])
+        for key in allowed
+    ]
 
 
 def global_ip_addresses() -> list[str]:
@@ -680,11 +1074,17 @@ def main() -> int:
     healthy_since: float | None = None
     final_data: dict[str, Any] | None = None
     failure_code = "DIRECT_HEALTH_TIMEOUT"
+    attempt_index = 0
 
     while time.monotonic() < deadline:
-        observed = safe_inspect(args.container_id)
+        attempt_index += 1
+        observed, inspection_diagnostic = safe_inspect(args.container_id, attempt_index)
         if observed is None:
-            failure_code = "DIRECT_INSPECTION_FAILED"
+            if inspection_diagnostic is None:
+                raise RuntimeError("missing closed inspection diagnostic")
+            for line in inspection_state_lines(inspection_diagnostic):
+                print(line)
+            failure_code = str(inspection_diagnostic["terminal_class"])
             break
         if observed.get("schema_version") != SCHEMA_VERSION:
             failure_code = "DIRECT_INSPECTION_SCHEMA_INVALID"
