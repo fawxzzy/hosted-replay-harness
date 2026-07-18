@@ -6,39 +6,40 @@
 
 No application repository, application migration, source data, Auth row, provider API, Supabase remote command, production environment, secret, or inherited workflow environment is in scope.
 
-## Current clean-environment loader diagnostic
+## Current stateful DB-start policy
 
-The manual workflow's fixed default mode is `loadconfig-services-v1`. It invokes exactly `supabase --workdir <packet-project> --network-id <frozen-name> --output json services` once from the pinned v2.109.1 binary. It never invokes `status`, `start`, `stop`, `db start`, `db reset`, login/link, remote flags, migrations, SQL, GoTrue, an application path, image acquisition, or Docker lifecycle mutation. The workflow-selected `run` path terminates before the preserved inactive image/network/direct-diagnostic code.
+The manual workflow has one fixed `run` path. It invokes the pinned v2.109.1 CLI exactly once as `supabase --workdir <packet-project> --network-id <frozen-name> --yes db start`. The public config remains byte-frozen at SHA-256 `1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6`; database migrations and seed are disabled, Auth is enabled only for its one-shot migration, and every other persistent service is disabled.
 
-The immutable source contract is finite:
+The earlier loader diagnostic proved `Config.Load` succeeds under a fresh child environment. Database start therefore uses the same `env -i` boundary: fixed system `PATH`, packet-local `HOME`, XDG roots and `TMPDIR`, `DO_NOT_TRACK=1`, and child-only `DOCKER_HOST`. It inherits no `SUPABASE_*`, CI, runner home/config, linked state, credential, provider, or application value. The local CLI upgrade cache is pre-seeded with the pinned version.
 
-- `apps/cli-go/cmd/root.go` runs root `PersistentPreRunE`, including the packet workdir and global flag processing.
-- `apps/cli-go/cmd/services.go` dispatches only to `internal/services.Run`.
-- `internal/services.Run` attempts local project-ref loading, calls `flags.LoadConfig`, then renders the ten configured service-image identities. A provider call is reachable only when linked state and a valid access token are both present.
-- The packet proves project-ref and access-token files absent, uses a fresh HOME and XDG roots, and rebuilds the child environment with `env -i`; no inherited `SUPABASE_*`, credential-store session, or linked state crosses the boundary.
-- `DO_NOT_TRACK=1` disables telemetry delivery. A fresh packet-local `supabase/.temp/cli-latest` is pre-seeded with the pinned version so the post-command upgrade check reads locally instead of contacting GitHub.
+The Docker observer remains read-only when no policy descriptor is supplied. DB start is admitted only by a private one-shot `fawxzzy.hosted-replay-harness.db-start-policy.v1` descriptor. The harness creates it with mode `0600`, passes it to the observer on an inherited descriptor, unlinks the path, and closes the harness copy before starting the CLI child. The descriptor contains only frozen public identities plus a fresh nonce. It never reaches the CLI child, and observer generation other than zero terminates `POLICY_LEDGER_LOST` rather than resuming state.
 
-The public committed config is copied into fresh packet scratch and must match SHA-256 `1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6`, be readable and LF-only, and coexist with zero `.env*`, migration, seed, project-ref, or access-token files. The CLI child receives only fixed `PATH`, packet-local `HOME`, all four XDG roots, `TMPDIR`, `DO_NOT_TRACK=1`, and child-only `DOCKER_HOST`. The observer permits `GET` and `HEAD`, but this command must produce zero connections and requests.
+The admitted endpoint denominator is the source-proven 47-row matrix with SHA-256 `9669ebd4ae75cfdc3950c9db8b2786270023ce0e26dde993806b3f7b6b2c5492`: 18 child lifecycle rows, 17 prohibited rows, and 12 outer-harness rows, with zero endpoint unknowns. Optional `/vX.Y` prefixes must exactly equal the daemon version negotiated by `/_ping`.
 
-Stdout and stderr are created separately under umask `077`, reduced to exit code, byte/line counts, and SHA-256, then deleted. Success additionally requires a closed ten-item JSON schema with only `name`, `local`, and empty `remote` strings. Scratch files are reduced to `PROJECT_CONFIG`, `CLI_UPDATE_CACHE`, and optional `TELEMETRY_STATE`, with only counts and a canonical digest retained. Any other file is `ROOT_INIT_STATE_ESCAPE`.
+The child sequence is single-use and ordered:
 
-## Ordered loader gates
+1. `HEAD /_ping`, with the source-conditional `GET` fallback only.
+2. Exact database-container and volume inspection returning 404.
+3. Exact cached PostgreSQL image inspection returning the frozen image ID.
+4. An exact-name network reuse probe returning 409; a 201 network creation is a policy violation.
+5. Exact labelled database-volume create, database-container create and start.
+6. One through 121 exact identity/network/port health inspections. Only the failure branch may read non-following database logs.
+7. Exact cached GoTrue image inspection and exact-name network reuse probe returning 409.
+8. Exact one-shot GoTrue create and start, one following log stream, exit-code-zero inspect, and exact force-plus-volume removal.
+
+Every returned container ID is recorded only in the observer's private transient ledger, hashed for the receipt, and consumed once. The policy rejects order changes, replay, ID substitution, name/label/image/digest/network/port drift, unknown fields, image pull, actual network creation, broad list or cleanup, privilege, host/PID/IPC mode, Docker socket, devices, capabilities, security options, extra binds/ports/networks, exec, attach, archive, wait, kill, build, prune, malformed framing, oversized content, concurrency, and restart recovery. The database may have only its exact volume, exact packet network, and requested `5432/tcp -> 56422`; observed publication must be exactly `127.0.0.1:56422`. GoTrue may run only `gotrue migrate`, with no bind or publication.
+
+## Ordered containment gates
 
 1. Verify Ubuntu 24.04, x86_64, Docker client/server `>=28`, at least 8 GiB actual RAM, and more than 10 GiB free disk.
-2. Download the one pinned CLI asset, verify its SHA-256, extract it, and verify the frozen binary SHA-256. The CLI `--version` shortcut is not executed because the pinned source makes it perform an external upgrade lookup.
-3. Require zero packet-labelled/project-labelled containers, volumes, and networks; no listener on 56422; and frozen count/digest fingerprints for native listeners 5432 and 5433.
-4. Copy and verify the exact public config, prove all linked/provider/application prerequisites absent, and pre-seed only the local upgrade-cache class.
-5. Start the read-only Docker API observer, then invoke exactly one `services` child under the closed clean environment.
-6. Stop the observer deterministically. Require zero connections, requests, responses, write attempts, forwarding errors, and parser errors.
-7. Classify and delete both raw streams, audit the closed scratch classes, and delete all loader scratch.
-8. Re-prove zero packet objects, no 56422 listener, and unchanged native listener fingerprints.
-9. The explicit `if: always()` cleanup step proves zero correlated containers, volumes, networks, listeners, bytecode, and runtime scratch before the sanitized artifact is retained.
-
-## Terminal split
-
-The only loader classifications are `CONFIG_LOAD_PASS_UNDER_CLEAN_ENV`, `CONFIG_ENV_TRAVERSAL_FAILED`, `CONFIG_FILE_READ_FAILED`, `CONFIG_FILE_MERGE_FAILED`, `CONFIG_DECODE_FAILED`, `CONFIG_VALIDATION_PROJECT_FAILED`, `CONFIG_VALIDATION_DB_FAILED`, `CONFIG_VALIDATION_AUTH_FAILED`, `CONFIG_KEY_GENERATION_FAILED`, and `CONFIG_UNKNOWN_SANITIZED`. Any nonempty remote service value, Docker request/write/error, linked/provider prerequisite, secret-shaped output, state escape, object/listener drift, observer failure, or cleanup ambiguity terminates `UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY` or `CONFIG_UNKNOWN_SANITIZED` without retaining the raw value.
-
-These are diagnostic classifications only. None admits containment, database startup, GoTrue migration, or application replay.
+2. Download and verify the pinned CLI asset and binary. Pull only the frozen `linux/amd64` PostgreSQL and GoTrue digests, verify RepoDigests, platforms and image IDs, then retag only to the CLI-expected aliases.
+3. Create one labelled fixed-subnet bridge with `Internal=true`, IPv6 disabled, loopback host binding and isolated gateway mode; freeze its exact engine ID while passing only its unique name through `--network-id`.
+4. Prove no default route and failure of external DNS, literal `1.1.1.1`, metadata, gateway, and host reachability on that exact network.
+5. Require zero packet database containers/volumes and no 56422 listener, freeze native 5432/5433 count/digests, start the watcher and policy observer, then invoke DB start once under the clean environment.
+6. Stop both observers deterministically, classify and delete raw CLI output, delete child scratch, and require a complete policy ledger with zero violations, unknown phases, image pulls, broad lists, cleanup calls, parser errors, or forwarding errors.
+7. Correlate live observations with bounded daemon history; require exactly one database create/start and one GoTrue create/start on the frozen network and pinned images.
+8. Require the database healthy at the sole loopback publication, GoTrue migration success, and `pg_cron` plus `pg_net` availability. Bounded DNS/literal-IP `pg_net` requests and a one-shot `pg_cron` external canary must have zero external success.
+9. Exact label/ID cleanup must leave zero packet containers, volumes, networks and 56422 listeners, with native 5432/5433 fingerprints unchanged. The explicit `if: always()` cleanup step repeats the zero-residue proof before the sanitized artifact is retained.
 
 ## Fail-closed result
 
@@ -46,13 +47,13 @@ Every failure maps to a stable uppercase code, and cleanup evidence cannot overw
 
 The sanitizer's output schema is closed: only fixed dotted keys, scalar types, uppercase enums, booleans, nonnegative integers, and a 64-character lowercase SHA-256 are admitted. Credential-bearing URLs, JWTs, bearer tokens, password/secret/token/key assignments, connection strings, private keys, environment dumps, SQL, Auth rows, PII, and arbitrary text can never be values in the sanitized state. Secret-shaped input is counted only as a boolean and line count; its content is never retained.
 
-For the Docker API boundary diagnostic, only the pinned Supabase CLI child receives a packet-local `DOCKER_HOST` that targets a permissions-restricted Unix-socket observer. Every harness Docker command continues to use the real daemon socket directly. The observer relays allowed read-only bytes unchanged and parses only bounded HTTP framing as a side channel. API-version prefixes are discarded and request targets are immediately reduced to fixed phase enums. Query values, headers, bodies, identifiers, names, labels, mounts, commands, socket paths, and raw traffic are never retained or emitted. A prohibited method is reduced to its method class and phase, counted, and terminated before upstream forwarding.
+Only the pinned Supabase CLI child receives the packet-local `DOCKER_HOST`; every harness Docker command continues to use the real daemon socket. The observer relays only policy-admitted bytes unchanged and parses bounded HTTP framing as a side channel. API-version prefixes are validated then normalized, and request targets are immediately reduced to fixed phase enums. Query values, headers, bodies, identifiers, names, labels, mounts, commands, socket paths, and raw traffic are never retained or emitted. In default mode every non-read method is stopped before upstream forwarding. In DB-start mode, a write is forwarded only after exact body, identity, order, and ledger predicates pass; any unknown or malformed request is stopped and reduced to one closed policy code.
 
 The observer receipt contains only its fixed schema and classification, connection/request/response/error counts, first/last/error phase enums, allowlisted method/status counters, and a canonical SHA-256 over those sanitized fields. Multiple requests on reused connections, fixed-length and chunked framing, partial reads, and concurrent connections must remain byte-transparent. Any parser, upstream, forwarding, response-completeness, permission, shutdown, or schema failure blocks the packet. The observer socket and readiness marker are removed on shutdown; its sanitized state is merged into the receipt and packet scratch is deleted before closeout.
 
 Listener diagnostics map unavailable tooling, a nonzero query, normalization failure, count failure, hash failure, and sanitized receipt failure to `LISTENER_COMMAND_UNAVAILABLE`, `LISTENER_QUERY_NONZERO`, `LISTENER_NORMALIZATION_FAILED`, `LISTENER_COUNT_FAILED`, `LISTENER_HASH_FAILED`, and `LISTENER_RECEIPT_WRITE_FAILED`. An otherwise preterminal exit between `PRE_CLI_BOUNDARY_BEGIN` and `PRE_CLI_PREFLIGHT_COMPLETE` maps to `LISTENER_UNEXPECTED_INTERRUPTION` with only the last stable phase. Raw listener output and normalized tuples remain transient and are deleted with scratch; addresses, process details, and tuples never enter logs, state, receipts, or artifacts. Local initialization is split defensively without attributing the prior interruption to initialization behavior.
 
-For this root-init packet, any Docker API request or correlated object/listener delta is terminal; no create/start identity is accepted. Observer shutdown is bounded to five seconds, and each exact container, volume, and network removal remains independently bounded to 20 seconds. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output and state remain transient and are never uploaded. A failed gate does not cause image acquisition, a network mutation, a remote Supabase path, or an application replay.
+Observer shutdown is bounded to five seconds, and each exact container, volume, and network removal remains independently bounded to 20 seconds. An explicit `if: always()` cleanup-only step reuses the exact packet filters, verifies zero resources and listeners, and merges only sanitized cleanup counts into the receipt before upload. Raw command output, descriptor material, dynamic credentials, connection values, SQL bodies, and scratch state remain transient and are never uploaded. Any failed policy or containment gate terminates without a retry, weakened network, remote Supabase path, or application replay.
 
 ## Network-name compatibility contract
 

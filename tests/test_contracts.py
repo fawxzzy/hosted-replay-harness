@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import re
 import shlex
 import shutil
@@ -149,13 +150,14 @@ class RunnerStaticContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
 
-    def test_legacy_direct_path_keeps_exact_pulls_but_loader_split_acquires_no_image(self) -> None:
+    def test_cli_containment_acquires_only_the_two_exact_images(self) -> None:
         pulls = re.findall(r"(?m)^\s*docker pull --platform linux/amd64 ", self.runner)
         self.assertEqual(len(pulls), 2)
         self.assertNotRegex(self.runner, r"(?m)^\s*docker (build|compose pull|image pull)\b")
-        root_init = self.runner.index("run_loadconfig_services_split\n  exit 1")
         first_pull = self.runner.index('docker pull --platform linux/amd64 "$POSTGRES_PULL"')
-        self.assertLess(root_init, first_pull)
+        cli_start = self.runner.index('    db start\n) >"$RAW/supabase-db-start.log"')
+        self.assertLess(first_pull, cli_start)
+        self.assertIn('record images.pull_count int 2', self.runner)
 
     def test_direct_mode_isolated_from_cli_and_uses_one_exact_target(self) -> None:
         self.assertIn('run|direct-port|cleanup-only', self.runner)
@@ -189,7 +191,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_contract_tests_do_not_leave_bytecode(self) -> None:
         self.assertIn('python3 -B -m unittest discover', self.runner)
 
-    def test_legacy_network_contract_is_preserved_but_not_reached_by_loader_split(self) -> None:
+    def test_exact_network_contract_precedes_the_contained_db_start(self) -> None:
         for fragment in (
             "--internal",
             "--ipv6=false",
@@ -208,8 +210,8 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn("record network.pre_cleanup_exact_id bool true", self.runner)
         self.assertIn("SECOND_PACKET_NETWORK_DETECTED", self.runner)
         self.assertLess(
-            self.runner.index('run_loadconfig_services_split\n  exit 1'),
-            self.runner.index('docker pull --platform linux/amd64 "$POSTGRES_PULL"'),
+            self.runner.index("assert_frozen_network pre_cli_start empty"),
+            self.runner.index('    db start\n) >"$RAW/supabase-db-start.log"'),
         )
 
     def test_root_init_split_requires_zero_packet_objects_and_listener_drift(self) -> None:
@@ -298,12 +300,19 @@ class RunnerStaticContractTests(unittest.TestCase):
             '[[ "$(stat -c \'%a\' "$DOCKER_API_READY")" == "600" ]]',
             self.runner,
         )
+        active_start = self.runner.index('exec 3<"$DOCKER_API_POLICY_FILE"')
+        active_cli = self.runner.index('    db start\n) >"$RAW/supabase-db-start.log"')
+        active_stop = self.runner.index("stop_docker_api_observer", active_cli)
+        self.assertLess(active_start, active_cli)
+        self.assertLess(active_cli, active_stop)
+        self.assertNotIn("export DOCKER_HOST", self.runner[active_start:active_stop])
 
     def test_docker_api_observer_state_is_sanitized_and_transient(self) -> None:
         self.assertIn("DOCKER_API_OBSERVER_STATE_MISSING", self.runner)
         self.assertIn("DOCKER_API_OBSERVER_FAILED", self.runner)
-        self.assertIn("DOCKER_API_RESPONSE_INCOMPLETE", self.runner)
-        self.assertIn("DOCKER_API_WRITE_ATTEMPT_OBSERVED", self.runner)
+        self.assertIn("DB_START_POLICY_COMPLETE", self.runner)
+        self.assertIn("DB_START_POLICY_INCOMPLETE", self.runner)
+        self.assertIn("DB_START_POLICY_VIOLATION", self.runner)
         self.assertIn("OBSERVER_FORWARDING_FAILED", self.runner)
         self.assertNotIn('cat "$RAW/docker-api-observer.log"', self.runner)
         self.assertIn('cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"', self.runner)
@@ -312,7 +321,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
         freeze = "freeze_precli_objects_and_listeners"
         boundary = 'EVENT_SINCE="$(date -u +%s)"'
-        cli_start = 'services\n  ) >"$RAW/supabase-services.stdout"'
+        cli_start = '    db start\n) >"$RAW/supabase-db-start.log"'
         self.assertIn(freeze, self.runner)
         self.assertIn('"$LISTENER_QUERY_BIN" -H -ltn "sport = :${port}"', self.runner)
         self.assertIn("pre_cli.packet_db_container_count", self.runner)
@@ -397,53 +406,54 @@ class RunnerStaticContractTests(unittest.TestCase):
         ):
             self.assertIn(code, self.runner)
 
-    def test_exact_loader_source_contract_and_binary_hash(self) -> None:
+    def test_exact_db_start_source_contract_and_binary_hash(self) -> None:
         self.assertIn('CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"', self.runner)
         self.assertIn(
             'CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"',
             self.runner,
         )
         self.assertIn('[[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]]', self.runner)
-        self.assertIn("record source_contract.command str supabase-services", self.runner)
+        self.assertIn("record source_contract.command str supabase-db-start", self.runner)
         self.assertIn("record source_contract.root_persistent_prerun bool true", self.runner)
         self.assertIn("record source_contract.load_config bool true", self.runner)
-        self.assertIn("record source_contract.docker_access_expected bool false", self.runner)
+        self.assertIn("record source_contract.docker_access_expected bool true", self.runner)
         self.assertIn("record source_contract.provider_access_enabled bool false", self.runner)
         self.assertEqual(
-            self.runner.count('services\n  ) >"$RAW/supabase-services.stdout"'), 1
+            self.runner.count('    db start\n) >"$RAW/supabase-db-start.log"'), 1
         )
 
-    def test_loader_execution_path_is_exact_and_prohibits_mutating_or_remote_commands(self) -> None:
-        start = self.runner.index("run_loadconfig_services_split() {")
-        end = self.runner.index("\n}\n\nif [[ \"$MODE\" == \"cleanup-only\" ]]", start)
-        root_init = self.runner[start:end]
+    def test_db_start_execution_path_is_exact_clean_and_prohibits_remote_commands(self) -> None:
+        start = self.runner.index('exec 3<"$DOCKER_API_POLICY_FILE"')
+        end = self.runner.index('assert_frozen_network post_cli active', start)
+        db_start = self.runner[start:end]
         exact = (
-            '"$RUNTIME/bin/supabase" \\\n'
-            '      --workdir "$ROOT_INIT_WORKDIR" \\\n'
-            '      --network-id "$NETWORK_NAME" \\\n'
-            '      --output json \\\n'
-            '      services'
+            'timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \\\n'
+            '    --workdir "$CLI_PROJECT_DIR" \\\n'
+            '    --network-id "$NETWORK_NAME" \\\n'
+            '    --yes \\\n'
+            '    db start'
         )
-        self.assertIn(exact, root_init)
-        self.assertEqual(root_init.count("\n      services\n"), 1)
+        self.assertIn(exact, db_start)
+        self.assertEqual(db_start.count("\n    db start\n"), 1)
+        self.assertIn("env -i", db_start)
+        self.assertIn('DOCKER_HOST="unix://$DOCKER_API_SOCKET"', db_start)
+        for inherited in ("SUPABASE_[A-Z0-9_]*", "CI", "GITHUB_[A-Z0-9_]*", "RUNNER_[A-Z0-9_]*"):
+            self.assertNotRegex(db_start, rf"(?m)^\s+{inherited}=")
         prohibited = (
             r"\bstatus\s+--ignore-health-check\b",
             r"\b(login|link|pull|push|dump)\b",
-            r"\bdb\s+(start|reset)\b",
+            r"\bdb\s+reset\b",
             r"--linked\b",
             r"--db-url\b",
-            r"docker\s+(pull|run|create|start|stop|rm|tag)\b",
-            r"docker\s+(system|container|volume|network|image)\s+prune",
         )
         for pattern in prohibited:
-            self.assertNotRegex(root_init, pattern)
-        workflow_entry = self.runner[
-            self.runner.index('if [[ "$MODE" == "run" ]]') : self.runner.index(
-                'docker pull --platform linux/amd64 "$POSTGRES_PULL"'
-            )
-        ]
-        self.assertIn("run_loadconfig_services_split", workflow_entry)
-        self.assertIn("exit 1", workflow_entry)
+            self.assertNotRegex(db_start, pattern)
+        self.assertIn('--policy-fd 3', db_start)
+        self.assertIn('"nonce": os.urandom(32).hex()', self.runner)
+        self.assertIn('exec 3<&-', db_start)
+        self.assertIn('rm -f -- "$DOCKER_API_POLICY_FILE"', db_start)
+        self.assertLess(db_start.index('rm -f -- "$DOCKER_API_POLICY_FILE"'), db_start.index('    db start'))
+        self.assertLess(db_start.index('exec 3<&-'), db_start.index('    db start'))
 
     def test_loader_preflight_proves_config_and_provider_state_absence(self) -> None:
         self.assertIn(
@@ -1227,6 +1237,344 @@ class DockerApiBoundaryTests(unittest.TestCase):
             receipt.sanitized()["classification"],
             "DOCKER_API_RESPONSE_INCOMPLETE",
         )
+
+
+class DbStartPolicyTests(unittest.TestCase):
+    DB_ID = "c" * 64
+    GOTRUE_ID = "d" * 64
+
+    def policy_data(self, **updates: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema": docker_api_boundary.POLICY_SCHEMA,
+            "matrix_sha256": docker_api_boundary.POLICY_MATRIX_SHA256,
+            "generation": 0,
+            "nonce": "1" * 64,
+            "api_version": "1.48",
+            "project": "fp-hosted-replay-ro-001",
+            "network_name": "fp-hosted-replay-ro-001-net",
+            "network_id": "a" * 64,
+            "db_name": "supabase_db_fp-hosted-replay-ro-001",
+            "db_volume": "supabase_db_fp-hosted-replay-ro-001",
+            "db_port": "56422",
+            "postgres_image_ref": "public.ecr.aws/supabase/postgres:17.6.1.143",
+            "postgres_image_id": "sha256:" + "b" * 64,
+            "postgres_digest": "sha256:" + "2" * 64,
+            "gotrue_image_ref": "public.ecr.aws/supabase/gotrue:v2.192.0",
+            "gotrue_image_id": "sha256:" + "e" * 64,
+            "gotrue_digest": "sha256:" + "3" * 64,
+        }
+        value.update(updates)
+        return value
+
+    @staticmethod
+    def labels() -> dict[str, str]:
+        return {
+            "com.supabase.cli.project": "fp-hosted-replay-ro-001",
+            "com.docker.compose.project": "fp-hosted-replay-ro-001",
+        }
+
+    def db_create_body(self) -> dict[str, object]:
+        return {
+            "Config": {
+                "Image": "public.ecr.aws/supabase/postgres:17.6.1.143",
+                "Labels": self.labels(),
+                "Env": [
+                    "POSTGRES_PASSWORD=private-password",
+                    "POSTGRES_HOST=/var/run/postgresql",
+                    "JWT_SECRET=private-jwt",
+                    "JWT_EXP=3600",
+                ],
+                "Healthcheck": {
+                    "Test": ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1", "-p", "5432"],
+                    "Interval": 10_000_000_000,
+                    "Timeout": 2_000_000_000,
+                    "Retries": 3,
+                },
+                "Entrypoint": ["sh", "-c", "schema material private-root-key\ndocker-entrypoint.sh postgres -D /etc/postgresql"],
+            },
+            "HostConfig": {
+                "Binds": ["supabase_db_fp-hosted-replay-ro-001:/var/lib/postgresql/data"],
+                "NetworkMode": "fp-hosted-replay-ro-001-net",
+                "PortBindings": {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]},
+                "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+                "ExtraHosts": ["host.docker.internal:host-gateway"],
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "fp-hosted-replay-ro-001-net": {
+                        "Aliases": ["db", "db.supabase.internal"]
+                    }
+                }
+            },
+        }
+
+    def gotrue_create_body(self) -> dict[str, object]:
+        return {
+            "Config": {
+                "Image": "public.ecr.aws/supabase/gotrue:v2.192.0",
+                "Labels": self.labels(),
+                "Env": [
+                    "API_EXTERNAL_URL=http://127.0.0.1:54321",
+                    "GOTRUE_LOG_LEVEL=error",
+                    "GOTRUE_DB_DRIVER=postgres",
+                    "GOTRUE_DB_DATABASE_URL=postgresql://supabase_auth_admin:private-password@supabase_db_fp-hosted-replay-ro-001:5432/postgres",
+                    "GOTRUE_SITE_URL=http://localhost:3000",
+                    "GOTRUE_JWT_SECRET=private-jwt",
+                ],
+                "Cmd": ["gotrue", "migrate"],
+            },
+            "HostConfig": {
+                "NetworkMode": "fp-hosted-replay-ro-001-net",
+                "ExtraHosts": ["host.docker.internal:host-gateway"],
+            },
+            "NetworkingConfig": {},
+        }
+
+    def inspect_body(self, database: bool, health: str = "healthy") -> dict[str, object]:
+        value: dict[str, object] = {
+            "Id": self.DB_ID if database else self.GOTRUE_ID,
+            "Image": "sha256:" + ("b" if database else "e") * 64,
+            "NetworkSettings": {
+                "Networks": {
+                    "fp-hosted-replay-ro-001-net": {"NetworkID": "a" * 64}
+                },
+                "Ports": (
+                    {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}]}
+                    if database
+                    else {}
+                ),
+            },
+            "State": {"ExitCode": 0},
+        }
+        if database:
+            value["Name"] = "/supabase_db_fp-hosted-replay-ro-001"
+            value["State"] = {"Health": {"Status": health}, "ExitCode": 0}
+        return value
+
+    def exchange(
+        self,
+        policy: object,
+        method: bytes,
+        target: str,
+        code: int,
+        request: dict[str, object] | None = None,
+        response: dict[str, object] | None = None,
+        response_headers: dict[str, str] | None = None,
+        stream_bytes: int = 0,
+    ) -> None:
+        request_body = (
+            json.dumps(request, separators=(",", ":")).encode() if request is not None else b""
+        )
+        request_headers = {"content-type": "application/json"} if request is not None else {}
+        decision = policy.authorize(method, target.encode(), request_headers, request_body)
+        body = json.dumps(response, separators=(",", ":")).encode() if response is not None else b""
+        headers = dict(response_headers or {})
+        if response is not None:
+            headers["content-type"] = "application/json"
+        policy.accept(
+            decision,
+            code,
+            headers,
+            None if decision.stream else body,
+            stream_bytes if decision.stream else len(body),
+        )
+
+    def advance_to_network(self, policy: object) -> None:
+        self.exchange(policy, b"HEAD", "/_ping", 200, response_headers={"api-version": "1.48"})
+        self.exchange(policy, b"GET", "/v1.48/containers/supabase_db_fp-hosted-replay-ro-001/json", 404)
+        self.exchange(policy, b"GET", "/v1.48/volumes/supabase_db_fp-hosted-replay-ro-001", 404)
+        self.exchange(
+            policy,
+            b"GET",
+            "/v1.48/images/public.ecr.aws/supabase/postgres:17.6.1.143/json",
+            200,
+            response={"Id": "sha256:" + "b" * 64},
+        )
+
+    def complete_policy(self, health_probes: int = 1) -> object:
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        self.advance_to_network(policy)
+        network = {"Name": "fp-hosted-replay-ro-001-net", "Labels": self.labels()}
+        volume = {"Name": "supabase_db_fp-hosted-replay-ro-001", "Labels": self.labels()}
+        self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
+        self.exchange(policy, b"POST", "/v1.48/volumes/create", 201, request=volume, response={"Name": volume["Name"]})
+        self.exchange(
+            policy,
+            b"POST",
+            "/v1.48/containers/create?name=supabase_db_fp-hosted-replay-ro-001",
+            201,
+            request=self.db_create_body(),
+            response={"Id": self.DB_ID, "Warnings": []},
+        )
+        self.exchange(policy, b"POST", f"/v1.48/containers/{self.DB_ID}/start", 204)
+        for index in range(health_probes):
+            health = "healthy" if index == health_probes - 1 else "starting"
+            self.exchange(
+                policy,
+                b"GET",
+                "/v1.48/containers/supabase_db_fp-hosted-replay-ro-001/json",
+                200,
+                response=self.inspect_body(True, health),
+            )
+        self.exchange(
+            policy,
+            b"GET",
+            "/v1.48/images/public.ecr.aws/supabase/gotrue:v2.192.0/json",
+            200,
+            response={"Id": "sha256:" + "e" * 64},
+        )
+        self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
+        self.exchange(
+            policy,
+            b"POST",
+            "/v1.48/containers/create",
+            201,
+            request=self.gotrue_create_body(),
+            response={"Id": self.GOTRUE_ID, "Warnings": []},
+        )
+        self.exchange(policy, b"POST", f"/v1.48/containers/{self.GOTRUE_ID}/start", 204)
+        self.exchange(
+            policy,
+            b"GET",
+            f"/v1.48/containers/{self.GOTRUE_ID}/logs?follow=1&stderr=1&stdout=1&tail=",
+            200,
+            response_headers={"content-type": "application/vnd.docker.raw-stream"},
+            stream_bytes=12,
+        )
+        self.exchange(
+            policy,
+            b"GET",
+            f"/v1.48/containers/{self.GOTRUE_ID}/json",
+            200,
+            response=self.inspect_body(False),
+        )
+        self.exchange(
+            policy,
+            b"DELETE",
+            f"/v1.48/containers/{self.GOTRUE_ID}?force=1&v=1",
+            204,
+        )
+        return policy
+
+    def test_full_exact_lifecycle_and_bounded_health_repeats(self) -> None:
+        policy = self.complete_policy(health_probes=121)
+        self.assertTrue(policy.complete)
+        self.assertEqual(policy.health_probe_count, 121)
+        receipt = docker_api_boundary.Receipt()
+        receipt.attach_policy(policy)
+        receipt.sync_policy(policy)
+        result = receipt.sanitized()
+        self.assertEqual(result["classification"], "DB_START_POLICY_COMPLETE")
+        self.assertEqual(result["policy_matrix_sha256"], docker_api_boundary.POLICY_MATRIX_SHA256)
+        self.assertNotIn(self.DB_ID, docker_api_boundary.format_state_lines(result))
+
+    def test_order_id_replay_prefix_and_network_201_fail_closed(self) -> None:
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_API_VERSION_REJECTED"):
+            policy.authorize(b"HEAD", b"/v1.48/_ping", {}, b"")
+
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        self.advance_to_network(policy)
+        decision = policy.authorize(
+            b"POST",
+            b"/v1.48/networks/create",
+            {"content-type": "application/json"},
+            json.dumps({"Name": "fp-hosted-replay-ro-001-net", "Labels": self.labels()}).encode(),
+        )
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_STATUS_REJECTED"):
+            policy.accept(decision, 201, {"content-type": "application/json"}, b"{}", 2)
+
+        policy = self.complete_policy()
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_ORDER_REJECTED"):
+            policy.authorize(b"POST", f"/v1.48/containers/{self.GOTRUE_ID}/start".encode(), {}, b"")
+
+    def test_identity_port_privilege_bind_capability_and_unknown_fields_rejected(self) -> None:
+        mutations = (
+            ("Config", "Image", "drifted/image:tag"),
+            ("Config", "Labels", {"com.supabase.cli.project": "other"}),
+            ("HostConfig", "NetworkMode", "other-network"),
+            ("HostConfig", "PortBindings", {"5432/tcp": [{"HostIp": "0.0.0.0", "HostPort": "56422"}]}),
+            ("HostConfig", "Privileged", True),
+            ("HostConfig", "Binds", ["foreign:/var/lib/postgresql/data"]),
+            ("HostConfig", "CapAdd", ["SYS_ADMIN"]),
+            ("HostConfig", "UnknownField", "value"),
+        )
+        for section, key, value in mutations:
+            with self.subTest(section=section, key=key):
+                policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+                self.advance_to_network(policy)
+                network = {"Name": "fp-hosted-replay-ro-001-net", "Labels": self.labels()}
+                volume = {"Name": "supabase_db_fp-hosted-replay-ro-001", "Labels": self.labels()}
+                self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
+                self.exchange(policy, b"POST", "/v1.48/volumes/create", 201, request=volume, response={"Name": volume["Name"]})
+                body = self.db_create_body()
+                body[section][key] = value
+                with self.assertRaises(docker_api_boundary.PolicyViolation):
+                    self.exchange(
+                        policy,
+                        b"POST",
+                        "/v1.48/containers/create?name=supabase_db_fp-hosted-replay-ro-001",
+                        201,
+                        request=body,
+                        response={"Id": self.DB_ID},
+                    )
+
+    def test_broad_cleanup_image_pull_exec_and_prune_are_denied(self) -> None:
+        prohibited = (
+            (b"GET", "/v1.48/containers/json"),
+            (b"POST", "/v1.48/images/create"),
+            (b"POST", "/v1.48/containers/prune"),
+            (b"POST", "/v1.48/volumes/prune"),
+            (b"POST", "/v1.48/networks/prune"),
+            (b"POST", f"/v1.48/containers/{self.DB_ID}/exec"),
+        )
+        for method, target in prohibited:
+            with self.subTest(target=target):
+                policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+                with self.assertRaises(docker_api_boundary.PolicyViolation):
+                    policy.authorize(method, target.encode(), {}, b"")
+
+    def test_descriptor_is_one_shot_restart_is_lost_and_secrets_are_not_retained(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, json.dumps(self.policy_data()).encode())
+        os.close(write_fd)
+        policy = docker_api_boundary.DBStartPolicy.from_fd(read_fd)
+        with self.assertRaises(OSError):
+            os.fstat(read_fd)
+        self.assertRegex(policy.digest, r"^[0-9a-f]{64}$")
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_LEDGER_LOST"):
+            docker_api_boundary.DBStartPolicy(self.policy_data(generation=1))
+
+        policy = self.complete_policy()
+        receipt = docker_api_boundary.Receipt()
+        receipt.attach_policy(policy)
+        receipt.sync_policy(policy)
+        rendered = docker_api_boundary.format_state_lines(receipt.sanitized())
+        for forbidden in ("private-password", "private-jwt", "postgresql://", self.DB_ID, self.GOTRUE_ID):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_framing_size_concurrency_and_schema_fail_closed(self) -> None:
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_FRAMING_REJECTED"):
+            docker_api_boundary._parse_head(
+                b"POST /v1.48/containers/create HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n",
+                request=True,
+            )
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_BODY_OVERSIZED"):
+            docker_api_boundary._closed_json(b"{" + b"x" * 100 + b"}", 10)
+        for malformed in (b'{"Name":"one","Name":"two"}', b'{"value":NaN}'):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_BODY_REJECTED"):
+                    docker_api_boundary._closed_json(malformed, 1024)
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        receipt = docker_api_boundary.Receipt()
+        server = docker_api_boundary.PolicyBoundaryServer(Path("packet.sock"), Path("docker.sock"), receipt, policy)
+
+        async def check_lock() -> None:
+            async with server.exchange_lock:
+                with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_CONCURRENT_REQUEST"):
+                    server.ensure_exchange_available()
+
+        asyncio.run(check_lock())
 
 
 class DbStartLogClassifierTests(unittest.TestCase):
