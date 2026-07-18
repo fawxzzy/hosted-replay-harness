@@ -6,6 +6,7 @@ import contextlib
 import gzip
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -4522,6 +4523,29 @@ def owned_firewall_entries_with_markers() -> list[dict]:
 
 class FirewallBoundaryTests(unittest.TestCase):
     @staticmethod
+    def _marker_diagnostic(entries: list[dict]) -> dict[str, object]:
+        return firewall_boundary.diagnose_marker_rule_expressions(
+            entries,
+            firewall_boundary.TABLE,
+            "br-fpro001",
+            "172.31.253.0/24",
+            "172.31.253.10",
+            "172.31.253.11",
+            "172.17.0.4",
+            "172.31.253.1",
+            18080,
+        )
+
+    @staticmethod
+    def _marker_rules(entries: list[dict]) -> list[dict]:
+        return [
+            entry["rule"]
+            for entry in entries
+            if isinstance(entry.get("rule"), dict)
+            and entry["rule"].get("chain") in firewall_boundary.MARKER_CHAINS
+        ]
+
+    @staticmethod
     def _prepared_ledger_payload(foreign: list[dict]) -> dict[str, object]:
         pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
         return {
@@ -4807,6 +4831,309 @@ printf 'SETUP:%s:%s\\n' "$FIREWALL_SETUP_OUTPUT_TOTAL" "$SMOKE_PASSED"
                         "172.31.253.1",
                         18080,
                     )
+
+    def test_marker_diagnostic_inventory_is_closed_redacted_and_deterministic(self) -> None:
+        base = owned_firewall_entries_with_markers()
+
+        def changed() -> tuple[list[dict], list[dict]]:
+            entries = copy.deepcopy(base)
+            return entries, self._marker_rules(entries)
+
+        cases: dict[str, list[dict]] = {"MATCHED_SHAPE": copy.deepcopy(base)}
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"]["right"] = b"unsupported"
+        cases["UNSUPPORTED_STRUCTURE"] = entries
+
+        entries = copy.deepcopy(base)
+        entries.append({"rule": "not-an-object"})
+        cases["RULE_TYPE"] = entries
+
+        entries, rules = changed()
+        target = rules[-1]
+        entries.remove(next(entry for entry in entries if entry.get("rule") is target))
+        cases["RULE_COUNT"] = entries
+
+        entries, rules = changed()
+        marker_entries = [entry for entry in entries if entry.get("rule") in rules]
+        marker_entries[0]["rule"], marker_entries[1]["rule"] = (
+            marker_entries[1]["rule"],
+            marker_entries[0]["rule"],
+        )
+        cases["RULE_ORDER"] = entries
+
+        entries, rules = changed()
+        rules[0]["unknown"] = True
+        cases["RULE_KEYS"] = entries
+
+        entries, rules = changed()
+        rules[0]["family"] = "other-family"
+        cases["RULE_IDENTITY"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"] = {"not": "a-list"}
+        cases["EXPRESSION_COLLECTION_TYPE"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"].pop()
+        cases["EXPRESSION_COUNT"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0], rules[0]["expr"][1] = (
+            rules[0]["expr"][1],
+            rules[0]["expr"][0],
+        )
+        cases["EXPRESSION_ORDER"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0] = "not-an-object"
+        cases["EXPRESSION_TYPE"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["unknown"] = None
+        cases["EXPRESSION_KEYS"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0] = {"counter": "different-kind"}
+        cases["EXPRESSION_KIND_OR_ORDER"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0] = {"accept": None}
+        cases["UNEXPECTED_VERDICT_OR_ACTION"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"].pop("right")
+        cases["MATCH_KEYS"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"]["op"] = "!="
+        cases["MATCH_OPERATOR"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"]["left"] = "not-an-object"
+        cases["SELECTOR_TYPE"] = entries
+
+        entries, rules = changed()
+        selector = rules[0]["expr"][0]["match"]["left"]
+        selector[next(iter(selector))]["unknown"] = True
+        cases["SELECTOR_KIND_OR_KEYS"] = entries
+
+        entries, rules = changed()
+        selector = rules[0]["expr"][0]["match"]["left"]
+        selector[next(iter(selector))]["key"] = "different-selector"
+        cases["SELECTOR_IDENTITY"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"]["right"] = 7
+        cases["RIGHT_VALUE_TYPE"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][0]["match"]["right"] = "different-literal"
+        cases["RIGHT_VALUE_IDENTITY"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][-1]["counter"] = {"name": "different-counter"}
+        cases["COUNTER_REFERENCE_SHAPE"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][-1]["counter"] = {"reference": "different-counter"}
+        cases["COUNTER_REFERENCE_KEYS"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][-1]["counter"] = {"packets": 0, "bytes": 0}
+        cases["COUNTER_DYNAMIC_FIELDS"] = entries
+
+        entries, rules = changed()
+        rules[0]["expr"][-1]["counter"] = "different-counter"
+        cases["COUNTER_REFERENCE_IDENTITY"] = entries
+
+        self.assertEqual(set(cases), firewall_boundary.MARKER_MISMATCH_CLASSES)
+        observed_classes: set[str] = set()
+        for expected_class, entries in cases.items():
+            with self.subTest(expected_class=expected_class):
+                first = self._marker_diagnostic(entries)
+                second = self._marker_diagnostic(copy.deepcopy(entries))
+                self.assertEqual(first, second)
+                self.assertEqual(first["mismatch_class"], expected_class)
+                self.assertEqual(first["schema"], firewall_boundary.MARKER_DIAGNOSTIC_SCHEMA)
+                self.assertRegex(str(first["expected_shape_sha256"]), r"^[0-9a-f]{64}$")
+                self.assertRegex(str(first["observed_shape_sha256"]), r"^[0-9a-f]{64}$")
+                self.assertLessEqual(int(first["expected_rule_count"]), 64)
+                self.assertLessEqual(int(first["observed_rule_count"]), 64)
+                serialized = json.dumps(first, sort_keys=True)
+                for raw in (
+                    "br-fpro001",
+                    "172.31.253.10",
+                    "172.31.253.11",
+                    "172.17.0.4",
+                    "172.31.253.1",
+                    "different-literal",
+                    "different-counter",
+                    firewall_boundary.MARKER_COUNTERS["gateway"],
+                ):
+                    self.assertNotIn(raw, serialized)
+                observed_classes.add(str(first["mismatch_class"]))
+        self.assertEqual(observed_classes, firewall_boundary.MARKER_MISMATCH_CLASSES)
+
+        matched = self._marker_diagnostic(base)
+        self.assertEqual(matched["disposition"], "DIAGNOSTIC_STOP_MATCHED_SHAPE")
+        self.assertTrue(matched["shape_digests_equal"])
+        self.assertTrue(matched["matched_shape"])
+
+        literal_change = self._marker_diagnostic(cases["RIGHT_VALUE_IDENTITY"])
+        self.assertTrue(literal_change["shape_digests_equal"])
+        structural_change = self._marker_diagnostic(cases["MATCH_KEYS"])
+        self.assertFalse(structural_change["shape_digests_equal"])
+
+        numeric_type_drift = copy.deepcopy(base)
+        output_rule = next(
+            rule
+            for rule in self._marker_rules(numeric_type_drift)
+            if rule["chain"] == firewall_boundary.MARKER_OUTPUT_CHAIN
+        )
+        payload_selector = next(
+            expression["match"]["left"]["payload"]
+            for expression in output_rule["expr"]
+            if "offset"
+            in expression.get("match", {}).get("left", {}).get("payload", {})
+        )
+        payload_selector["offset"] = float(payload_selector["offset"])
+        self.assertEqual(
+            self._marker_diagnostic(numeric_type_drift)["mismatch_class"],
+            "SELECTOR_IDENTITY",
+        )
+
+    def test_marker_shape_digest_redacts_literals_but_preserves_structure(self) -> None:
+        first = {
+            "match": {
+                "op": "==",
+                "left": {"meta": {"key": "first-selector"}},
+                "right": "first-sensitive-literal",
+            }
+        }
+        second = {
+            "match": {
+                "op": "==",
+                "left": {"meta": {"key": "second-selector"}},
+                "right": "second-sensitive-literal",
+            }
+        }
+        first_sha, first_supported = firewall_boundary._redacted_shape_digest(first)
+        second_sha, second_supported = firewall_boundary._redacted_shape_digest(second)
+        self.assertTrue(first_supported and second_supported)
+        self.assertEqual(first_sha, second_sha)
+
+        structural = copy.deepcopy(second)
+        structural["match"].pop("right")
+        structural_sha, structural_supported = firewall_boundary._redacted_shape_digest(
+            structural
+        )
+        self.assertTrue(structural_supported)
+        self.assertNotEqual(first_sha, structural_sha)
+
+    def test_marker_diagnostic_state_publication_is_closed_private_and_one_shot(self) -> None:
+        diagnostic = self._marker_diagnostic(owned_firewall_entries_with_markers())
+        rows = firewall_boundary.marker_diagnostic_state_rows(diagnostic)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.tsv"
+            state.write_text("existing\tbool\ttrue\n", encoding="utf-8")
+            if os.name != "nt":
+                state.chmod(0o600)
+            firewall_boundary.publish_marker_diagnostic_state(rows, state)
+            payload = state.read_text(encoding="utf-8")
+            self.assertEqual(payload.count(firewall_boundary.MARKER_DIAGNOSTIC_PREFIX), len(rows))
+            self.assertIn(
+                "firewall.markers.diagnostic.canaries_reachable\tbool\tfalse",
+                payload,
+            )
+            self.assertIn("DIAGNOSTIC_STOP_MATCHED_SHAPE", payload)
+            for raw in (
+                "br-fpro001",
+                "172.31.253.10",
+                "172.31.253.11",
+                "172.17.0.4",
+                "172.31.253.1",
+                firewall_boundary.MARKER_COUNTERS["gateway"],
+            ):
+                self.assertNotIn(raw, payload)
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED",
+            ):
+                firewall_boundary.publish_marker_diagnostic_state(rows, state)
+
+            missing = Path(directory) / "missing.tsv"
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED",
+            ):
+                firewall_boundary.publish_marker_diagnostic_state(rows, missing)
+
+            malformed = list(rows)
+            malformed[0] = (malformed[0][0], "str", "raw value with spaces")
+            clean = Path(directory) / "clean.tsv"
+            clean.write_text("", encoding="utf-8")
+            if os.name != "nt":
+                clean.chmod(0o600)
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_MARKER_DIAGNOSTIC_INVALID",
+            ):
+                firewall_boundary.publish_marker_diagnostic_state(malformed, clean)
+
+            for invalid_diagnostic in (
+                {**diagnostic, "raw": "not-admitted"},
+                {**diagnostic, "mismatch_class": "UNKNOWN_CLASS"},
+                {**diagnostic, "observed_expression_kind": "UNKNOWN_KIND"},
+                {**diagnostic, "matched_shape": False},
+                {**diagnostic, "expected_rule_count": 8},
+            ):
+                with self.subTest(invalid_diagnostic=invalid_diagnostic):
+                    with self.assertRaisesRegex(
+                        firewall_boundary.BoundaryError,
+                        "FIREWALL_MARKER_DIAGNOSTIC_INVALID",
+                    ):
+                        firewall_boundary.marker_diagnostic_state_rows(
+                            invalid_diagnostic
+                        )
+
+    def test_marker_diagnostic_always_stops_before_canary_reachability(self) -> None:
+        source = inspect.getsource(firewall_boundary.install_markers)
+        ledger_write = source.index("write_ledger(ledger_path, ledger)")
+        publication = source.index("publish_marker_diagnostic_state(rows)")
+        matched_stop = source.index(
+            'raise BoundaryError("FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE")'
+        )
+        mismatch_stop = source.index(
+            'raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")',
+            matched_stop,
+        )
+        self.assertLess(ledger_write, publication)
+        self.assertLess(publication, matched_stop)
+        self.assertLess(matched_stop, mismatch_stop)
+        self.assertNotIn("return", source[publication:])
+        self.assertNotIn("marker_counters", source)
+
+        contract = (ROOT / "docs/CONTAINMENT_CONTRACT.md").read_text(encoding="utf-8")
+        self.assertIn("canaries_reachable=false", contract)
+        self.assertIn("FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE", contract)
+        for mismatch_class in firewall_boundary.MARKER_MISMATCH_CLASSES:
+            self.assertIn(f"`{mismatch_class}`", contract)
+
+    def test_marker_diagnostic_bounds_oversized_unknown_readback(self) -> None:
+        entries = owned_firewall_entries_with_markers()
+        entries.extend(
+            nft_entry(
+                "rule",
+                chain=firewall_boundary.MARKER_INPUT_CHAIN,
+                expr=[{"unknown": index}],
+            )
+            for index in range(80)
+        )
+        diagnostic = self._marker_diagnostic(entries)
+        self.assertEqual(diagnostic["mismatch_class"], "RULE_COUNT")
+        self.assertEqual(diagnostic["observed_rule_count"], 64)
+        self.assertTrue(diagnostic["count_truncated"])
 
     def test_process_identity_preflight_is_closed_and_sanitized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5540,6 +5867,10 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
+            diagnostic_state = Path(directory) / "state.tsv"
+            diagnostic_state.write_text("existing\tbool\ttrue\n", encoding="utf-8")
+            if os.name != "nt":
+                diagnostic_state.chmod(0o600)
             firewall_boundary.write_ledger(
                 ledger,
                 {
@@ -5570,24 +5901,41 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 ],
             ), mock.patch.object(
                 firewall_boundary, "_run", return_value=success
+            ), mock.patch.object(
+                firewall_boundary,
+                "MARKER_DIAGNOSTIC_STATE_FILE",
+                diagnostic_state,
             ), contextlib.redirect_stdout(state):
-                firewall_boundary.install_markers(
-                    ledger,
-                    "172.31.253.10",
-                    "172.31.253.11",
-                    "172.17.0.4",
-                    "172.31.253.1",
-                    18080,
-                )
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE",
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
             saved = firewall_boundary.read_ledger(ledger)
             self.assertTrue(saved["markers_installed"])
             self.assertRegex(saved["marker_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(saved["combined_sha256"], r"^[0-9a-f]{64}$")
             sanitized = state.getvalue()
-            self.assertIn("firewall.markers.counter_count\tint\t7", sanitized)
-            self.assertIn("firewall.markers.rule_count\tint\t7", sanitized)
+            persisted = diagnostic_state.read_text(encoding="utf-8")
+            self.assertEqual(sanitized, "")
+            self.assertIn(
+                "firewall.markers.diagnostic.disposition\tstr\tDIAGNOSTIC_STOP_MATCHED_SHAPE",
+                persisted,
+            )
+            self.assertIn(
+                "firewall.markers.diagnostic.canaries_reachable\tbool\tfalse",
+                persisted,
+            )
             for raw in ("172.31.253.10", "172.31.253.11", "172.17.0.4"):
                 self.assertNotIn(raw, sanitized)
+                self.assertNotIn(raw, persisted)
             with self.assertRaisesRegex(
                 firewall_boundary.BoundaryError, "FIREWALL_MARKER_COLLISION"
             ):
@@ -5606,13 +5954,17 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             {"chain": {"family": "ip", "table": "foreign-original", "name": "docker-setup"}}
         ]
         original_sha, original_counts = firewall_boundary.canonical_snapshot(original)
-        setup_sha, setup_counts = firewall_boundary.canonical_snapshot(setup)
+        setup_sha, _ = firewall_boundary.canonical_snapshot(setup)
         owned_sha, _ = firewall_boundary.validate_owned(
             owned_firewall_entries(), firewall_boundary.TABLE
         )
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
+            diagnostic_state = Path(directory) / "state.tsv"
+            diagnostic_state.write_text("existing\tbool\ttrue\n", encoding="utf-8")
+            if os.name != "nt":
+                diagnostic_state.chmod(0o600)
             firewall_boundary.write_ledger(
                 ledger,
                 {
@@ -5643,35 +5995,136 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 ],
             ), mock.patch.object(
                 firewall_boundary, "_run", return_value=success
+            ), mock.patch.object(
+                firewall_boundary,
+                "MARKER_DIAGNOSTIC_STATE_FILE",
+                diagnostic_state,
             ), contextlib.redirect_stdout(state):
-                firewall_boundary.install_markers(
-                    ledger,
-                    "172.31.253.10",
-                    "172.31.253.11",
-                    "172.17.0.4",
-                    "172.31.253.1",
-                    18080,
-                )
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE",
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
             saved = firewall_boundary.read_ledger(ledger)
             self.assertEqual(saved["preimage_sha256"], original_sha)
             self.assertEqual(saved["preimage_counts"], original_counts)
             sanitized = state.getvalue()
+            persisted = diagnostic_state.read_text(encoding="utf-8")
             self.assertIn(
-                f"firewall.markers.original_cleanup_preimage_sha256\tstr\t{original_sha}",
-                sanitized,
+                "firewall.markers.diagnostic.foreign_transaction_unchanged\tbool\ttrue",
+                persisted,
             )
-            self.assertEqual(sanitized.count(setup_sha), 2)
-            self.assertIn("firewall.markers.foreign_transaction_unchanged\tbool\ttrue", sanitized)
-            self.assertIn(
-                "firewall.markers.setup_history_changed_from_original\tbool\ttrue",
-                sanitized,
-            )
-            self.assertIn(
-                f"firewall.markers.foreign_pre_chain_count\tint\t{setup_counts['chain']}",
-                sanitized,
-            )
+            self.assertNotIn(original_sha, persisted)
+            self.assertNotIn(setup_sha, persisted)
             self.assertNotIn("foreign-original", sanitized)
             self.assertNotIn("docker-setup", sanitized)
+            self.assertNotIn("foreign-original", persisted)
+            self.assertNotIn("docker-setup", persisted)
+
+    def test_marker_diagnostic_exit_retains_exact_idempotent_cleanup_for_match_and_mismatch(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        for matched in (True, False):
+            with self.subTest(matched=matched), tempfile.TemporaryDirectory() as directory:
+                marked = owned_firewall_entries_with_markers()
+                if not matched:
+                    self._marker_rules(marked)[0]["expr"][0]["match"][
+                        "right"
+                    ] = "different-literal"
+                ledger = Path(directory) / "ledger.json"
+                completion = firewall_boundary.restoration_completion_path(ledger)
+                diagnostic_state = Path(directory) / "state.tsv"
+                diagnostic_state.write_text("existing\tbool\ttrue\n", encoding="utf-8")
+                if os.name != "nt":
+                    diagnostic_state.chmod(0o600)
+                firewall_boundary.write_ledger(
+                    ledger,
+                    {
+                        "schema": firewall_boundary.SCHEMA,
+                        "table": firewall_boundary.TABLE,
+                        "interface": "br-fpro001",
+                        "subnet": "172.31.253.0/24",
+                        "preimage_sha256": pre_sha,
+                        "preimage_counts": pre_counts,
+                        "installed": True,
+                        "owned_sha256": owned_sha,
+                        "markers_installed": False,
+                        "marker_sha256": "",
+                        "combined_sha256": "",
+                    },
+                )
+                expected_code = (
+                    "FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE"
+                    if matched
+                    else "FIREWALL_MARKER_INSTALLATION_MISMATCH"
+                )
+                with mock.patch.object(
+                    firewall_boundary,
+                    "privileged_prefix",
+                    return_value=(["nft"], "nftables-v1"),
+                ), mock.patch.object(
+                    firewall_boundary,
+                    "read_ruleset",
+                    side_effect=[foreign + owned_firewall_entries(), foreign + marked],
+                ), mock.patch.object(
+                    firewall_boundary, "_run", return_value=success
+                ), mock.patch.object(
+                    firewall_boundary,
+                    "MARKER_DIAGNOSTIC_STATE_FILE",
+                    diagnostic_state,
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        firewall_boundary.BoundaryError, expected_code
+                    ):
+                        firewall_boundary.install_markers(
+                            ledger,
+                            "172.31.253.10",
+                            "172.31.253.11",
+                            "172.17.0.4",
+                            "172.31.253.1",
+                            18080,
+                        )
+                saved = firewall_boundary.read_ledger(ledger)
+                self.assertTrue(saved["markers_installed"])
+                self.assertRegex(saved["marker_sha256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(saved["combined_sha256"], r"^[0-9a-f]{64}$")
+
+                with mock.patch.object(
+                    firewall_boundary,
+                    "privileged_prefix",
+                    return_value=(["nft"], "nftables-v1"),
+                ), mock.patch.object(
+                    firewall_boundary,
+                    "read_ruleset",
+                    side_effect=[foreign + marked, foreign],
+                ), mock.patch.object(
+                    firewall_boundary, "_run", return_value=success
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    firewall_boundary.remove(ledger)
+                self.assertFalse(ledger.exists())
+                self.assertTrue(completion.exists())
+
+                with mock.patch.object(
+                    firewall_boundary,
+                    "privileged_prefix",
+                    return_value=(["nft"], "nftables-v1"),
+                ), mock.patch.object(
+                    firewall_boundary, "read_ruleset", return_value=foreign
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    firewall_boundary.remove(ledger)
+                self.assertFalse(ledger.exists())
+                self.assertFalse(completion.exists())
 
     def test_marker_transaction_rejects_window_drift_snapshot_failure_and_collision(self) -> None:
         original = [{"table": {"family": "ip", "name": "foreign"}}]

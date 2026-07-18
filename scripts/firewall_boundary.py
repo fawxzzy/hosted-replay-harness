@@ -43,6 +43,84 @@ MARKER_COUNTERS = {
     "foreign_network": "marker_foreign_network",
 }
 MARKER_CHAINS = {MARKER_INPUT_CHAIN, MARKER_FORWARD_CHAIN, MARKER_OUTPUT_CHAIN}
+MARKER_CHAIN_ORDER = (
+    MARKER_INPUT_CHAIN,
+    MARKER_FORWARD_CHAIN,
+    MARKER_OUTPUT_CHAIN,
+)
+MARKER_CHAIN_CLASSES = {
+    MARKER_INPUT_CHAIN: "INPUT",
+    MARKER_FORWARD_CHAIN: "FORWARD",
+    MARKER_OUTPUT_CHAIN: "OUTPUT",
+}
+MARKER_DIAGNOSTIC_SCHEMA = (
+    "fawxzzy.hosted-replay-harness.marker-expression-diagnostic.v1"
+)
+MARKER_DIAGNOSTIC_STATE_FILE = (
+    Path(__file__).resolve().parents[1] / "artifacts" / ".state.tsv"
+)
+MARKER_MISMATCH_CLASSES = frozenset(
+    {
+        "MATCHED_SHAPE",
+        "UNSUPPORTED_STRUCTURE",
+        "RULE_TYPE",
+        "RULE_COUNT",
+        "RULE_ORDER",
+        "RULE_KEYS",
+        "RULE_IDENTITY",
+        "EXPRESSION_COLLECTION_TYPE",
+        "EXPRESSION_COUNT",
+        "EXPRESSION_ORDER",
+        "EXPRESSION_TYPE",
+        "EXPRESSION_KEYS",
+        "EXPRESSION_KIND_OR_ORDER",
+        "UNEXPECTED_VERDICT_OR_ACTION",
+        "MATCH_KEYS",
+        "MATCH_OPERATOR",
+        "SELECTOR_TYPE",
+        "SELECTOR_KIND_OR_KEYS",
+        "SELECTOR_IDENTITY",
+        "RIGHT_VALUE_TYPE",
+        "RIGHT_VALUE_IDENTITY",
+        "COUNTER_REFERENCE_SHAPE",
+        "COUNTER_REFERENCE_KEYS",
+        "COUNTER_DYNAMIC_FIELDS",
+        "COUNTER_REFERENCE_IDENTITY",
+    }
+)
+MARKER_EXPRESSION_KINDS = frozenset(
+    {"MATCH", "COUNTER", "ACTION", "UNKNOWN", "MULTIPLE", "NON_OBJECT", "NONE"}
+)
+MARKER_ACTION_KEYS = frozenset(
+    {"accept", "drop", "reject", "jump", "goto", "return", "queue", "masq", "snat", "dnat"}
+)
+MARKER_DIAGNOSTIC_PREFIX = "firewall.markers.diagnostic."
+MARKER_DIAGNOSTIC_MAX_COUNT = 64
+MARKER_DIAGNOSTIC_MAX_NODES = 512
+MARKER_DIAGNOSTIC_MAX_DEPTH = 16
+MARKER_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "schema",
+        "disposition",
+        "mismatch_class",
+        "chain_class",
+        "rule_ordinal",
+        "expression_ordinal",
+        "expected_expression_kind",
+        "observed_expression_kind",
+        "expected_shape_sha256",
+        "observed_shape_sha256",
+        "shape_digests_equal",
+        "expected_rule_count",
+        "observed_rule_count",
+        "expected_expression_count",
+        "observed_expression_count",
+        "count_truncated",
+        "expected_shape_supported",
+        "observed_shape_supported",
+        "matched_shape",
+    }
+)
 # DNS question wire identity for the fixed public canary name already frozen in
 # the runner.  It is matched only transiently and is never emitted in state.
 DNS_QUESTION_HEX = "076578616d706c6503636f6d00"
@@ -442,6 +520,622 @@ def expected_marker_rule_expressions(
     }
 
 
+def _redacted_shape_digest(value: Any) -> tuple[str, bool]:
+    remaining = [MARKER_DIAGNOSTIC_MAX_NODES]
+    supported = [True]
+
+    def project(current: Any, depth: int, parent_key: str = "") -> Any:
+        if depth > MARKER_DIAGNOSTIC_MAX_DEPTH or remaining[0] <= 0:
+            supported[0] = False
+            return {"$type": "LIMIT"}
+        remaining[0] -= 1
+        if current is None:
+            return {"$type": "NULL"}
+        if isinstance(current, bool):
+            return {"$type": "BOOL"}
+        if isinstance(current, int):
+            return {"$type": "INT"}
+        if isinstance(current, float):
+            return {"$type": "NUMBER"}
+        if isinstance(current, str):
+            if parent_key == "op":
+                return {"$type": "OPERATOR_EQ" if current == "==" else "OPERATOR_OTHER"}
+            return {"$type": "STRING"}
+        if isinstance(current, list):
+            return [project(item, depth + 1) for item in current]
+        if isinstance(current, dict):
+            if any(not isinstance(key, str) for key in current):
+                supported[0] = False
+                return {"$type": "NON_STRING_KEY_OBJECT"}
+            return {
+                key: project(current[key], depth + 1, key)
+                for key in sorted(current)
+            }
+        supported[0] = False
+        return {"$type": "UNSUPPORTED"}
+
+    encoded = json.dumps(
+        project(value, 0), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), supported[0]
+
+
+def _marker_expression_kind(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "NON_OBJECT"
+    keys = set(value)
+    if len(keys) != 1:
+        return "MULTIPLE" if keys else "UNKNOWN"
+    key = next(iter(keys))
+    if key == "match":
+        return "MATCH"
+    if key == "counter":
+        return "COUNTER"
+    if key in MARKER_ACTION_KEYS:
+        return "ACTION"
+    return "UNKNOWN"
+
+
+def _literal_type_class(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "BOOL"
+    if isinstance(value, int):
+        return "INT"
+    if isinstance(value, float):
+        return "NUMBER"
+    if isinstance(value, str):
+        return "STRING"
+    if isinstance(value, list):
+        return "LIST"
+    if isinstance(value, dict):
+        return "OBJECT"
+    return "UNSUPPORTED"
+
+
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(
+            _strict_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
+def _bounded_diagnostic_count(value: int) -> tuple[int, bool]:
+    return min(max(value, 0), MARKER_DIAGNOSTIC_MAX_COUNT), value > MARKER_DIAGNOSTIC_MAX_COUNT
+
+
+def diagnose_marker_rule_expressions(
+    entries: list[dict[str, Any]],
+    table_name: str,
+    interface: str,
+    subnet: str,
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+) -> dict[str, Any]:
+    expected_expressions = expected_marker_rule_expressions(
+        table_name,
+        interface,
+        subnet,
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
+    )
+    expected_rules = {
+        chain: [
+            {
+                "family": "inet",
+                "table": table_name,
+                "chain": chain,
+                "expr": expressions,
+            }
+            for expressions in expected_expressions[chain]
+        ]
+        for chain in MARKER_CHAIN_ORDER
+    }
+    observed_rules: dict[str, list[Any]] = {chain: [] for chain in MARKER_CHAIN_ORDER}
+    malformed_rule: Any | None = None
+    if not isinstance(entries, list):
+        malformed_rule = entries
+    else:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                malformed_rule = entry
+                break
+            rule = entry.get("rule")
+            if rule is None:
+                continue
+            if not isinstance(rule, dict):
+                if set(entry) == {"rule"}:
+                    malformed_rule = rule
+                    break
+                continue
+            if rule.get("table") == table_name and rule.get("chain") in observed_rules:
+                observed_rules[rule["chain"]].append(rule)
+
+    expected_shape_source = {
+        chain: [rule["expr"] for rule in expected_rules[chain]]
+        for chain in MARKER_CHAIN_ORDER
+    }
+    observed_shape_source = {
+        chain: [
+            rule.get("expr")
+            if isinstance(rule, dict)
+            else rule
+            for rule in observed_rules[chain]
+        ]
+        for chain in MARKER_CHAIN_ORDER
+    }
+    expected_shape_sha, expected_supported = _redacted_shape_digest(
+        expected_shape_source
+    )
+    observed_shape_sha, observed_supported = _redacted_shape_digest(
+        observed_shape_source
+        if malformed_rule is None
+        else {"malformed_rule": malformed_rule}
+    )
+
+    def result(
+        mismatch_class: str,
+        *,
+        chain: str | None = None,
+        rule_ordinal: int = 0,
+        expression_ordinal: int = 0,
+        expected_kind: str = "NONE",
+        observed_kind: str = "NONE",
+        expected_expression_count: int = 0,
+        observed_expression_count: int = 0,
+    ) -> dict[str, Any]:
+        if mismatch_class not in MARKER_MISMATCH_CLASSES:
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+        expected_rule_count, expected_rule_truncated = _bounded_diagnostic_count(
+            sum(len(rules) for rules in expected_rules.values())
+        )
+        observed_rule_count, observed_rule_truncated = _bounded_diagnostic_count(
+            sum(len(rules) for rules in observed_rules.values())
+        )
+        expected_expr_count, expected_expr_truncated = _bounded_diagnostic_count(
+            expected_expression_count
+        )
+        observed_expr_count, observed_expr_truncated = _bounded_diagnostic_count(
+            observed_expression_count
+        )
+        matched = mismatch_class == "MATCHED_SHAPE"
+        return {
+            "schema": MARKER_DIAGNOSTIC_SCHEMA,
+            "disposition": (
+                "DIAGNOSTIC_STOP_MATCHED_SHAPE"
+                if matched
+                else "DIAGNOSTIC_STOP_MISMATCH"
+            ),
+            "mismatch_class": mismatch_class,
+            "chain_class": MARKER_CHAIN_CLASSES.get(chain, "NONE"),
+            "rule_ordinal": rule_ordinal,
+            "expression_ordinal": expression_ordinal,
+            "expected_expression_kind": expected_kind,
+            "observed_expression_kind": observed_kind,
+            "expected_shape_sha256": expected_shape_sha,
+            "observed_shape_sha256": observed_shape_sha,
+            "shape_digests_equal": expected_shape_sha == observed_shape_sha,
+            "expected_rule_count": expected_rule_count,
+            "observed_rule_count": observed_rule_count,
+            "expected_expression_count": expected_expr_count,
+            "observed_expression_count": observed_expr_count,
+            "count_truncated": any(
+                (
+                    expected_rule_truncated,
+                    observed_rule_truncated,
+                    expected_expr_truncated,
+                    observed_expr_truncated,
+                )
+            ),
+            "expected_shape_supported": expected_supported,
+            "observed_shape_supported": observed_supported,
+            "matched_shape": matched,
+        }
+
+    if not expected_supported or not observed_supported:
+        return result("UNSUPPORTED_STRUCTURE")
+    if malformed_rule is not None:
+        return result("RULE_TYPE")
+
+    for chain in MARKER_CHAIN_ORDER:
+        expected_chain_rules = expected_rules[chain]
+        observed_chain_rules = observed_rules[chain]
+        if len(observed_chain_rules) != len(expected_chain_rules):
+            return result("RULE_COUNT", chain=chain)
+        for rule_index, (expected_rule, observed_rule) in enumerate(
+            zip(expected_chain_rules, observed_chain_rules), start=1
+        ):
+            if not isinstance(observed_rule, dict):
+                return result("RULE_TYPE", chain=chain, rule_ordinal=rule_index)
+            if not {"family", "table", "chain", "expr"}.issubset(observed_rule) or not set(
+                observed_rule
+            ).issubset({"family", "table", "chain", "expr", "handle"}):
+                return result("RULE_KEYS", chain=chain, rule_ordinal=rule_index)
+            if any(
+                observed_rule.get(key) != expected_rule[key]
+                for key in ("family", "table", "chain")
+            ):
+                return result("RULE_IDENTITY", chain=chain, rule_ordinal=rule_index)
+            expected_items = expected_rule["expr"]
+            observed_items = observed_rule.get("expr")
+            if (
+                isinstance(observed_items, list)
+                and not _strict_json_equal(observed_items, expected_items)
+                and any(
+                    _strict_json_equal(observed_items, candidate["expr"])
+                    for candidate_index, candidate in enumerate(
+                        expected_chain_rules, start=1
+                    )
+                    if candidate_index != rule_index
+                )
+            ):
+                return result("RULE_ORDER", chain=chain, rule_ordinal=rule_index)
+            if not isinstance(observed_items, list):
+                return result(
+                    "EXPRESSION_COLLECTION_TYPE",
+                    chain=chain,
+                    rule_ordinal=rule_index,
+                    expected_expression_count=len(expected_items),
+                )
+            if len(observed_items) != len(expected_items):
+                return result(
+                    "EXPRESSION_COUNT",
+                    chain=chain,
+                    rule_ordinal=rule_index,
+                    expected_expression_count=len(expected_items),
+                    observed_expression_count=len(observed_items),
+                )
+            if not _strict_json_equal(observed_items, expected_items) and sorted(
+                canonical_json_sha256(item) for item in observed_items
+            ) == sorted(canonical_json_sha256(item) for item in expected_items):
+                return result(
+                    "EXPRESSION_ORDER",
+                    chain=chain,
+                    rule_ordinal=rule_index,
+                    expected_expression_count=len(expected_items),
+                    observed_expression_count=len(observed_items),
+                )
+            for expression_index, (expected_item, observed_item) in enumerate(
+                zip(expected_items, observed_items), start=1
+            ):
+                expected_kind = _marker_expression_kind(expected_item)
+                observed_kind = _marker_expression_kind(observed_item)
+                common = {
+                    "chain": chain,
+                    "rule_ordinal": rule_index,
+                    "expression_ordinal": expression_index,
+                    "expected_kind": expected_kind,
+                    "observed_kind": observed_kind,
+                    "expected_expression_count": len(expected_items),
+                    "observed_expression_count": len(observed_items),
+                }
+                if not isinstance(observed_item, dict):
+                    return result("EXPRESSION_TYPE", **common)
+                observed_keys = set(observed_item)
+                if observed_keys & MARKER_ACTION_KEYS:
+                    return result("UNEXPECTED_VERDICT_OR_ACTION", **common)
+                if len(observed_keys) != 1:
+                    return result("EXPRESSION_KEYS", **common)
+                if observed_kind != expected_kind:
+                    return result("EXPRESSION_KIND_OR_ORDER", **common)
+                if expected_kind == "MATCH":
+                    expected_match = expected_item["match"]
+                    observed_match = observed_item.get("match")
+                    if not isinstance(observed_match, dict) or set(observed_match) != {
+                        "op",
+                        "left",
+                        "right",
+                    }:
+                        return result("MATCH_KEYS", **common)
+                    if observed_match.get("op") != expected_match["op"]:
+                        return result("MATCH_OPERATOR", **common)
+                    expected_left = expected_match["left"]
+                    observed_left = observed_match.get("left")
+                    if not isinstance(observed_left, dict):
+                        return result("SELECTOR_TYPE", **common)
+                    if set(observed_left) != set(expected_left):
+                        return result("SELECTOR_KIND_OR_KEYS", **common)
+                    selector_key = next(iter(expected_left))
+                    expected_selector = expected_left[selector_key]
+                    observed_selector = observed_left.get(selector_key)
+                    if not isinstance(observed_selector, dict):
+                        return result("SELECTOR_TYPE", **common)
+                    if set(observed_selector) != set(expected_selector):
+                        return result("SELECTOR_KIND_OR_KEYS", **common)
+                    if not _strict_json_equal(observed_selector, expected_selector):
+                        return result("SELECTOR_IDENTITY", **common)
+                    expected_right = expected_match["right"]
+                    observed_right = observed_match.get("right")
+                    if _literal_type_class(observed_right) != _literal_type_class(
+                        expected_right
+                    ):
+                        return result("RIGHT_VALUE_TYPE", **common)
+                    if not _strict_json_equal(observed_right, expected_right):
+                        return result("RIGHT_VALUE_IDENTITY", **common)
+                elif expected_kind == "COUNTER":
+                    expected_counter = expected_item["counter"]
+                    observed_counter = observed_item.get("counter")
+                    if isinstance(observed_counter, dict):
+                        counter_keys = set(observed_counter)
+                        if counter_keys & {"packets", "bytes"}:
+                            return result("COUNTER_DYNAMIC_FIELDS", **common)
+                        if counter_keys != {"name"}:
+                            return result("COUNTER_REFERENCE_KEYS", **common)
+                        return result("COUNTER_REFERENCE_SHAPE", **common)
+                    if not isinstance(observed_counter, str):
+                        return result("COUNTER_REFERENCE_SHAPE", **common)
+                    if observed_counter != expected_counter:
+                        return result("COUNTER_REFERENCE_IDENTITY", **common)
+                else:
+                    return result("EXPRESSION_KIND_OR_ORDER", **common)
+    return result("MATCHED_SHAPE")
+
+
+def marker_diagnostic_state_rows(
+    diagnostic: dict[str, Any],
+) -> list[tuple[str, str, Any]]:
+    if set(diagnostic) != MARKER_DIAGNOSTIC_KEYS:
+        raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    mismatch_class = diagnostic.get("mismatch_class")
+    matched = mismatch_class == "MATCHED_SHAPE"
+    if (
+        diagnostic.get("schema") != MARKER_DIAGNOSTIC_SCHEMA
+        or mismatch_class not in MARKER_MISMATCH_CLASSES
+        or diagnostic.get("disposition")
+        != (
+            "DIAGNOSTIC_STOP_MATCHED_SHAPE"
+            if matched
+            else "DIAGNOSTIC_STOP_MISMATCH"
+        )
+        or diagnostic.get("chain_class") not in {"INPUT", "FORWARD", "OUTPUT", "NONE"}
+        or diagnostic.get("expected_expression_kind") not in MARKER_EXPRESSION_KINDS
+        or diagnostic.get("observed_expression_kind") not in MARKER_EXPRESSION_KINDS
+        or diagnostic.get("matched_shape") is not matched
+        or diagnostic.get("expected_shape_supported") is not True
+        or diagnostic.get("shape_digests_equal")
+        is not (
+            diagnostic.get("expected_shape_sha256")
+            == diagnostic.get("observed_shape_sha256")
+        )
+    ):
+        raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    for key in (
+        "expected_shape_sha256",
+        "observed_shape_sha256",
+    ):
+        if not isinstance(diagnostic.get(key), str) or not re.fullmatch(
+            r"[0-9a-f]{64}", diagnostic[key]
+        ):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    for key in (
+        "shape_digests_equal",
+        "count_truncated",
+        "expected_shape_supported",
+        "observed_shape_supported",
+        "matched_shape",
+    ):
+        if not isinstance(diagnostic.get(key), bool):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    for key in (
+        "rule_ordinal",
+        "expression_ordinal",
+        "expected_rule_count",
+        "observed_rule_count",
+        "expected_expression_count",
+        "observed_expression_count",
+    ):
+        value = diagnostic.get(key)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= MARKER_DIAGNOSTIC_MAX_COUNT
+        ):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    if diagnostic["expected_rule_count"] != 7:
+        raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    return [
+        (f"{MARKER_DIAGNOSTIC_PREFIX}schema", "str", diagnostic["schema"]),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}disposition",
+            "str",
+            diagnostic["disposition"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}mismatch_class",
+            "str",
+            diagnostic["mismatch_class"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}chain_class",
+            "str",
+            diagnostic["chain_class"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}rule_ordinal",
+            "int",
+            diagnostic["rule_ordinal"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expression_ordinal",
+            "int",
+            diagnostic["expression_ordinal"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expected_expression_kind",
+            "str",
+            diagnostic["expected_expression_kind"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}observed_expression_kind",
+            "str",
+            diagnostic["observed_expression_kind"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expected_shape_sha256",
+            "str",
+            diagnostic["expected_shape_sha256"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}observed_shape_sha256",
+            "str",
+            diagnostic["observed_shape_sha256"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}shape_digests_equal",
+            "bool",
+            diagnostic["shape_digests_equal"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expected_rule_count",
+            "int",
+            diagnostic["expected_rule_count"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}observed_rule_count",
+            "int",
+            diagnostic["observed_rule_count"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expected_expression_count",
+            "int",
+            diagnostic["expected_expression_count"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}observed_expression_count",
+            "int",
+            diagnostic["observed_expression_count"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}count_truncated",
+            "bool",
+            diagnostic["count_truncated"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}expected_shape_supported",
+            "bool",
+            diagnostic["expected_shape_supported"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}observed_shape_supported",
+            "bool",
+            diagnostic["observed_shape_supported"],
+        ),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}matched_shape",
+            "bool",
+            diagnostic["matched_shape"],
+        ),
+        (f"{MARKER_DIAGNOSTIC_PREFIX}atomic_install", "bool", True),
+        (
+            f"{MARKER_DIAGNOSTIC_PREFIX}foreign_transaction_unchanged",
+            "bool",
+            True,
+        ),
+        (f"{MARKER_DIAGNOSTIC_PREFIX}ledger_recorded", "bool", True),
+        (f"{MARKER_DIAGNOSTIC_PREFIX}canaries_reachable", "bool", False),
+    ]
+
+
+def publish_marker_diagnostic_state(
+    rows: list[tuple[str, str, Any]],
+    state_path: Path | None = None,
+) -> None:
+    if state_path is None:
+        state_path = MARKER_DIAGNOSTIC_STATE_FILE
+    expected_keys = {
+        f"{MARKER_DIAGNOSTIC_PREFIX}{suffix}"
+        for suffix in (
+            "schema",
+            "disposition",
+            "mismatch_class",
+            "chain_class",
+            "rule_ordinal",
+            "expression_ordinal",
+            "expected_expression_kind",
+            "observed_expression_kind",
+            "expected_shape_sha256",
+            "observed_shape_sha256",
+            "shape_digests_equal",
+            "expected_rule_count",
+            "observed_rule_count",
+            "expected_expression_count",
+            "observed_expression_count",
+            "count_truncated",
+            "expected_shape_supported",
+            "observed_shape_supported",
+            "matched_shape",
+            "atomic_install",
+            "foreign_transaction_unchanged",
+            "ledger_recorded",
+            "canaries_reachable",
+        )
+    }
+    if len(rows) != len(expected_keys) or {row[0] for row in rows} != expected_keys:
+        raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    for key, kind, value in rows:
+        if kind == "bool" and not isinstance(value, bool):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+        if kind == "int" and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= MARKER_DIAGNOSTIC_MAX_COUNT
+        ):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+        if kind == "str" and (
+            not isinstance(value, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}|[0-9a-f]{64}", value)
+        ):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+        if kind not in {"bool", "int", "str"} or not key.startswith(
+            MARKER_DIAGNOSTIC_PREFIX
+        ):
+            raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    payload = ("\n".join(state_line(*row) for row in rows) + "\n").encode("utf-8")
+    if len(payload) > 4096:
+        raise BoundaryError("FIREWALL_MARKER_DIAGNOSTIC_INVALID")
+    try:
+        before = os.lstat(state_path)
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED")
+        if os.name != "nt" and before.st_mode & 0o077:
+            raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED")
+        existing = state_path.read_bytes()
+        if len(existing) > 1024 * 1024 or MARKER_DIAGNOSTIC_PREFIX.encode() in existing:
+            raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED")
+        flags = os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(state_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED")
+            if os.write(descriptor, payload) != len(payload):
+                raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BoundaryError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise BoundaryError("FIREWALL_DIAGNOSTIC_STATE_PUBLICATION_FAILED") from exc
+
+
 def validate_marker_rule_expressions(
     entries: list[dict[str, Any]],
     table_name: str,
@@ -453,7 +1147,8 @@ def validate_marker_rule_expressions(
     gateway_ip: str,
     host_port: int,
 ) -> str:
-    expected = expected_marker_rule_expressions(
+    diagnostic = diagnose_marker_rule_expressions(
+        entries,
         table_name,
         interface,
         subnet,
@@ -463,27 +1158,9 @@ def validate_marker_rule_expressions(
         gateway_ip,
         host_port,
     )
-    observed: dict[str, list[list[dict[str, Any]]]] = {
-        chain: [] for chain in expected
-    }
-    for entry in owned_entries(entries, table_name):
-        rule = entry.get("rule")
-        if not isinstance(rule, dict) or rule.get("chain") not in observed:
-            continue
-        _require_exact_keys(rule, {"family", "table", "chain", "expr"}, {"handle"})
-        expressions = rule.get("expr")
-        if (
-            rule.get("family") != "inet"
-            or rule.get("table") != table_name
-            or not isinstance(expressions, list)
-            or any(not isinstance(expression, dict) for expression in expressions)
-        ):
-            raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
-        observed[rule["chain"]].append(expressions)
-    if observed != expected:
+    if diagnostic["mismatch_class"] != "MATCHED_SHAPE":
         raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
-    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return diagnostic["expected_shape_sha256"]
 
 
 def _require_exact_keys(payload: dict[str, Any], required: set[str], optional: set[str]) -> None:
@@ -1078,11 +1755,6 @@ def install_markers(
     if digest != ledger["owned_sha256"]:
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
     foreign_sha, foreign_counts = canonical_snapshot(before, exclude_table=TABLE)
-    setup_history_changed = (
-        foreign_sha != ledger["preimage_sha256"]
-        or foreign_counts != ledger["preimage_counts"]
-    )
-
     applied = _run([*prefix, "-f", "-"], input_text=batch)
     if applied.returncode != 0:
         raise BoundaryError("FIREWALL_MARKER_ATOMIC_INSTALL_FAILED")
@@ -1091,10 +1763,7 @@ def install_markers(
     post_foreign_sha, post_foreign_counts = canonical_snapshot(
         after, exclude_table=TABLE
     )
-    combined_sha, combined_counts = validate_owned(
-        after, TABLE, markers_installed=True
-    )
-    expression_sha = validate_marker_rule_expressions(
+    diagnostic = diagnose_marker_rule_expressions(
         after,
         TABLE,
         ledger["interface"],
@@ -1105,6 +1774,9 @@ def install_markers(
         gateway_ip,
         host_port,
     )
+    combined_sha, _ = validate_owned(
+        after, TABLE, markers_installed=True
+    )
     marker_sha, marker_counts = canonical_snapshot(marker_entries(after, TABLE))
     if marker_counts != {"chain": 3, "counter": 7, "rule": 7}:
         raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
@@ -1114,73 +1786,11 @@ def install_markers(
     ledger["marker_sha256"] = marker_sha
     ledger["combined_sha256"] = combined_sha
     write_ledger(ledger_path, ledger)
-    emit(
-        [
-            ("firewall.markers.atomic_install", "bool", True),
-            (
-                "firewall.markers.original_cleanup_preimage_sha256",
-                "str",
-                ledger["preimage_sha256"],
-            ),
-            ("firewall.markers.foreign_pre_sha256", "str", foreign_sha),
-            (
-                "firewall.markers.foreign_pre_table_count",
-                "int",
-                foreign_counts.get("table", 0),
-            ),
-            (
-                "firewall.markers.foreign_pre_chain_count",
-                "int",
-                foreign_counts.get("chain", 0),
-            ),
-            (
-                "firewall.markers.foreign_pre_rule_count",
-                "int",
-                foreign_counts.get("rule", 0),
-            ),
-            (
-                "firewall.markers.foreign_pre_counter_count",
-                "int",
-                foreign_counts.get("counter", 0),
-            ),
-            ("firewall.markers.foreign_post_sha256", "str", post_foreign_sha),
-            (
-                "firewall.markers.foreign_post_table_count",
-                "int",
-                post_foreign_counts.get("table", 0),
-            ),
-            (
-                "firewall.markers.foreign_post_chain_count",
-                "int",
-                post_foreign_counts.get("chain", 0),
-            ),
-            (
-                "firewall.markers.foreign_post_rule_count",
-                "int",
-                post_foreign_counts.get("rule", 0),
-            ),
-            (
-                "firewall.markers.foreign_post_counter_count",
-                "int",
-                post_foreign_counts.get("counter", 0),
-            ),
-            ("firewall.markers.foreign_transaction_unchanged", "bool", True),
-            (
-                "firewall.markers.setup_history_changed_from_original",
-                "bool",
-                setup_history_changed,
-            ),
-            ("firewall.markers.expression_contract_sha256", "str", expression_sha),
-            ("firewall.markers.sha256", "str", marker_sha),
-            ("firewall.markers.combined_sha256", "str", combined_sha),
-            ("firewall.markers.chain_count", "int", marker_counts["chain"]),
-            ("firewall.markers.counter_count", "int", marker_counts["counter"]),
-            ("firewall.markers.rule_count", "int", marker_counts["rule"]),
-            ("firewall.markers.owned_chain_count", "int", combined_counts["chain"]),
-            ("firewall.markers.owned_counter_count", "int", combined_counts["counter"]),
-            ("firewall.markers.owned_rule_count", "int", combined_counts["rule"]),
-        ]
-    )
+    rows = marker_diagnostic_state_rows(diagnostic)
+    publish_marker_diagnostic_state(rows)
+    if diagnostic["mismatch_class"] == "MATCHED_SHAPE":
+        raise BoundaryError("FIREWALL_DIAGNOSTIC_STOP_MATCHED_SHAPE")
+    raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
 
 
 def counters(ledger_path: Path) -> None:
