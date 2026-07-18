@@ -98,6 +98,7 @@ CLEANUP_ORIGINAL_MODE=""
 CLEANUP_FIREWALL_REQUIRED=""
 CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
 DOCKER_CLEANUP_QUERY_VALUES=()
+DOCKER_CLEANUP_QUERY_RECORDS=()
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
 EXPECTED_OUTPUT_DENIES=0
@@ -1107,8 +1108,10 @@ stop_host_test_listener() {
 }
 
 cleanup_firewall_boundary() {
-  local pre_firewall_container_count="$1" cleanup_mode_rc="$2" pre_firewall_network_count="$3" firewall_code
+  local pre_firewall_container_count="$1" cleanup_mode_rc="$2" pre_firewall_network_count="$3"
+  local pre_firewall_volume_count="$4" firewall_code
   record cleanup.containers_before_firewall_remove int "$pre_firewall_container_count"
+  record cleanup.volumes_before_firewall_remove int "$pre_firewall_volume_count"
   record cleanup.networks_before_firewall_remove int "$pre_firewall_network_count"
   if [[ "$pre_firewall_container_count" != "0" ]]; then
     record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE
@@ -1116,6 +1119,10 @@ cleanup_firewall_boundary() {
   fi
   if [[ "$pre_firewall_network_count" != "0" ]]; then
     record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_NETWORK_RESIDUE
+    return 1
+  fi
+  if [[ "$pre_firewall_volume_count" != "0" ]]; then
+    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_VOLUME_RESIDUE
     return 1
   fi
   if [[ "$cleanup_mode_rc" != "0" ]]; then
@@ -1162,52 +1169,108 @@ record_cleanup_docker_query_failure() {
   record cleanup.docker_query.failure_class str "$failure_class"
 }
 
+docker_cleanup_parse_query_file() {
+  local resource="$1" phase="$2" query_output="$3" size last_byte value framed_size=0
+  local -a records=()
+  local -A query_seen=()
+  DOCKER_CLEANUP_QUERY_RECORDS=()
+  if [[ ! -f "$query_output" || -L "$query_output" ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+    return 1
+  fi
+  if ! size="$(stat -c '%s' -- "$query_output" 2>>"$RAW/cleanup-docker-query.log")" \
+    || [[ ! "$size" =~ ^[0-9]+$ ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+    return 1
+  fi
+  [[ "$size" != "0" ]] || return 0
+  if ! last_byte="$(od -An -tu1 -j "$((size - 1))" -N 1 -- "$query_output" \
+    2>>"$RAW/cleanup-docker-query.log" | tr -d '[:space:]')" \
+    || [[ "$last_byte" != "10" ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+    return 1
+  fi
+  if ! mapfile -t records <"$query_output" || [[ "${#records[@]}" == "0" ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+    return 1
+  fi
+  for value in "${records[@]}"; do
+    case "$resource" in
+      CONTAINER|NETWORK) [[ "$value" =~ ^[0-9a-f]{64}$ ]] ;;
+      VOLUME) [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] ;;
+      *) return 1 ;;
+    esac || {
+      record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+      return 1
+    }
+    if [[ -n "${query_seen[$value]+present}" ]]; then
+      record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+      return 1
+    fi
+    query_seen["$value"]=1
+    framed_size=$((framed_size + ${#value} + 1))
+  done
+  if [[ "$framed_size" != "$size" ]]; then
+    record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
+    return 1
+  fi
+  DOCKER_CLEANUP_QUERY_RECORDS=("${records[@]}")
+}
+
 docker_cleanup_query_ids() {
-  local resource="$1" phase="$2" filter output value
+  local resource="$1" phase="$2" filter query_output parse_rc value
   local -a values=()
   local -A seen=()
+  case "$resource" in CONTAINER|VOLUME|NETWORK) ;; *) return 1 ;; esac
   DOCKER_CLEANUP_QUERY_VALUES=()
   for filter in \
     "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" \
     "label=io.fawxzzy.packet=${DIRECT_PACKET}" \
     "label=io.fawxzzy.packet=${FIREWALL_PACKET}" \
     "label=com.supabase.cli.project=${PROJECT}"; do
+    if ! query_output="$(mktemp "$RAW/cleanup-docker-query.XXXXXX")"; then
+      record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+      return 1
+    fi
     case "$resource" in
       CONTAINER)
-        if ! output="$(docker ps -aq --no-trunc --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+        if ! docker ps -aq --no-trunc --filter "$filter" >"$query_output" \
+          2>>"$RAW/cleanup-docker-query.log"; then
           record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          rm -f -- "$query_output" 2>>"$RAW/cleanup-docker-query.log" || return 1
           return 1
         fi
         ;;
       VOLUME)
-        if ! output="$(docker volume ls -q --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+        if ! docker volume ls -q --filter "$filter" >"$query_output" \
+          2>>"$RAW/cleanup-docker-query.log"; then
           record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          rm -f -- "$query_output" 2>>"$RAW/cleanup-docker-query.log" || return 1
           return 1
         fi
         ;;
       NETWORK)
-        if ! output="$(docker network ls --no-trunc -q --filter "$filter" 2>>"$RAW/cleanup-docker-query.log")"; then
+        if ! docker network ls --no-trunc -q --filter "$filter" >"$query_output" \
+          2>>"$RAW/cleanup-docker-query.log"; then
           record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+          rm -f -- "$query_output" 2>>"$RAW/cleanup-docker-query.log" || return 1
           return 1
         fi
         ;;
-      *) return 1 ;;
     esac
-    [[ -n "$output" ]] || continue
-    while IFS= read -r value || [[ -n "$value" ]]; do
-      case "$resource" in
-        CONTAINER|NETWORK) [[ "$value" =~ ^[0-9a-f]{64}$ ]] ;;
-        VOLUME) [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] ;;
-      esac || {
-        record_cleanup_docker_query_failure "$phase" "$resource" LIST MALFORMED_OUTPUT
-        DOCKER_CLEANUP_QUERY_VALUES=()
-        return 1
-      }
+    parse_rc=0
+    docker_cleanup_parse_query_file "$resource" "$phase" "$query_output" || parse_rc=1
+    if ! rm -f -- "$query_output" 2>>"$RAW/cleanup-docker-query.log"; then
+      record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
+      return 1
+    fi
+    [[ "$parse_rc" == "0" ]] || return 1
+    for value in "${DOCKER_CLEANUP_QUERY_RECORDS[@]}"; do
       if [[ -z "${seen[$value]+present}" ]]; then
         seen["$value"]=1
         values+=("$value")
       fi
-    done <<<"$output"
+    done
   done
   DOCKER_CLEANUP_QUERY_VALUES=("${values[@]}")
 }
@@ -1270,7 +1333,7 @@ docker_cleanup_verify_ownership() {
 
 cleanup_exact() {
   local id listener_count="" container_count="" volume_count="" network_count=""
-  local pre_firewall_container_count="" pre_firewall_network_count=""
+  local pre_firewall_container_count="" pre_firewall_volume_count="" pre_firewall_network_count=""
   local cleanup_mode_rc=0 cleanup_query_rc=0 firewall_rc=0 firewall_code
   local -a container_ids=() volume_names=() network_ids=()
   CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
@@ -1329,13 +1392,20 @@ cleanup_exact() {
   else
     cleanup_query_rc=1
   fi
+  if docker_cleanup_query_ids VOLUME PRE_FIREWALL; then
+    pre_firewall_volume_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
+  else
+    cleanup_query_rc=1
+  fi
   if docker_cleanup_query_ids NETWORK PRE_FIREWALL; then
     pre_firewall_network_count="${#DOCKER_CLEANUP_QUERY_VALUES[@]}"
   else
     cleanup_query_rc=1
   fi
-  if [[ -n "$pre_firewall_container_count" && -n "$pre_firewall_network_count" ]]; then
-    cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" "$pre_firewall_network_count" || firewall_rc=1
+  if [[ "$cleanup_query_rc" == "0" && -n "$pre_firewall_container_count" \
+    && -n "$pre_firewall_volume_count" && -n "$pre_firewall_network_count" ]]; then
+    cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" \
+      "$pre_firewall_network_count" "$pre_firewall_volume_count" || firewall_rc=1
   else
     firewall_rc=1
     record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_DOCKER_QUERY_FAILURE

@@ -489,6 +489,10 @@ validate_network_ipam_contract fixture-network after-create
             boundary.index('firewall_boundary.py" remove'),
         )
         self.assertLess(
+            boundary.index('record cleanup.volumes_before_firewall_remove'),
+            boundary.index('firewall_boundary.py" remove'),
+        )
+        self.assertLess(
             boundary.index('record cleanup.networks_before_firewall_remove'),
             boundary.index('firewall_boundary.py" remove'),
         )
@@ -668,10 +672,16 @@ rm -f "$CLEANUP_MODE_STAGE_FILE"
         functions = self.runner_functions(
             "record",
             "record_cleanup_docker_query_failure",
+            "docker_cleanup_parse_query_file",
             "docker_cleanup_query_ids",
         )
 
-        def execute(resource: str, fail_call: int = 0, malformed: bool = False) -> subprocess.CompletedProcess[str]:
+        def execute(
+            resource: str,
+            fail_call: int = 0,
+            malformed: bool = False,
+            valid_output: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).as_posix()
                 script = f"""set -Eeuo pipefail
@@ -685,42 +695,46 @@ FIREWALL_PACKET=firewall
 PROJECT=project
 CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
 DOCKER_CLEANUP_QUERY_VALUES=()
+DOCKER_CLEANUP_QUERY_RECORDS=()
 printf '0\n' >"$ROOT/docker-call"
 FAIL_CALL={fail_call}
 MALFORMED={'1' if malformed else '0'}
+VALID_OUTPUT={'1' if valid_output else '0'}
 docker() {{
   DOCKER_CALL="$(<"$ROOT/docker-call")"
   DOCKER_CALL=$((DOCKER_CALL + 1))
   printf '%s\n' "$DOCKER_CALL" >"$ROOT/docker-call"
   if [[ "$FAIL_CALL" != 0 && "$DOCKER_CALL" == "$FAIL_CALL" ]]; then
+    printf '%064d\n' 0
     return 1
   fi
   if [[ "$MALFORMED" == 1 ]]; then
     printf 'not admitted output\n'
+  elif [[ "$VALID_OUTPUT" == 1 ]]; then
+    printf '%064d\n' 0
   fi
 }}
 {functions}
 set +e
 docker_cleanup_query_ids {resource} FINAL_RESIDUE
 rc="$?"
-printf 'RC:%s COUNT:%s CALLS:%s\n' "$rc" "${{#DOCKER_CLEANUP_QUERY_VALUES[@]}}" "$(<"$ROOT/docker-call")"
+residue="$(find "$RAW" -maxdepth 1 -type f -name 'cleanup-docker-query.??????' | wc -l)"
+printf 'RC:%s COUNT:%s CALLS:%s RESIDUE:%s\n' "$rc" "${{#DOCKER_CLEANUP_QUERY_VALUES[@]}}" "$(<"$ROOT/docker-call")" "$residue"
 cat "$STATE_FILE" 2>/dev/null || true
 exit "$rc"
 """
                 return self.run_bash(script)
 
         for resource in ("CONTAINER", "VOLUME", "NETWORK"):
-            with self.subTest(resource=resource, kind="daemon-or-command-failure"):
-                failed = execute(resource, fail_call=1)
-                self.assertNotEqual(failed.returncode, 0)
-                self.assertIn("RC:1 COUNT:0 CALLS:1", failed.stdout)
-                self.assertIn(f"cleanup.docker_query.resource\tstr\t{resource}", failed.stdout)
-                self.assertIn("cleanup.docker_query.failure_class\tstr\tCOMMAND_FAILED", failed.stdout)
-            with self.subTest(resource=resource, kind="partial-filter-failure"):
-                partial = execute(resource, fail_call=3)
-                self.assertNotEqual(partial.returncode, 0)
-                self.assertIn("RC:1 COUNT:0 CALLS:3", partial.stdout)
-                self.assertIn("cleanup.docker_query.operation\tstr\tLIST", partial.stdout)
+            for fail_call in range(1, 5):
+                with self.subTest(resource=resource, kind="filter-failure", call=fail_call):
+                    failed = execute(resource, fail_call=fail_call)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn(f"RC:1 COUNT:0 CALLS:{fail_call} RESIDUE:0", failed.stdout)
+                    self.assertIn(f"cleanup.docker_query.resource\tstr\t{resource}", failed.stdout)
+                    self.assertIn("cleanup.docker_query.failure_class\tstr\tCOMMAND_FAILED", failed.stdout)
+                    self.assertIn("cleanup.docker_query.operation\tstr\tLIST", failed.stdout)
+                    self.assertNotIn("0" * 64, failed.stdout)
             with self.subTest(resource=resource, kind="malformed"):
                 malformed = execute(resource, malformed=True)
                 self.assertNotEqual(malformed.returncode, 0)
@@ -728,8 +742,78 @@ exit "$rc"
             with self.subTest(resource=resource, kind="successful-empty"):
                 empty = execute(resource)
                 self.assertEqual(empty.returncode, 0, empty.stderr)
-                self.assertIn("RC:0 COUNT:0 CALLS:4", empty.stdout)
+                self.assertIn("RC:0 COUNT:0 CALLS:4 RESIDUE:0", empty.stdout)
                 self.assertNotIn("cleanup.docker_query.", empty.stdout)
+            with self.subTest(resource=resource, kind="cross-filter-overlap"):
+                overlap = execute(resource, valid_output=True)
+                self.assertEqual(overlap.returncode, 0, overlap.stderr)
+                self.assertIn("RC:0 COUNT:1 CALLS:4 RESIDUE:0", overlap.stdout)
+
+    def test_cleanup_docker_query_framing_rejects_blank_duplicate_and_ambiguous_records(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "record_cleanup_docker_query_failure",
+            "docker_cleanup_parse_query_file",
+        )
+        valid_a = b"a" * 64
+        valid_b = b"b" * 64
+
+        def execute(payload: bytes) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root_path = Path(directory)
+                raw = root_path / "raw"
+                raw.mkdir()
+                query = raw / "query.out"
+                query.write_bytes(payload)
+                script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root_path.as_posix())}
+RAW="$ROOT/raw"
+STATE_FILE="$ROOT/state.tsv"
+CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
+DOCKER_CLEANUP_QUERY_RECORDS=()
+{functions}
+set +e
+docker_cleanup_parse_query_file CONTAINER FINAL_RESIDUE "$RAW/query.out"
+rc="$?"
+printf 'RC:%s COUNT:%s\n' "$rc" "${{#DOCKER_CLEANUP_QUERY_RECORDS[@]}}"
+cat "$STATE_FILE" 2>/dev/null || true
+exit "$rc"
+"""
+                return self.run_bash(script)
+
+        accepted = {
+            "zero-byte": b"",
+            "one-record": valid_a + b"\n",
+            "two-records": valid_a + b"\n" + valid_b + b"\n",
+        }
+        for name, payload in accepted.items():
+            with self.subTest(name=name):
+                result = execute(payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("MALFORMED_OUTPUT", result.stdout)
+
+        rejected = {
+            "one-blank": b"\n",
+            "multiple-blank": b"\n\n",
+            "spaces": b"   \n",
+            "tabs": b"\t\n",
+            "crlf-only": b"\r\n",
+            "valid-crlf": valid_a + b"\r\n",
+            "trailing-blank": valid_a + b"\n\n",
+            "middle-blank": valid_a + b"\n\n" + valid_b + b"\n",
+            "valid-plus-spaces": valid_a + b"\n \n",
+            "malformed-id": b"abc\n",
+            "duplicate-id": valid_a + b"\n" + valid_a + b"\n",
+            "unterminated-record": valid_a,
+            "nul-in-record": valid_a[:32] + b"\x00" + valid_a[32:] + b"\n",
+            "invalid-byte": b"\xff\n",
+        }
+        for name, payload in rejected.items():
+            with self.subTest(name=name):
+                result = execute(payload)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cleanup.docker_query.failure_class\tstr\tMALFORMED_OUTPUT", result.stdout)
+                self.assertIn("RC:1 COUNT:0", result.stdout)
 
     def test_cleanup_docker_ownership_reads_are_explicit_and_fail_closed(self) -> None:
         functions = self.runner_functions(
@@ -800,6 +884,12 @@ exit "$rc"
         )
         self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_DOCKER_QUERY_FAILURE", cleanup)
         self.assertIn('[[ "$cleanup_query_rc" == "0" ]] || return 1', cleanup)
+        self.assertRegex(
+            cleanup,
+            r'if \[\[ "\$cleanup_query_rc" == "0" && -n "\$pre_firewall_container_count" '
+            r'\\\n\s+&& -n "\$pre_firewall_volume_count" && -n "\$pre_firewall_network_count" \]\]; then',
+        )
+        self.assertEqual(cleanup.count("cleanup_query_rc=0"), 1)
         self.assertLess(
             cleanup.index("docker_cleanup_query_ids CONTAINER PRE_FIREWALL"),
             cleanup.index("cleanup_firewall_boundary"),
@@ -807,6 +897,83 @@ exit "$rc"
         self.assertNotIn('record cleanup.containers_remaining int "0"', cleanup)
         self.assertNotIn('record cleanup.volumes_remaining int "0"', cleanup)
         self.assertNotIn('record cleanup.networks_remaining int "0"', cleanup)
+
+    def test_cumulative_query_failure_always_withholds_firewall_removal(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "record_cleanup_docker_query_failure",
+            "docker_cleanup_parse_query_file",
+            "docker_cleanup_query_ids",
+            "docker_cleanup_verify_ownership",
+            "cleanup_exact",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).as_posix()
+            script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root)}
+MODE=firewall-rehearsal
+DB_PORT=56422
+CONTAINMENT_PACKET=containment
+DIRECT_PACKET=direct
+FIREWALL_PACKET=firewall
+PROJECT=project
+FIREWALL_LEDGER="$ROOT/firewall-ledger"
+LISTENER_SNAPSHOT_COUNT=0
+LISTENER_FAILURE_CODE=""
+LISTENER_LAST_PHASE=""
+SCENARIO=EMPTY
+FAIL_AT=0
+DOCKER_CALL=0
+CURRENT_CASE=""
+docker() {{
+  DOCKER_CALL=$((DOCKER_CALL + 1))
+  if [[ "$FAIL_AT" != 0 && "$DOCKER_CALL" == "$FAIL_AT" ]]; then return 1; fi
+  if [[ "$SCENARIO" == OWNERSHIP_FAIL || "$SCENARIO" == OWNERSHIP_MISMATCH ]]; then
+    if [[ "$1" == ps && "$DOCKER_CALL" == 1 ]]; then printf '%064d\\n' 0; return 0; fi
+    if [[ "$1" == inspect ]]; then
+      if [[ "$SCENARIO" == OWNERSHIP_FAIL && "$DOCKER_CALL" == 5 ]]; then return 1; fi
+      if [[ "$SCENARIO" == OWNERSHIP_MISMATCH ]]; then printf '<no value>\\n'; else printf 'project\\n'; fi
+    fi
+  fi
+}}
+resolve_cleanup_mode_contract() {{ return 0; }}
+stop_docker_api_observer() {{ return 0; }}
+stop_watcher() {{ return 0; }}
+stop_host_test_listener() {{ return 0; }}
+cleanup_firewall_boundary() {{ printf 'CALLED\\n' >"$ROOT/$CURRENT_CASE.firewall"; return 0; }}
+capture_listener_snapshot() {{ LISTENER_SNAPSHOT_COUNT=0; return 0; }}
+native_listener_contract() {{ return 0; }}
+timeout() {{ return 1; }}
+{functions}
+run_case() {{
+  CURRENT_CASE="$1"
+  SCENARIO="$2"
+  FAIL_AT="$3"
+  DOCKER_CALL=0
+  CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
+  DOCKER_CLEANUP_QUERY_VALUES=()
+  DOCKER_CLEANUP_QUERY_RECORDS=()
+  RAW="$ROOT/$CURRENT_CASE.raw"
+  STATE_FILE="$ROOT/$CURRENT_CASE.tsv"
+  mkdir -p "$RAW"
+  if cleanup_exact; then return 90; fi
+  [[ ! -e "$ROOT/$CURRENT_CASE.firewall" ]]
+  grep -Fq $'cleanup.firewall.failure_code\\tstr\\tFIREWALL_REMOVE_BLOCKED_BY_DOCKER_QUERY_FAILURE' "$STATE_FILE"
+}}
+for fail_at in 1 5 9 13 17 21; do run_case "LIST-$fail_at" EMPTY "$fail_at"; done
+run_case OWNERSHIP-FAIL OWNERSHIP_FAIL 0
+run_case OWNERSHIP-MISMATCH OWNERSHIP_MISMATCH 0
+printf 'CASES:8\\n'
+"""
+            completed = subprocess.run(
+                [BASH],
+                input=script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "CASES:8\n")
 
     def test_mode_aware_firewall_cleanup_never_uses_evidence_absence_as_the_selector(self) -> None:
         functions = self.runner_functions("record", "cleanup_firewall_boundary")
@@ -817,6 +984,7 @@ exit "$rc"
             helper_rc: int = 0,
             mode_rc: int = 0,
             precontainers: int = 0,
+            prevolumes: int = 0,
             prenetworks: int = 0,
             create_ledger: bool = False,
         ) -> subprocess.CompletedProcess[str]:
@@ -848,7 +1016,7 @@ python3() {{
 {functions}
 {'touch "$FIREWALL_LEDGER"' if create_ledger else ':'}
 set +e
-cleanup_firewall_boundary {precontainers} {mode_rc} {prenetworks}
+cleanup_firewall_boundary {precontainers} {mode_rc} {prenetworks} {prevolumes}
 rc="$?"
 if [[ -f "$ROOT/helper.calls" ]]; then
   printf 'CALLS:%s\n' "$(wc -l <"$ROOT/helper.calls")"
@@ -885,6 +1053,10 @@ exit "$rc"
         self.assertNotEqual(network_residue.returncode, 0)
         self.assertIn("CALLS:0", network_residue.stdout)
         self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_NETWORK_RESIDUE", network_residue.stdout)
+        volume_residue = execute("firewall-rehearsal", "true", prevolumes=1)
+        self.assertNotEqual(volume_residue.returncode, 0)
+        self.assertIn("CALLS:0", volume_residue.stdout)
+        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_VOLUME_RESIDUE", volume_residue.stdout)
 
     def test_finalize_result_writer_failure_blocks_pass_and_preserves_prior_failure(self) -> None:
         functions = self.runner_functions("record", "current_failure_code", "finalize")
