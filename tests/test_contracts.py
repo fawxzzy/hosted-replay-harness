@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import re
@@ -9,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +47,9 @@ subnets = load_module("check_subnet", "scripts/check_subnet.py")
 db_start_log = load_module("classify_db_start_log", "scripts/classify_db_start_log.py")
 docker_events = load_module("classify_docker_events", "scripts/classify_docker_events.py")
 direct_port = load_module("direct_port_probe", "scripts/direct_port_probe.py")
+docker_api_boundary = load_module(
+    "docker_api_boundary", "scripts/docker_api_boundary.py"
+)
 
 
 class PinContractTests(unittest.TestCase):
@@ -269,10 +275,49 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner.index(raw_delete), self.runner.index('EVENT_UNTIL="$((')
         )
         self.assertNotIn('cat "$RAW/supabase-db-start.log"', self.runner)
-        self.assertRegex(
-            self.runner,
-            r'(?s)if \[\[ "\$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" \]\]; then\s+block OTHER_PRECONTAINER_FAILURE',
+        for code in (
+            "NO_DOCKER_API_REQUEST_OBSERVED",
+            "DOCKER_API_ERROR_RESPONSE_OBSERVED",
+            "DOCKER_API_BOUNDARY_OBSERVED",
+            "OTHER_PRECONTAINER_FAILURE",
+        ):
+            self.assertIn(f"block {code}", self.runner)
+        no_mutation = self.runner.index(
+            'if [[ "$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" ]]'
         )
+        self.assertLess(
+            self.runner.index("case \"$docker_api_classification\" in", no_mutation),
+            self.runner.index("block OTHER_PRECONTAINER_FAILURE", no_mutation),
+        )
+
+    def test_docker_api_observer_is_scoped_to_the_cli_child(self) -> None:
+        child_env = 'env DOCKER_HOST="unix://$DOCKER_API_SOCKET"'
+        self.assertEqual(self.runner.count(child_env), 1)
+        self.assertNotIn("export DOCKER_HOST", self.runner)
+        observer_start = self.runner.index(
+            'python3 -B "$ROOT/scripts/docker_api_boundary.py"'
+        )
+        cli_start = self.runner.index('db start >"$RAW/supabase-db-start.log"')
+        observer_stop = self.runner.index("stop_docker_api_observer", cli_start)
+        self.assertLess(observer_start, cli_start)
+        self.assertLess(cli_start, observer_stop)
+        self.assertIn(
+            '[[ "$(stat -c \'%a\' "$DOCKER_API_SOCKET")" == "600" ]]',
+            self.runner,
+        )
+        self.assertIn(
+            '[[ "$(stat -c \'%a\' "$DOCKER_API_READY")" == "600" ]]',
+            self.runner,
+        )
+
+    def test_docker_api_observer_state_is_sanitized_and_transient(self) -> None:
+        self.assertIn("DOCKER_API_OBSERVER_STATE_MISSING", self.runner)
+        self.assertIn("DOCKER_API_OBSERVER_FAILED", self.runner)
+        self.assertIn("DOCKER_API_RESPONSE_INCOMPLETE", self.runner)
+        self.assertIn("OBSERVER_FORWARDING_FAILED", self.runner)
+        self.assertNotIn('cat "$RAW/docker-api-observer.log"', self.runner)
+        self.assertIn('cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"', self.runner)
+        self.assertIn('rm -rf -- "$RUNTIME"', self.runner)
 
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
         freeze = "freeze_precli_objects_and_listeners"
@@ -746,6 +791,213 @@ class ResultWriterTests(unittest.TestCase):
             observed = result["supabase_cli"]["db_start_diagnostic"]
             self.assertEqual(observed, diagnostic)
             self.assertNotIn("opaque diagnostic fixture", output.read_text(encoding="utf-8"))
+
+
+class DockerApiBoundaryTests(unittest.TestCase):
+    class FakeReader:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = deque(chunks)
+
+        async def read(self, _size: int) -> bytes:
+            await asyncio.sleep(0)
+            return self.chunks.popleft() if self.chunks else b""
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.eof = False
+            self.closed = False
+
+        def write(self, data: bytes) -> None:
+            self.data.extend(data)
+
+        async def drain(self) -> None:
+            await asyncio.sleep(0)
+
+        def write_eof(self) -> None:
+            self.eof = True
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            await asyncio.sleep(0)
+
+    def test_zero_requests_has_stable_closed_receipt(self) -> None:
+        first = docker_api_boundary.Receipt().sanitized()
+        second = docker_api_boundary.Receipt().sanitized()
+        self.assertEqual(first, second)
+        self.assertEqual(first["classification"], "NO_DOCKER_API_REQUEST_OBSERVED")
+        self.assertRegex(first["canonical_sha256"], r"^[0-9a-f]{64}$")
+        rendered = docker_api_boundary.format_state_lines(first)
+        self.assertNotIn("/var/run", rendered)
+        self.assertNotIn("DOCKER_HOST", rendered)
+
+    def test_fixed_path_templates_and_version_normalization(self) -> None:
+        cases = {
+            (b"GET", b"/v1.47/_ping"): "API_NEGOTIATION",
+            (b"GET", b"/version"): "API_NEGOTIATION",
+            (b"GET", b"/v1.47/images/pinned@sha256:opaque/json"): "IMAGE_INSPECT",
+            (b"GET", b"/networks/opaque?verbose=true"): "NETWORK_INSPECT_REUSE",
+            (b"GET", b"/v1.47/volumes/opaque"): "VOLUME_INSPECT",
+            (b"POST", b"/v1.47/volumes/create"): "VOLUME_CREATE",
+            (b"POST", b"/containers/create?name=opaque"): "CONTAINER_CREATE",
+            (b"GET", b"/v1.47/not-allowlisted/opaque?token=secret"): "UNKNOWN_API_PHASE",
+        }
+        for (method, target), expected in cases.items():
+            with self.subTest(target=target):
+                self.assertEqual(
+                    docker_api_boundary.classify_path(method, target), expected
+                )
+        self.assertEqual(
+            docker_api_boundary.normalize_path(b"/v1.47/_ping?opaque=value"),
+            b"/_ping",
+        )
+
+    def test_partial_chunked_and_keepalive_framing(self) -> None:
+        receipt = docker_api_boundary.Receipt()
+        pending: deque[tuple[str, bytes]] = deque()
+        requests = docker_api_boundary.RequestParser(receipt, pending)
+        responses = docker_api_boundary.ResponseParser(receipt, pending)
+        request_bytes = (
+            b"POST /v1.47/volumes/create HTTP/1.1\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"4\r\nDATA\r\n0\r\n\r\n"
+            b"GET /v1.47/images/opaque/json HTTP/1.1\r\n\r\n"
+        )
+        response_bytes = (
+            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}"
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"2\r\n{}\r\n0\r\n\r\n"
+        )
+        for offset in range(0, len(request_bytes), 3):
+            requests.feed(request_bytes[offset : offset + 3])
+        for offset in range(0, len(response_bytes), 5):
+            responses.feed(response_bytes[offset : offset + 5])
+        result = receipt.sanitized()
+        self.assertEqual(result["request_count"], 2)
+        self.assertEqual(result["response_count"], 2)
+        self.assertEqual(result["phase_counts"]["VOLUME_CREATE"], 1)
+        self.assertEqual(result["phase_counts"]["IMAGE_INSPECT"], 1)
+        self.assertEqual(result["status_code_counts"]["CODE_201"], 1)
+        self.assertEqual(result["classification"], "DOCKER_API_REQUESTS_OBSERVED")
+
+    def test_error_response_records_only_allowlisted_status(self) -> None:
+        receipt = docker_api_boundary.Receipt()
+        receipt.request("CONTAINER_CREATE", "WRITE")
+        receipt.response("CONTAINER_CREATE", 500)
+        result = receipt.sanitized()
+        self.assertEqual(result["classification"], "DOCKER_API_ERROR_RESPONSE_OBSERVED")
+        self.assertEqual(result["first_error_phase"], "CONTAINER_CREATE")
+        self.assertEqual(result["first_error_status_code"], 500)
+        self.assertEqual(result["status_code_counts"]["CODE_500"], 1)
+
+    def test_sensitive_input_is_never_retained(self) -> None:
+        receipt = docker_api_boundary.Receipt()
+        pending: deque[tuple[str, bytes]] = deque()
+        parser = docker_api_boundary.RequestParser(receipt, pending)
+        sensitive = (
+            b"POST /v1.47/containers/create?token=do-not-retain HTTP/1.1\r\n"
+            b"Authorization: Bearer fake.jwt.value\r\n"
+            b"Content-Length: 32\r\n\r\n"
+            b'{"password":"do-not-retain-now"}'
+        )
+        parser.feed(sensitive)
+        rendered = docker_api_boundary.format_state_lines(receipt.sanitized())
+        for forbidden in (
+            "do-not-retain",
+            "Authorization",
+            "Bearer",
+            "password",
+            "containers/create",
+            "token=",
+            "fake.jwt.value",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_schema_rejects_unknown_keys_types_and_values(self) -> None:
+        valid = docker_api_boundary.Receipt().sanitized()
+        unknown = dict(valid)
+        unknown["raw_path"] = "/containers/secret"
+        with self.assertRaises(ValueError):
+            docker_api_boundary.validate_result(unknown)
+        bad_type = dict(valid)
+        bad_type["request_count"] = "0"
+        with self.assertRaises(ValueError):
+            docker_api_boundary.validate_result(bad_type)
+        bad_phase = dict(valid)
+        bad_phase["first_phase"] = "RAW_PATH"
+        with self.assertRaises(ValueError):
+            docker_api_boundary.validate_result(bad_phase)
+        bad_digest = dict(valid)
+        bad_digest["canonical_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            docker_api_boundary.validate_result(bad_digest)
+
+    def test_relay_is_byte_exact_for_concurrent_connections(self) -> None:
+        async def exercise() -> tuple[bytes, bytes, object]:
+            receipt = docker_api_boundary.Receipt()
+            server = docker_api_boundary.BoundaryServer(
+                Path("packet.sock"), Path("docker.sock"), receipt
+            )
+            payload_a = b"GET /_ping HTTP/1.1\r\n\r\n"
+            payload_b = b"GET /v1.47/networks/opaque HTTP/1.1\r\n\r\n"
+            writer_a = self.FakeWriter()
+            writer_b = self.FakeWriter()
+            pending_a: deque[tuple[str, bytes]] = deque()
+            pending_b: deque[tuple[str, bytes]] = deque()
+            receipt.connect()
+            receipt.connect()
+            await asyncio.gather(
+                server.relay(
+                    self.FakeReader([payload_a[:7], payload_a[7:]]),
+                    writer_a,
+                    docker_api_boundary.RequestParser(receipt, pending_a),
+                ),
+                server.relay(
+                    self.FakeReader([payload_b[:11], payload_b[11:]]),
+                    writer_b,
+                    docker_api_boundary.RequestParser(receipt, pending_b),
+                ),
+            )
+            return bytes(writer_a.data), bytes(writer_b.data), receipt.sanitized()
+
+        forwarded_a, forwarded_b, result = asyncio.run(exercise())
+        self.assertEqual(forwarded_a, b"GET /_ping HTTP/1.1\r\n\r\n")
+        self.assertEqual(
+            forwarded_b, b"GET /v1.47/networks/opaque HTTP/1.1\r\n\r\n"
+        )
+        self.assertEqual(result["connection_count"], 2)
+        self.assertEqual(result["request_count"], 2)
+
+    def test_upstream_failure_is_fail_closed(self) -> None:
+        async def exercise() -> object:
+            receipt = docker_api_boundary.Receipt()
+            server = docker_api_boundary.BoundaryServer(
+                Path("packet.sock"), Path("missing.sock"), receipt
+            )
+            client_writer = self.FakeWriter()
+            with mock.patch.object(
+                docker_api_boundary.asyncio,
+                "open_unix_connection",
+                side_effect=OSError("unavailable"),
+                create=True,
+            ):
+                await server.handle(self.FakeReader([]), client_writer)
+            self.assertTrue(client_writer.closed)
+            return receipt.sanitized()
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result["classification"], "OBSERVER_FORWARDING_FAILED")
+        self.assertEqual(result["forwarding_error_count"], 1)
+
+    def test_incomplete_response_is_fail_closed(self) -> None:
+        receipt = docker_api_boundary.Receipt()
+        receipt.request("VOLUME_INSPECT", "READ")
+        self.assertEqual(
+            receipt.sanitized()["classification"],
+            "DOCKER_API_RESPONSE_INCOMPLETE",
+        )
 
 
 class DbStartLogClassifierTests(unittest.TestCase):

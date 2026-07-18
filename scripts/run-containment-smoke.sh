@@ -35,12 +35,16 @@ VIOLATION_FILE="$RUNTIME/container-violations.jsonl"
 WATCH_READY="$RUNTIME/watcher.ready"
 DB_START_DIAGNOSTIC_FILE="$RUNTIME/db-start-diagnostic.tsv"
 EVENT_HISTORY_STATE_FILE="$RUNTIME/docker-event-history.tsv"
+DOCKER_API_BOUNDARY_STATE_FILE="$RUNTIME/docker-api-boundary.tsv"
+DOCKER_API_SOCKET="$RUNTIME/docker-api.sock"
+DOCKER_API_READY="$RUNTIME/docker-api.ready"
 CONTAINER_EVENTS_FILE="$RAW/docker-container-events.jsonl"
 VOLUME_EVENTS_FILE="$RAW/docker-volume-events.jsonl"
 NETWORK_EVENTS_FILE="$RAW/docker-network-events.jsonl"
 STATE_FILE="$ROOT/artifacts/.state.tsv"
 RESULT_FILE="$ROOT/artifacts/containment-smoke.json"
 WATCH_PID=""
+DOCKER_API_OBSERVER_PID=""
 NETWORK_ID=""
 POSTGRES_IMAGE_ID=""
 GOTRUE_IMAGE_ID=""
@@ -408,8 +412,31 @@ stop_watcher() {
   WATCH_PID=""
 }
 
+stop_docker_api_observer() {
+  local observer_rc=0 forced=0
+  if [[ -z "$DOCKER_API_OBSERVER_PID" ]]; then
+    return 0
+  fi
+  if kill -0 "$DOCKER_API_OBSERVER_PID" 2>/dev/null; then
+    kill "$DOCKER_API_OBSERVER_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "$DOCKER_API_OBSERVER_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$DOCKER_API_OBSERVER_PID" 2>/dev/null; then
+      forced=1
+      kill -KILL "$DOCKER_API_OBSERVER_PID" 2>/dev/null || true
+    fi
+  fi
+  wait "$DOCKER_API_OBSERVER_PID" 2>/dev/null || observer_rc="$?"
+  DOCKER_API_OBSERVER_PID=""
+  [[ "$forced" == "0" ]] || return 124
+  return "$observer_rc"
+}
+
 cleanup_exact() {
   local id label project_label count listener_count container_count volume_count
+  stop_docker_api_observer || true
   stop_watcher
 
   mapfile -t container_ids < <(
@@ -884,8 +911,27 @@ freeze_precli_objects_and_listeners
 EVENT_SINCE="$(date -u +%s)"
 record docker_event_history.boundary_frozen bool true
 
+[[ ! -e "$DOCKER_API_SOCKET" && ! -e "$DOCKER_API_READY" && ! -e "$DOCKER_API_BOUNDARY_STATE_FILE" ]] \
+  || block DOCKER_API_OBSERVER_PREEXISTING_STATE
+python3 -B "$ROOT/scripts/docker_api_boundary.py" \
+  --listen "$DOCKER_API_SOCKET" \
+  --upstream /var/run/docker.sock \
+  --state "$DOCKER_API_BOUNDARY_STATE_FILE" \
+  --ready "$DOCKER_API_READY" \
+  >"$RAW/docker-api-observer.log" 2>&1 &
+DOCKER_API_OBSERVER_PID="$!"
+for _ in $(seq 1 50); do
+  [[ -S "$DOCKER_API_SOCKET" && -f "$DOCKER_API_READY" ]] && break
+  kill -0 "$DOCKER_API_OBSERVER_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[[ -S "$DOCKER_API_SOCKET" && -f "$DOCKER_API_READY" ]] || block DOCKER_API_OBSERVER_NOT_READY
+[[ "$(stat -c '%a' "$DOCKER_API_SOCKET")" == "600" ]] || block DOCKER_API_OBSERVER_SOCKET_PERMISSIONS
+[[ "$(stat -c '%a' "$DOCKER_API_READY")" == "600" ]] || block DOCKER_API_OBSERVER_READY_PERMISSIONS
+
 set +e
-timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
+env DOCKER_HOST="unix://$DOCKER_API_SOCKET" \
+  timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
   --debug \
   --workdir "$PROJECT_DIR" \
   --network-id "$NETWORK_NAME" \
@@ -894,9 +940,21 @@ timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
 cli_rc="$?"
 set -e
 sleep 1
+docker_api_observer_rc=0
+stop_docker_api_observer || docker_api_observer_rc="$?"
 watcher_alive=0
 kill -0 "$WATCH_PID" 2>/dev/null && watcher_alive=1
 stop_watcher
+docker_api_boundary_state_present=true
+if [[ ! -f "$DOCKER_API_BOUNDARY_STATE_FILE" ]]; then
+  docker_api_boundary_state_present=false
+  docker_api_classification=OBSERVER_STATE_MISSING
+else
+  cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"
+  docker_api_classification="$(awk -F '\t' '$1=="docker_api_boundary.classification"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+fi
+record docker_api_boundary.observer_exit_code int "$docker_api_observer_rc"
+record docker_api_boundary.state_present bool "$docker_api_boundary_state_present"
 if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
   --input "$RAW/supabase-db-start.log" \
   --exit-code "$cli_rc" \
@@ -912,6 +970,9 @@ fi
 [[ ! -e "$RAW/supabase-db-start.log" ]] || block DB_START_RAW_LOG_DELETE_FAILED
 record supabase_cli.db_start_diagnostic.raw_deleted bool true
 [[ "$db_start_category" =~ ^[A-Z0-9_]+$ ]] || block DB_START_LOG_SANITIZER_FAILED
+[[ "$docker_api_boundary_state_present" == "true" ]] || block DOCKER_API_OBSERVER_STATE_MISSING
+[[ "$docker_api_observer_rc" == "0" ]] || block DOCKER_API_OBSERVER_FAILED "observer-exit-${docker_api_observer_rc}"
+[[ "$docker_api_classification" =~ ^[A-Z0-9_]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
 [[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 if [[ "$watcher_alive" != "1" ]]; then
   if [[ -s "$VIOLATION_FILE" ]]; then
@@ -999,11 +1060,22 @@ case "$event_classification" in
   EVENT_HISTORY_CONSISTENT|NO_DOCKER_MUTATION_OBSERVED) ;;
   *) block DOCKER_EVENT_HISTORY_SANITIZER_FAILED ;;
 esac
+case "$docker_api_classification" in
+  NO_DOCKER_API_REQUEST_OBSERVED|DOCKER_API_REQUESTS_OBSERVED|DOCKER_API_ERROR_RESPONSE_OBSERVED) ;;
+  DOCKER_API_RESPONSE_INCOMPLETE) block DOCKER_API_OBSERVER_INCOMPLETE ;;
+  OBSERVER_FORWARDING_FAILED) block DOCKER_API_OBSERVER_FAILED ;;
+  *) block DOCKER_API_OBSERVER_STATE_INVALID ;;
+esac
 if [[ "$cli_rc" != "0" ]]; then
   if [[ "$db_start_category" != "UNKNOWN_SANITIZED" ]]; then
     block "$db_start_category" "cli-exit-${cli_rc}"
   fi
   if [[ "$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" ]]; then
+    case "$docker_api_classification" in
+      NO_DOCKER_API_REQUEST_OBSERVED) block NO_DOCKER_API_REQUEST_OBSERVED "cli-exit-${cli_rc}" ;;
+      DOCKER_API_ERROR_RESPONSE_OBSERVED) block DOCKER_API_ERROR_RESPONSE_OBSERVED "cli-exit-${cli_rc}" ;;
+      DOCKER_API_REQUESTS_OBSERVED) block DOCKER_API_BOUNDARY_OBSERVED "cli-exit-${cli_rc}" ;;
+    esac
     block OTHER_PRECONTAINER_FAILURE "cli-exit-${cli_rc}"
   fi
   block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
