@@ -334,6 +334,146 @@ def build_marker_batch(
     )
 
 
+def _match(left: dict[str, Any], right: Any) -> dict[str, Any]:
+    return {"match": {"op": "==", "left": left, "right": right}}
+
+
+def _meta(key: str) -> dict[str, Any]:
+    return {"meta": {"key": key}}
+
+
+def _payload(protocol: str, field: str) -> dict[str, Any]:
+    return {"payload": {"protocol": protocol, "field": field}}
+
+
+def expected_marker_rule_expressions(
+    table_name: str,
+    interface: str,
+    subnet: str,
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+) -> dict[str, list[list[dict[str, Any]]]]:
+    # Reuse the exact batch validator so the semantic readback contract cannot
+    # accept an identity that the mutation path itself would reject.
+    build_marker_batch(
+        table_name,
+        interface,
+        subnet,
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
+    )
+    return {
+        MARKER_INPUT_CHAIN: [
+            [
+                _match(_meta("iifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), gateway_ip),
+                _match(_payload("icmp", "type"), "echo-request"),
+                {"counter": MARKER_COUNTERS["gateway"]},
+            ],
+            [
+                _match(_meta("iifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), gateway_ip),
+                _match(_payload("tcp", "dport"), host_port),
+                {"counter": MARKER_COUNTERS["host_listener"]},
+            ],
+        ],
+        MARKER_FORWARD_CHAIN: [
+            [
+                _match(_meta("iifname"), interface),
+                _match(_meta("oifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), service_ip),
+                _match(_payload("tcp", "dport"), 5432),
+                {"counter": MARKER_COUNTERS["same_network"]},
+            ],
+            [
+                _match(_meta("iifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), "1.1.1.1"),
+                _match(_payload("tcp", "dport"), 443),
+                {"counter": MARKER_COUNTERS["literal_ip"]},
+            ],
+            [
+                _match(_meta("iifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), "169.254.169.254"),
+                _match(_payload("tcp", "dport"), 80),
+                {"counter": MARKER_COUNTERS["metadata"]},
+            ],
+            [
+                _match(_meta("iifname"), interface),
+                _match(_payload("ip", "saddr"), client_ip),
+                _match(_payload("ip", "daddr"), foreign_ip),
+                _match(_payload("tcp", "dport"), 5432),
+                {"counter": MARKER_COUNTERS["foreign_network"]},
+            ],
+        ],
+        MARKER_OUTPUT_CHAIN: [
+            [
+                _match(_meta("skuid"), 0),
+                _match(_payload("udp", "dport"), 53),
+                _match(
+                    {"payload": {"base": "th", "offset": 160, "len": 104}},
+                    f"0x{DNS_QUESTION_HEX}",
+                ),
+                {"counter": MARKER_COUNTERS["external_dns"]},
+            ]
+        ],
+    }
+
+
+def validate_marker_rule_expressions(
+    entries: list[dict[str, Any]],
+    table_name: str,
+    interface: str,
+    subnet: str,
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+) -> str:
+    expected = expected_marker_rule_expressions(
+        table_name,
+        interface,
+        subnet,
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
+    )
+    observed: dict[str, list[list[dict[str, Any]]]] = {
+        chain: [] for chain in expected
+    }
+    for entry in owned_entries(entries, table_name):
+        rule = entry.get("rule")
+        if not isinstance(rule, dict) or rule.get("chain") not in observed:
+            continue
+        _require_exact_keys(rule, {"family", "table", "chain", "expr"}, {"handle"})
+        expressions = rule.get("expr")
+        if (
+            rule.get("family") != "inet"
+            or rule.get("table") != table_name
+            or not isinstance(expressions, list)
+            or any(not isinstance(expression, dict) for expression in expressions)
+        ):
+            raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
+        observed[rule["chain"]].append(expressions)
+    if observed != expected:
+        raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
+    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _require_exact_keys(payload: dict[str, Any], required: set[str], optional: set[str]) -> None:
     keys = set(payload)
     if not required.issubset(keys) or not keys.issubset(required | optional):
@@ -647,17 +787,6 @@ def install_markers(
     if ledger.get("markers_installed") is True:
         raise BoundaryError("FIREWALL_MARKER_COLLISION")
     prefix, _ = privileged_prefix()
-    before = read_ruleset(prefix)
-    digest, _ = validate_owned(before, TABLE, markers_installed=False)
-    if digest != ledger["owned_sha256"]:
-        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
-    foreign_sha, foreign_counts = canonical_snapshot(before, exclude_table=TABLE)
-    if (
-        foreign_sha != ledger["preimage_sha256"]
-        or foreign_counts != ledger["preimage_counts"]
-    ):
-        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
-
     batch = build_marker_batch(
         TABLE,
         ledger["interface"],
@@ -671,20 +800,46 @@ def install_markers(
     checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
     if checked.returncode != 0:
         raise BoundaryError("FIREWALL_MARKER_ATOMIC_CHECK_FAILED")
+
+    # This is the transaction preimage, not the original installation
+    # preimage. Docker may legitimately change foreign nftables state while
+    # packet containers are created; only change concurrent with this atomic
+    # marker mutation is attributable to the marker transaction.
+    before = read_ruleset(prefix)
+    digest, _ = validate_owned(before, TABLE, markers_installed=False)
+    if digest != ledger["owned_sha256"]:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+    foreign_sha, foreign_counts = canonical_snapshot(before, exclude_table=TABLE)
+    setup_history_changed = (
+        foreign_sha != ledger["preimage_sha256"]
+        or foreign_counts != ledger["preimage_counts"]
+    )
+
     applied = _run([*prefix, "-f", "-"], input_text=batch)
     if applied.returncode != 0:
         raise BoundaryError("FIREWALL_MARKER_ATOMIC_INSTALL_FAILED")
 
     after = read_ruleset(prefix)
+    post_foreign_sha, post_foreign_counts = canonical_snapshot(
+        after, exclude_table=TABLE
+    )
     combined_sha, combined_counts = validate_owned(
         after, TABLE, markers_installed=True
+    )
+    expression_sha = validate_marker_rule_expressions(
+        after,
+        TABLE,
+        ledger["interface"],
+        ledger["subnet"],
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
     )
     marker_sha, marker_counts = canonical_snapshot(marker_entries(after, TABLE))
     if marker_counts != {"chain": 3, "counter": 7, "rule": 7}:
         raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
-    post_foreign_sha, post_foreign_counts = canonical_snapshot(
-        after, exclude_table=TABLE
-    )
     if post_foreign_sha != foreign_sha or post_foreign_counts != foreign_counts:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     ledger["markers_installed"] = True
@@ -694,6 +849,60 @@ def install_markers(
     emit(
         [
             ("firewall.markers.atomic_install", "bool", True),
+            (
+                "firewall.markers.original_cleanup_preimage_sha256",
+                "str",
+                ledger["preimage_sha256"],
+            ),
+            ("firewall.markers.foreign_pre_sha256", "str", foreign_sha),
+            (
+                "firewall.markers.foreign_pre_table_count",
+                "int",
+                foreign_counts.get("table", 0),
+            ),
+            (
+                "firewall.markers.foreign_pre_chain_count",
+                "int",
+                foreign_counts.get("chain", 0),
+            ),
+            (
+                "firewall.markers.foreign_pre_rule_count",
+                "int",
+                foreign_counts.get("rule", 0),
+            ),
+            (
+                "firewall.markers.foreign_pre_counter_count",
+                "int",
+                foreign_counts.get("counter", 0),
+            ),
+            ("firewall.markers.foreign_post_sha256", "str", post_foreign_sha),
+            (
+                "firewall.markers.foreign_post_table_count",
+                "int",
+                post_foreign_counts.get("table", 0),
+            ),
+            (
+                "firewall.markers.foreign_post_chain_count",
+                "int",
+                post_foreign_counts.get("chain", 0),
+            ),
+            (
+                "firewall.markers.foreign_post_rule_count",
+                "int",
+                post_foreign_counts.get("rule", 0),
+            ),
+            (
+                "firewall.markers.foreign_post_counter_count",
+                "int",
+                post_foreign_counts.get("counter", 0),
+            ),
+            ("firewall.markers.foreign_transaction_unchanged", "bool", True),
+            (
+                "firewall.markers.setup_history_changed_from_original",
+                "bool",
+                setup_history_changed,
+            ),
+            ("firewall.markers.expression_contract_sha256", "str", expression_sha),
             ("firewall.markers.sha256", "str", marker_sha),
             ("firewall.markers.combined_sha256", "str", combined_sha),
             ("firewall.markers.chain_count", "int", marker_counts["chain"]),

@@ -4067,25 +4067,20 @@ def owned_firewall_entries_with_markers() -> list[dict]:
             ),
         )
     )
-    marker_rules = (
-        (firewall_boundary.MARKER_INPUT_CHAIN, "gateway"),
-        (firewall_boundary.MARKER_INPUT_CHAIN, "host_listener"),
-        (firewall_boundary.MARKER_FORWARD_CHAIN, "same_network"),
-        (firewall_boundary.MARKER_FORWARD_CHAIN, "literal_ip"),
-        (firewall_boundary.MARKER_FORWARD_CHAIN, "metadata"),
-        (firewall_boundary.MARKER_FORWARD_CHAIN, "foreign_network"),
-        (firewall_boundary.MARKER_OUTPUT_CHAIN, "external_dns"),
+    expected = firewall_boundary.expected_marker_rule_expressions(
+        firewall_boundary.TABLE,
+        "br-fpro001",
+        "172.31.253.0/24",
+        "172.31.253.10",
+        "172.31.253.11",
+        "172.17.0.4",
+        "172.31.253.1",
+        18080,
     )
     entries.extend(
-        nft_entry(
-            "rule",
-            chain=chain,
-            expr=[
-                {"match": {"canary": canary}},
-                {"counter": {"name": firewall_boundary.MARKER_COUNTERS[canary]}},
-            ],
-        )
-        for chain, canary in marker_rules
+        nft_entry("rule", chain=chain, expr=copy.deepcopy(expressions))
+        for chain, rules in expected.items()
+        for expressions in rules
     )
     return entries
 
@@ -4225,6 +4220,103 @@ printf 'SETUP:%s:%s\\n' "$FIREWALL_SETUP_OUTPUT_TOTAL" "$SMOKE_PASSED"
                         "br-fpro001",
                         "172.31.253.0/24",
                         *invalid,
+                    )
+
+    def test_marker_readback_requires_exact_ordered_libnftables_expressions(self) -> None:
+        marked = owned_firewall_entries_with_markers()
+        expression_sha = firewall_boundary.validate_marker_rule_expressions(
+            marked,
+            firewall_boundary.TABLE,
+            "br-fpro001",
+            "172.31.253.0/24",
+            "172.31.253.10",
+            "172.31.253.11",
+            "172.17.0.4",
+            "172.31.253.1",
+            18080,
+        )
+        self.assertRegex(expression_sha, r"^[0-9a-f]{64}$")
+        expected = firewall_boundary.expected_marker_rule_expressions(
+            firewall_boundary.TABLE,
+            "br-fpro001",
+            "172.31.253.0/24",
+            "172.31.253.10",
+            "172.31.253.11",
+            "172.17.0.4",
+            "172.31.253.1",
+            18080,
+        )
+        self.assertEqual(
+            expected[firewall_boundary.MARKER_INPUT_CHAIN][0][-1],
+            {"counter": firewall_boundary.MARKER_COUNTERS["gateway"]},
+        )
+        self.assertEqual(
+            expected[firewall_boundary.MARKER_FORWARD_CHAIN][0][0],
+            {
+                "match": {
+                    "op": "==",
+                    "left": {"meta": {"key": "iifname"}},
+                    "right": "br-fpro001",
+                }
+            },
+        )
+        self.assertEqual(
+            expected[firewall_boundary.MARKER_OUTPUT_CHAIN][0][2],
+            {
+                "match": {
+                    "op": "==",
+                    "left": {"payload": {"base": "th", "offset": 160, "len": 104}},
+                    "right": f"0x{firewall_boundary.DNS_QUESTION_HEX}",
+                }
+            },
+        )
+
+        marker_indices = [
+            index
+            for index, entry in enumerate(marked)
+            if isinstance(entry.get("rule"), dict)
+            and entry["rule"].get("chain") in firewall_boundary.MARKER_CHAINS
+        ]
+        cases: list[list[dict]] = []
+        reordered_rules = copy.deepcopy(marked)
+        reordered_rules[marker_indices[0]], reordered_rules[marker_indices[1]] = (
+            reordered_rules[marker_indices[1]],
+            reordered_rules[marker_indices[0]],
+        )
+        cases.append(reordered_rules)
+        wrong_tuple = copy.deepcopy(marked)
+        wrong_tuple[marker_indices[2]]["rule"]["expr"][3]["match"]["right"] = "172.31.253.12"
+        cases.append(wrong_tuple)
+        wrong_counter = copy.deepcopy(marked)
+        wrong_counter[marker_indices[3]]["rule"]["expr"][-1] = {"counter": "marker_metadata"}
+        cases.append(wrong_counter)
+        broad_dns = copy.deepcopy(marked)
+        broad_dns[marker_indices[-1]]["rule"]["expr"].pop(2)
+        cases.append(broad_dns)
+        unknown_expression = copy.deepcopy(marked)
+        unknown_expression[marker_indices[4]]["rule"]["expr"].insert(0, {"accept": None})
+        cases.append(unknown_expression)
+        anonymous_counter = copy.deepcopy(marked)
+        anonymous_counter[marker_indices[5]]["rule"]["expr"][-1] = {
+            "counter": {"packets": 0, "bytes": 0}
+        }
+        cases.append(anonymous_counter)
+        for entries in cases:
+            with self.subTest(entries=entries):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_MARKER_INSTALLATION_MISMATCH",
+                ):
+                    firewall_boundary.validate_marker_rule_expressions(
+                        entries,
+                        firewall_boundary.TABLE,
+                        "br-fpro001",
+                        "172.31.253.0/24",
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
                     )
 
     def test_process_identity_preflight_is_closed_and_sanitized(self) -> None:
@@ -4996,6 +5088,187 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "172.31.253.1",
                     18080,
                 )
+
+    def test_marker_transaction_accepts_stable_setup_era_foreign_change_only(self) -> None:
+        original = [{"table": {"family": "ip", "name": "foreign-original"}}]
+        setup = original + [
+            {"chain": {"family": "ip", "table": "foreign-original", "name": "docker-setup"}}
+        ]
+        original_sha, original_counts = firewall_boundary.canonical_snapshot(original)
+        setup_sha, setup_counts = firewall_boundary.canonical_snapshot(setup)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                {
+                    "schema": firewall_boundary.SCHEMA,
+                    "table": firewall_boundary.TABLE,
+                    "interface": "br-fpro001",
+                    "subnet": "172.31.253.0/24",
+                    "preimage_sha256": original_sha,
+                    "preimage_counts": original_counts,
+                    "installed": True,
+                    "owned_sha256": owned_sha,
+                    "markers_installed": False,
+                    "marker_sha256": "",
+                    "combined_sha256": "",
+                },
+            )
+            state = io.StringIO()
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[
+                    setup + owned_firewall_entries(),
+                    setup + owned_firewall_entries_with_markers(),
+                ],
+            ), mock.patch.object(
+                firewall_boundary, "_run", return_value=success
+            ), contextlib.redirect_stdout(state):
+                firewall_boundary.install_markers(
+                    ledger,
+                    "172.31.253.10",
+                    "172.31.253.11",
+                    "172.17.0.4",
+                    "172.31.253.1",
+                    18080,
+                )
+            saved = firewall_boundary.read_ledger(ledger)
+            self.assertEqual(saved["preimage_sha256"], original_sha)
+            self.assertEqual(saved["preimage_counts"], original_counts)
+            sanitized = state.getvalue()
+            self.assertIn(
+                f"firewall.markers.original_cleanup_preimage_sha256\tstr\t{original_sha}",
+                sanitized,
+            )
+            self.assertEqual(sanitized.count(setup_sha), 2)
+            self.assertIn("firewall.markers.foreign_transaction_unchanged\tbool\ttrue", sanitized)
+            self.assertIn(
+                "firewall.markers.setup_history_changed_from_original\tbool\ttrue",
+                sanitized,
+            )
+            self.assertIn(
+                f"firewall.markers.foreign_pre_chain_count\tint\t{setup_counts['chain']}",
+                sanitized,
+            )
+            self.assertNotIn("foreign-original", sanitized)
+            self.assertNotIn("docker-setup", sanitized)
+
+    def test_marker_transaction_rejects_window_drift_snapshot_failure_and_collision(self) -> None:
+        original = [{"table": {"family": "ip", "name": "foreign"}}]
+        setup = original + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "setup"}}
+        ]
+        during = setup + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "during-marker"}}
+        ]
+        original_sha, original_counts = firewall_boundary.canonical_snapshot(original)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        def ledger_payload() -> dict[str, object]:
+            return {
+                "schema": firewall_boundary.SCHEMA,
+                "table": firewall_boundary.TABLE,
+                "interface": "br-fpro001",
+                "subnet": "172.31.253.0/24",
+                "preimage_sha256": original_sha,
+                "preimage_counts": original_counts,
+                "installed": True,
+                "owned_sha256": owned_sha,
+                "markers_installed": False,
+                "marker_sha256": "",
+                "combined_sha256": "",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(ledger, ledger_payload())
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[
+                    setup + owned_firewall_entries(),
+                    during + owned_firewall_entries_with_markers(),
+                ],
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_FOREIGN_STATE_DRIFT"
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
+            saved = firewall_boundary.read_ledger(ledger)
+            self.assertFalse(saved["markers_installed"])
+            self.assertEqual(saved["preimage_sha256"], original_sha)
+
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=firewall_boundary.BoundaryError("FIREWALL_INSPECTION_FAILED"),
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_INSPECTION_FAILED"
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
+
+            collision = setup + owned_firewall_entries()
+            collision.append(
+                nft_entry(
+                    "counter",
+                    name="marker_collision",
+                    packets=0,
+                    bytes=0,
+                )
+            )
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", return_value=collision
+            ), mock.patch.object(firewall_boundary, "_run", return_value=success):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_INSTALLATION_MISMATCH"
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
 
     def test_marker_apply_failure_preserves_base_ledger_for_exact_cleanup(self) -> None:
         foreign = [{"table": {"family": "ip", "name": "foreign"}}]
