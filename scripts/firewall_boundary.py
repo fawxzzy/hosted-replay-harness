@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ import sys
 from typing import Any
 
 
-SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v2"
+SCHEMA = "fawxzzy.hosted-replay-harness.firewall-boundary.v3"
 TABLE = "fp_hosted_replay_ro_001"
 INPUT_CHAIN = "packet_input"
 FORWARD_CHAIN = "packet_forward"
@@ -28,6 +29,22 @@ OUTPUT_CHAIN = "packet_output"
 INPUT_COUNTER = "packet_input_deny"
 FORWARD_COUNTER = "packet_forward_deny"
 OUTPUT_COUNTER = "packet_output_deny"
+MARKER_INPUT_CHAIN = "canary_input"
+MARKER_FORWARD_CHAIN = "canary_forward"
+MARKER_OUTPUT_CHAIN = "canary_output"
+MARKER_COUNTERS = {
+    "same_network": "marker_same_network",
+    "external_dns": "marker_external_dns",
+    "literal_ip": "marker_literal_ip",
+    "metadata": "marker_metadata",
+    "gateway": "marker_gateway",
+    "host_listener": "marker_host_listener",
+    "foreign_network": "marker_foreign_network",
+}
+MARKER_CHAINS = {MARKER_INPUT_CHAIN, MARKER_FORWARD_CHAIN, MARKER_OUTPUT_CHAIN}
+# DNS question wire identity for the fixed public canary name already frozen in
+# the runner.  It is matched only transiently and is never emitted in state.
+DNS_QUESTION_HEX = "076578616d706c6503636f6d00"
 VERSION_RE = re.compile(r"^nftables v([0-9]+)\.([0-9]+)\.([0-9]+)(?:[ -].*)?$")
 SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 SAFE_IFACE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
@@ -41,6 +58,9 @@ LEDGER_KEYS = {
     "preimage_counts",
     "installed",
     "owned_sha256",
+    "markers_installed",
+    "marker_sha256",
+    "combined_sha256",
 }
 
 
@@ -244,16 +264,108 @@ def build_batch(table_name: str, interface: str, subnet: str) -> str:
     )
 
 
+def _validated_ipv4(value: str, code: str) -> ipaddress.IPv4Address:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise BoundaryError(code) from exc
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise BoundaryError(code)
+    return address
+
+
+def build_marker_batch(
+    table_name: str,
+    interface: str,
+    subnet: str,
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+) -> str:
+    if not SAFE_NAME_RE.fullmatch(table_name):
+        raise BoundaryError("FIREWALL_IDENTITY_INVALID")
+    if not SAFE_IFACE_RE.fullmatch(interface):
+        raise BoundaryError("FIREWALL_INTERFACE_INVALID")
+    try:
+        network = ipaddress.ip_network(subnet, strict=True)
+    except ValueError as exc:
+        raise BoundaryError("FIREWALL_SUBNET_INVALID") from exc
+    if not isinstance(network, ipaddress.IPv4Network):
+        raise BoundaryError("FIREWALL_SUBNET_INVALID")
+    client = _validated_ipv4(client_ip, "FIREWALL_MARKER_IDENTITY_INVALID")
+    service = _validated_ipv4(service_ip, "FIREWALL_MARKER_IDENTITY_INVALID")
+    foreign = _validated_ipv4(foreign_ip, "FIREWALL_MARKER_IDENTITY_INVALID")
+    gateway = _validated_ipv4(gateway_ip, "FIREWALL_MARKER_IDENTITY_INVALID")
+    if (
+        client not in network
+        or service not in network
+        or gateway not in network
+        or gateway in {network.network_address, network.broadcast_address}
+        or foreign in network
+        or len({client, service, gateway}) != 3
+        or not isinstance(host_port, int)
+        or not 1 <= host_port <= 65535
+    ):
+        raise BoundaryError("FIREWALL_MARKER_IDENTITY_INVALID")
+
+    counters = tuple(
+        f"add counter inet {table_name} {name}" for name in MARKER_COUNTERS.values()
+    )
+    rules = (
+        f'add rule inet {table_name} {MARKER_INPUT_CHAIN} iifname "{interface}" ip saddr {client} ip daddr {gateway} icmp type echo-request counter name {MARKER_COUNTERS["gateway"]}',
+        f'add rule inet {table_name} {MARKER_INPUT_CHAIN} iifname "{interface}" ip saddr {client} ip daddr {gateway} tcp dport {host_port} counter name {MARKER_COUNTERS["host_listener"]}',
+        f'add rule inet {table_name} {MARKER_FORWARD_CHAIN} iifname "{interface}" oifname "{interface}" ip saddr {client} ip daddr {service} tcp dport 5432 counter name {MARKER_COUNTERS["same_network"]}',
+        f'add rule inet {table_name} {MARKER_FORWARD_CHAIN} iifname "{interface}" ip saddr {client} ip daddr 1.1.1.1 tcp dport 443 counter name {MARKER_COUNTERS["literal_ip"]}',
+        f'add rule inet {table_name} {MARKER_FORWARD_CHAIN} iifname "{interface}" ip saddr {client} ip daddr 169.254.169.254 tcp dport 80 counter name {MARKER_COUNTERS["metadata"]}',
+        f'add rule inet {table_name} {MARKER_FORWARD_CHAIN} iifname "{interface}" ip saddr {client} ip daddr {foreign} tcp dport 5432 counter name {MARKER_COUNTERS["foreign_network"]}',
+        f'add rule inet {table_name} {MARKER_OUTPUT_CHAIN} meta skuid 0 udp dport 53 @th,160,104 0x{DNS_QUESTION_HEX} counter name {MARKER_COUNTERS["external_dns"]}',
+    )
+    return "\n".join(
+        (
+            *counters,
+            f"add chain inet {table_name} {MARKER_INPUT_CHAIN} {{ type filter hook input priority -20; policy accept; }}",
+            f"add chain inet {table_name} {MARKER_FORWARD_CHAIN} {{ type filter hook forward priority -20; policy accept; }}",
+            f"add chain inet {table_name} {MARKER_OUTPUT_CHAIN} {{ type filter hook output priority -20; policy accept; }}",
+            *rules,
+            "",
+        )
+    )
+
+
 def _require_exact_keys(payload: dict[str, Any], required: set[str], optional: set[str]) -> None:
     keys = set(payload)
     if not required.issubset(keys) or not keys.issubset(required | optional):
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
 
 
-def validate_owned(entries: list[dict[str, Any]], table_name: str) -> tuple[str, dict[str, int]]:
+def marker_entries(entries: list[dict[str, Any]], table_name: str) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    marker_counter_names = set(MARKER_COUNTERS.values())
+    for entry in owned_entries(entries, table_name):
+        chain = entry.get("chain")
+        counter = entry.get("counter")
+        rule = entry.get("rule")
+        if isinstance(chain, dict) and chain.get("name") in MARKER_CHAINS:
+            selected.append(entry)
+        elif isinstance(counter, dict) and counter.get("name") in marker_counter_names:
+            selected.append(entry)
+        elif isinstance(rule, dict) and rule.get("chain") in MARKER_CHAINS:
+            selected.append(entry)
+    return selected
+
+
+def validate_owned(
+    entries: list[dict[str, Any]], table_name: str, *, markers_installed: bool = False
+) -> tuple[str, dict[str, int]]:
     selected = owned_entries(entries, table_name)
     digest, counts = canonical_snapshot(selected)
-    expected = {"chain": 3, "counter": 3, "rule": 7, "table": 1}
+    expected = (
+        {"chain": 6, "counter": 10, "rule": 14, "table": 1}
+        if markers_installed
+        else {"chain": 3, "counter": 3, "rule": 7, "table": 1}
+    )
     if counts != expected:
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
 
@@ -273,6 +385,8 @@ def validate_owned(entries: list[dict[str, Any]], table_name: str) -> tuple[str,
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
 
     expected_counters = {INPUT_COUNTER, FORWARD_COUNTER, OUTPUT_COUNTER}
+    if markers_installed:
+        expected_counters.update(MARKER_COUNTERS.values())
     counter_names: list[str] = []
     for counter in by_kind["counter"]:
         _require_exact_keys(
@@ -288,14 +402,22 @@ def validate_owned(entries: list[dict[str, Any]], table_name: str) -> tuple[str,
         ):
             raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
         counter_names.append(counter.get("name"))
-    if len(set(counter_names)) != 3 or set(counter_names) != expected_counters:
+    if len(counter_names) != len(expected_counters) or set(counter_names) != expected_counters:
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
 
     expected_chains = {
-        INPUT_CHAIN: "input",
-        FORWARD_CHAIN: "forward",
-        OUTPUT_CHAIN: "output",
+        INPUT_CHAIN: ("input", -10),
+        FORWARD_CHAIN: ("forward", -10),
+        OUTPUT_CHAIN: ("output", -10),
     }
+    if markers_installed:
+        expected_chains.update(
+            {
+                MARKER_INPUT_CHAIN: ("input", -20),
+                MARKER_FORWARD_CHAIN: ("forward", -20),
+                MARKER_OUTPUT_CHAIN: ("output", -20),
+            }
+        )
     chain_names: list[str] = []
     for chain in by_kind["chain"]:
         _require_exact_keys(
@@ -309,16 +431,20 @@ def validate_owned(entries: list[dict[str, Any]], table_name: str) -> tuple[str,
             or chain.get("table") != table_name
             or name not in expected_chains
             or chain.get("type") != "filter"
-            or chain.get("hook") != expected_chains[name]
-            or chain.get("prio") != -10
+            or chain.get("hook") != expected_chains[name][0]
+            or chain.get("prio") != expected_chains[name][1]
             or chain.get("policy") != "accept"
         ):
             raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
         chain_names.append(name)
-    if len(set(chain_names)) != 3 or set(chain_names) != set(expected_chains):
+    if len(chain_names) != len(expected_chains) or set(chain_names) != set(expected_chains):
         raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
 
     expected_rule_counts = {INPUT_CHAIN: 2, FORWARD_CHAIN: 3, OUTPUT_CHAIN: 2}
+    if markers_installed:
+        expected_rule_counts.update(
+            {MARKER_INPUT_CHAIN: 2, MARKER_FORWARD_CHAIN: 4, MARKER_OUTPUT_CHAIN: 1}
+        )
     observed_rule_counts = {name: 0 for name in expected_rule_counts}
     expression_digests: dict[str, set[str]] = {name: set() for name in expected_rule_counts}
     for rule in by_kind["rule"]:
@@ -383,7 +509,9 @@ def read_ledger(path: Path) -> dict[str, Any]:
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     if not SAFE_SUBNET_RE.fullmatch(str(ledger.get("subnet", ""))):
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    if not isinstance(ledger.get("installed"), bool):
+    if not isinstance(ledger.get("installed"), bool) or not isinstance(
+        ledger.get("markers_installed"), bool
+    ):
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     counts = ledger.get("preimage_counts")
     if not isinstance(counts, dict) or any(
@@ -395,8 +523,15 @@ def read_ledger(path: Path) -> dict[str, Any]:
         value = ledger.get(key)
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
             raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    owned = ledger.get("owned_sha256")
-    if not isinstance(owned, str) or (owned and not re.fullmatch(r"[0-9a-f]{64}", owned)):
+    for key in ("owned_sha256", "marker_sha256", "combined_sha256"):
+        value = ledger.get(key)
+        if not isinstance(value, str) or (value and not re.fullmatch(r"[0-9a-f]{64}", value)):
+            raise BoundaryError("FIREWALL_LEDGER_INVALID")
+    if ledger["installed"] and not ledger["owned_sha256"]:
+        raise BoundaryError("FIREWALL_LEDGER_INVALID")
+    if ledger["markers_installed"] != bool(
+        ledger["marker_sha256"] and ledger["combined_sha256"]
+    ):
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     return ledger
 
@@ -419,6 +554,9 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
         "preimage_counts": pre_counts,
         "installed": False,
         "owned_sha256": "",
+        "markers_installed": False,
+        "marker_sha256": "",
+        "combined_sha256": "",
     }
     write_ledger(ledger_path, ledger)
     batch = build_batch(TABLE, interface, subnet)
@@ -472,18 +610,133 @@ def counter_packets(entries: list[dict[str, Any]], name: str) -> int:
     return found[0]
 
 
+def _validated_current_owned(
+    entries: list[dict[str, Any]], ledger: dict[str, Any]
+) -> tuple[str, dict[str, int]]:
+    markers_installed = ledger.get("markers_installed") is True
+    digest, counts = validate_owned(
+        entries, TABLE, markers_installed=markers_installed
+    )
+    expected_digest = (
+        ledger["combined_sha256"] if markers_installed else ledger["owned_sha256"]
+    )
+    if digest != expected_digest:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+    if markers_installed:
+        marker_digest, marker_counts = canonical_snapshot(marker_entries(entries, TABLE))
+        if marker_digest != ledger["marker_sha256"] or marker_counts != {
+            "chain": 3,
+            "counter": 7,
+            "rule": 7,
+        }:
+            raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
+    return digest, counts
+
+
+def install_markers(
+    ledger_path: Path,
+    client_ip: str,
+    service_ip: str,
+    foreign_ip: str,
+    gateway_ip: str,
+    host_port: int,
+) -> None:
+    ledger = read_ledger(ledger_path)
+    if ledger.get("installed") is not True:
+        raise BoundaryError("FIREWALL_LEDGER_INVALID")
+    if ledger.get("markers_installed") is True:
+        raise BoundaryError("FIREWALL_MARKER_COLLISION")
+    prefix, _ = privileged_prefix()
+    before = read_ruleset(prefix)
+    digest, _ = validate_owned(before, TABLE, markers_installed=False)
+    if digest != ledger["owned_sha256"]:
+        raise BoundaryError("FIREWALL_INSTALLATION_MISMATCH")
+    foreign_sha, foreign_counts = canonical_snapshot(before, exclude_table=TABLE)
+    if (
+        foreign_sha != ledger["preimage_sha256"]
+        or foreign_counts != ledger["preimage_counts"]
+    ):
+        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
+
+    batch = build_marker_batch(
+        TABLE,
+        ledger["interface"],
+        ledger["subnet"],
+        client_ip,
+        service_ip,
+        foreign_ip,
+        gateway_ip,
+        host_port,
+    )
+    checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
+    if checked.returncode != 0:
+        raise BoundaryError("FIREWALL_MARKER_ATOMIC_CHECK_FAILED")
+    applied = _run([*prefix, "-f", "-"], input_text=batch)
+    if applied.returncode != 0:
+        raise BoundaryError("FIREWALL_MARKER_ATOMIC_INSTALL_FAILED")
+
+    after = read_ruleset(prefix)
+    combined_sha, combined_counts = validate_owned(
+        after, TABLE, markers_installed=True
+    )
+    marker_sha, marker_counts = canonical_snapshot(marker_entries(after, TABLE))
+    if marker_counts != {"chain": 3, "counter": 7, "rule": 7}:
+        raise BoundaryError("FIREWALL_MARKER_INSTALLATION_MISMATCH")
+    post_foreign_sha, post_foreign_counts = canonical_snapshot(
+        after, exclude_table=TABLE
+    )
+    if post_foreign_sha != foreign_sha or post_foreign_counts != foreign_counts:
+        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
+    ledger["markers_installed"] = True
+    ledger["marker_sha256"] = marker_sha
+    ledger["combined_sha256"] = combined_sha
+    write_ledger(ledger_path, ledger)
+    emit(
+        [
+            ("firewall.markers.atomic_install", "bool", True),
+            ("firewall.markers.sha256", "str", marker_sha),
+            ("firewall.markers.combined_sha256", "str", combined_sha),
+            ("firewall.markers.chain_count", "int", marker_counts["chain"]),
+            ("firewall.markers.counter_count", "int", marker_counts["counter"]),
+            ("firewall.markers.rule_count", "int", marker_counts["rule"]),
+            ("firewall.markers.owned_chain_count", "int", combined_counts["chain"]),
+            ("firewall.markers.owned_counter_count", "int", combined_counts["counter"]),
+            ("firewall.markers.owned_rule_count", "int", combined_counts["rule"]),
+        ]
+    )
+
+
 def counters(ledger_path: Path) -> None:
     ledger = read_ledger(ledger_path)
     if ledger.get("installed") is not True:
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     prefix, _ = privileged_prefix()
     entries = read_ruleset(prefix)
-    validate_owned(entries, TABLE)
+    _validated_current_owned(entries, ledger)
     emit(
         [
             ("firewall.counters.input_deny", "int", counter_packets(entries, INPUT_COUNTER)),
             ("firewall.counters.forward_deny", "int", counter_packets(entries, FORWARD_COUNTER)),
             ("firewall.counters.output_deny", "int", counter_packets(entries, OUTPUT_COUNTER)),
+        ]
+    )
+
+
+def marker_counters(ledger_path: Path) -> None:
+    ledger = read_ledger(ledger_path)
+    if ledger.get("installed") is not True or ledger.get("markers_installed") is not True:
+        raise BoundaryError("FIREWALL_MARKER_LEDGER_INVALID")
+    prefix, _ = privileged_prefix()
+    entries = read_ruleset(prefix)
+    _validated_current_owned(entries, ledger)
+    emit(
+        [
+            (
+                f"firewall.markers.counters.{key}",
+                "int",
+                counter_packets(entries, name),
+            )
+            for key, name in MARKER_COUNTERS.items()
         ]
     )
 
@@ -534,16 +787,36 @@ def main() -> int:
     install_parser.add_argument("--ledger", required=True, type=Path)
     install_parser.add_argument("--interface", required=True)
     install_parser.add_argument("--subnet", required=True)
+    marker_parser = subparsers.add_parser("install-markers")
+    marker_parser.add_argument("--ledger", required=True, type=Path)
+    marker_parser.add_argument("--client-ip", required=True)
+    marker_parser.add_argument("--service-ip", required=True)
+    marker_parser.add_argument("--foreign-ip", required=True)
+    marker_parser.add_argument("--gateway-ip", required=True)
+    marker_parser.add_argument("--host-port", required=True, type=int)
     counter_parser = subparsers.add_parser("counters")
     counter_parser.add_argument("--ledger", required=True, type=Path)
+    marker_counter_parser = subparsers.add_parser("marker-counters")
+    marker_counter_parser.add_argument("--ledger", required=True, type=Path)
     remove_parser = subparsers.add_parser("remove")
     remove_parser.add_argument("--ledger", required=True, type=Path)
     args = parser.parse_args()
     try:
         if args.command == "install":
             install(args.ledger, args.interface, args.subnet)
+        elif args.command == "install-markers":
+            install_markers(
+                args.ledger,
+                args.client_ip,
+                args.service_ip,
+                args.foreign_ip,
+                args.gateway_ip,
+                args.host_port,
+            )
         elif args.command == "counters":
             counters(args.ledger)
+        elif args.command == "marker-counters":
+            marker_counters(args.ledger)
         else:
             remove(args.ledger)
     except (BoundaryError, subprocess.TimeoutExpired) as exc:

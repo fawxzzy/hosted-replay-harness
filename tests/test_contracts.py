@@ -480,7 +480,9 @@ validate_network_ipam_contract fixture-network after-create
             "native_listener_contract post_cli",
         ):
             self.assertIn(fragment, rehearsal)
-        self.assertIn("(( after > before ))", self.runner)
+        self.assertIn("firewall_validate_marker_deltas", self.runner)
+        self.assertIn("(( marker_delta > 0 ))", self.runner)
+        self.assertIn("FIREWALL_MARKER_UNEXPECTED_DELTA", self.runner)
 
     def test_immutable_workflow_config_pins_and_observer_hashes(self) -> None:
         expected = {
@@ -4031,6 +4033,63 @@ def owned_firewall_entries() -> list[dict]:
     ]
 
 
+def owned_firewall_entries_with_markers() -> list[dict]:
+    entries = owned_firewall_entries()
+    entries.extend(
+        nft_entry("counter", name=name, packets=0, bytes=0)
+        for name in firewall_boundary.MARKER_COUNTERS.values()
+    )
+    entries.extend(
+        (
+            nft_entry(
+                "chain",
+                name=firewall_boundary.MARKER_INPUT_CHAIN,
+                type="filter",
+                hook="input",
+                prio=-20,
+                policy="accept",
+            ),
+            nft_entry(
+                "chain",
+                name=firewall_boundary.MARKER_FORWARD_CHAIN,
+                type="filter",
+                hook="forward",
+                prio=-20,
+                policy="accept",
+            ),
+            nft_entry(
+                "chain",
+                name=firewall_boundary.MARKER_OUTPUT_CHAIN,
+                type="filter",
+                hook="output",
+                prio=-20,
+                policy="accept",
+            ),
+        )
+    )
+    marker_rules = (
+        (firewall_boundary.MARKER_INPUT_CHAIN, "gateway"),
+        (firewall_boundary.MARKER_INPUT_CHAIN, "host_listener"),
+        (firewall_boundary.MARKER_FORWARD_CHAIN, "same_network"),
+        (firewall_boundary.MARKER_FORWARD_CHAIN, "literal_ip"),
+        (firewall_boundary.MARKER_FORWARD_CHAIN, "metadata"),
+        (firewall_boundary.MARKER_FORWARD_CHAIN, "foreign_network"),
+        (firewall_boundary.MARKER_OUTPUT_CHAIN, "external_dns"),
+    )
+    entries.extend(
+        nft_entry(
+            "rule",
+            chain=chain,
+            expr=[
+                {"match": {"canary": canary}},
+                {"counter": {"name": firewall_boundary.MARKER_COUNTERS[canary]}},
+            ],
+        )
+        for chain, canary in marker_rules
+    )
+    return entries
+
+
 class FirewallBoundaryTests(unittest.TestCase):
     @staticmethod
     def _phase_contract_functions() -> str:
@@ -4055,7 +4114,7 @@ class FirewallBoundaryTests(unittest.TestCase):
             override = ""
             if defer_finish:
                 override = "firewall_phase_finish() { printf 'FINISH:%s\\n' \"$1\"; }"
-            finish = "firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED" if complete else ""
+            finish = "firewall_phase_finish PRECANARY_SETUP_QUIESCENT" if complete else ""
             script = f"""set -Eeuo pipefail
 FIREWALL_PHASE_MANIFEST={shlex.quote(str(Path(directory) / 'manifest.tsv'))}
 FIREWALL_PHASE_SNAPSHOT_COUNT=0
@@ -4067,7 +4126,7 @@ FIREWALL_PHASE_SUM_FORWARD=0
 FIREWALL_PHASE_SUM_OUTPUT=0
 FIREWALL_FIRST_HIT_FROZEN=0
 FIREWALL_FIRST_HIT_CLASS=""
-PRECANARY_PHASE_DIAGNOSTIC_PASSED=0
+FIREWALL_SETUP_OUTPUT_TOTAL=0
 SMOKE_PASSED=0
 CURRENT_INPUT=0
 CURRENT_FORWARD=0
@@ -4086,7 +4145,7 @@ block() {{ printf 'BLOCK:%s\\n' "$1"; exit 91; }}
 {calls}
 {finish}
 printf 'FIRST:%s:%s\\n' "$FIREWALL_FIRST_HIT_CLASS" "$FIREWALL_FIRST_HIT_FROZEN"
-printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
+printf 'SETUP:%s:%s\\n' "$FIREWALL_SETUP_OUTPUT_TOTAL" "$SMOKE_PASSED"
 """
             return subprocess.run(
                 [bash_executable()],
@@ -4122,6 +4181,51 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
         self.assertEqual(batch.count("172.31.253.0/24"), 6)
         self.assertEqual(batch.count("meta skuid 0"), 2)
         self.assertEqual(batch.count("packet_output_deny"), 3)
+
+    def test_marker_batch_is_atomic_flow_specific_and_has_no_verdict_or_broad_dns_marker(self) -> None:
+        batch = firewall_boundary.build_marker_batch(
+            firewall_boundary.TABLE,
+            "br-fpro001",
+            "172.31.253.0/24",
+            "172.31.253.10",
+            "172.31.253.11",
+            "172.17.0.4",
+            "172.31.253.1",
+            18080,
+        )
+        self.assertEqual(batch.count("add counter inet"), 7)
+        self.assertEqual(batch.count("add chain inet"), 3)
+        self.assertEqual(batch.count("add rule inet"), 7)
+        self.assertIn("priority -20; policy accept", batch)
+        self.assertIn(
+            'iifname "br-fpro001" oifname "br-fpro001" ip saddr 172.31.253.10 ip daddr 172.31.253.11 tcp dport 5432 counter name marker_same_network',
+            batch,
+        )
+        self.assertIn(
+            f"udp dport 53 @th,160,104 0x{firewall_boundary.DNS_QUESTION_HEX} counter name marker_external_dns",
+            batch,
+        )
+        self.assertNotIn("marker_external_dns drop", batch)
+        self.assertNotIn("meta skuid 0 udp dport 53 counter name marker_external_dns", batch)
+        self.assertNotIn("flush", batch)
+        self.assertNotIn("delete", batch)
+        for invalid in (
+            ("172.31.253.1", "172.31.253.11", "172.17.0.4", "172.31.253.1", 18080),
+            ("172.31.253.10", "172.31.253.11", "172.31.253.12", "172.31.253.1", 18080),
+            ("172.31.253.10", "172.31.253.11", "172.17.0.4", "172.31.253.0", 18080),
+            ("172.31.253.10", "172.31.253.11", "172.17.0.4", "172.31.253.1", 0),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_MARKER_IDENTITY_INVALID",
+                ):
+                    firewall_boundary.build_marker_batch(
+                        firewall_boundary.TABLE,
+                        "br-fpro001",
+                        "172.31.253.0/24",
+                        *invalid,
+                    )
 
     def test_process_identity_preflight_is_closed_and_sanitized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4180,6 +4284,23 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
         self.assertEqual(first[1], {"chain": 3, "counter": 3, "rule": 7, "table": 1})
         self.assertEqual(first[0], "22d68c21dec10ab4828727fb601006e31a1da6bfc96b7e6505a6aa570c013944")
 
+        marked = owned_firewall_entries_with_markers()
+        marked_first = firewall_boundary.validate_owned(
+            marked, firewall_boundary.TABLE, markers_installed=True
+        )
+        marked_second = firewall_boundary.validate_owned(
+            copy.deepcopy(marked), firewall_boundary.TABLE, markers_installed=True
+        )
+        self.assertEqual(marked_first, marked_second)
+        self.assertEqual(
+            marked_first[1], {"chain": 6, "counter": 10, "rule": 14, "table": 1}
+        )
+        marker_sha, marker_counts = firewall_boundary.canonical_snapshot(
+            firewall_boundary.marker_entries(marked, firewall_boundary.TABLE)
+        )
+        self.assertRegex(marker_sha, r"^[0-9a-f]{64}$")
+        self.assertEqual(marker_counts, {"chain": 3, "counter": 7, "rule": 7})
+
     def test_owned_table_rejects_unknown_duplicate_and_malformed_objects(self) -> None:
         cases = []
         duplicate_counter = owned_firewall_entries()
@@ -4211,25 +4332,73 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
                 ):
                     firewall_boundary.validate_owned(entries, firewall_boundary.TABLE)
 
-    def test_runner_correlates_embedded_dns_only_to_output_counter(self) -> None:
+        marked_duplicate = owned_firewall_entries_with_markers()
+        marked_duplicate[-2]["rule"]["expr"] = copy.deepcopy(
+            marked_duplicate[-3]["rule"]["expr"]
+        )
+        with self.assertRaisesRegex(
+            firewall_boundary.BoundaryError, "FIREWALL_INSTALLATION_MISMATCH"
+        ):
+            firewall_boundary.validate_owned(
+                marked_duplicate, firewall_boundary.TABLE, markers_installed=True
+            )
+
+    def test_runner_correlates_embedded_dns_to_specific_marker_and_output_enforcement(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
         self.assertIn("EXPECTED_OUTPUT_DENIES=0", runner)
         self.assertIn('[[ "$(wc -l <"$counter_file" | tr -d \' \')" == "3" ]]', runner)
         self.assertIn(
-            "expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED",
+            "expect_firewall_block external_dns output_deny external_dns EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED",
             runner,
         )
-        self.assertIn('docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME"', runner)
-        self.assertIn("record canaries.firewall.same_network_resolution bool true", runner)
+        self.assertIn("expect_same_network_positive same_network_resolution none", runner)
+        self.assertIn("expect_same_network_positive same_network_connect same_network", runner)
         self.assertIn('output_absolute="$(firewall_counter_value output_deny)"', runner)
         self.assertIn(
             'before_output="$(firewall_counter_value output_deny)"', runner
         )
-        self.assertIn('record firewall.final_output_deny_count int "$output_after"', runner)
+        self.assertIn('record firewall.final_output_deny_count int "$output_final"', runner)
         self.assertNotIn('expect_firewall_block external_dns forward_deny', runner)
         self.assertNotIn('cat "$RAW/canary-', runner)
 
-    def test_precanary_phase_order_is_complete_and_stops_before_canaries(self) -> None:
+    def test_every_canary_has_one_closed_marker_and_enforcement_mapping(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        rehearsal = runner[
+            runner.index("run_firewall_publication_rehearsal() {") : runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        for expected in (
+            "expect_same_network_positive same_network_resolution none",
+            "expect_same_network_positive same_network_connect same_network",
+            "expect_firewall_block external_dns output_deny external_dns",
+            "expect_firewall_block literal_ip forward_deny literal_ip",
+            "expect_firewall_block metadata forward_deny metadata",
+            "expect_firewall_block gateway input_deny gateway",
+            "expect_firewall_block host_listener input_deny host_listener",
+            "expect_firewall_block foreign_network forward_deny foreign_network",
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(rehearsal.count(expected), 1)
+        self.assertIn('[[ "$manifest_count" == "8"', runner)
+        self.assertIn("canaries.firewall.marker_manifest_sha256", runner)
+        self.assertIn("diagnostic.precanary.enforcement_manifest_sha256", runner)
+        self.assertIn("FIREWALL_MARKER_EXPECTED_TOTAL", runner)
+        self.assertNotIn("reset counters", runner.lower())
+
+    def test_cleanup_listener_failure_omits_count_and_fails_without_negative_sentinel(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        cleanup = runner[
+            runner.index("cleanup_exact() {") : runner.index("\nfinalize() {")
+        ]
+        self.assertIn('record cleanup.listeners_remaining int "$listener_count"', cleanup)
+        self.assertIn('listener_count=""', cleanup)
+        self.assertIn("record cleanup.listener_failure_code", cleanup)
+        self.assertIn('[[ "$listener_count" == "0" ]] || return 1', cleanup)
+        self.assertNotIn('listener_count="-1"', cleanup)
+        self.assertNotIn("cleanup.listeners_remaining int -1", cleanup)
+
+    def test_precanary_phase_order_is_complete_and_advances_only_after_quiescence(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
         rehearsal = runner[
             runner.index("run_firewall_publication_rehearsal() {") : runner.index(
@@ -4250,14 +4419,28 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
         )
         positions = [rehearsal.index(f"firewall_phase_snapshot {phase}") for phase in phases]
         self.assertEqual(positions, sorted(positions))
-        finish = rehearsal.index("firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED")
-        stop = rehearsal.index("return 0", finish)
-        same_network = rehearsal.index('docker exec "$client_id" getent ahostsv4')
+        identity = rehearsal.index('client_ip="$(docker inspect', positions[7])
+        finish = rehearsal.index("firewall_phase_finish PRECANARY_SETUP_QUIESCENT")
+        markers = rehearsal.index("firewall_install_marker_boundary", finish)
+        same_network = rehearsal.index("expect_same_network_positive", markers)
+        self.assertLess(identity, positions[8])
         self.assertLess(positions[-1], finish)
-        self.assertLess(finish, stop)
-        self.assertLess(stop, same_network)
+        self.assertLess(finish, markers)
+        self.assertLess(markers, same_network)
         self.assertIn("sleep 2\n  firewall_phase_snapshot quiescence_second", rehearsal)
-        self.assertIn("PRECANARY_PHASE_DIAGNOSTIC_PASS", runner)
+        marker_function = runner[
+            runner.index("firewall_install_marker_boundary() {") : runner.index(
+                "\nfirewall_record_canary_evidence() {"
+            )
+        ]
+        self.assertIn("input_before - FIREWALL_PHASE_PREV_INPUT", marker_function)
+        self.assertIn("forward_before - FIREWALL_PHASE_PREV_FORWARD", marker_function)
+        self.assertIn("output_before - FIREWALL_PHASE_PREV_OUTPUT", marker_function)
+        self.assertLess(
+            marker_function.index("FIREWALL_QUIESCENCE_LOST_BEFORE_MARKER_INSTALL"),
+            marker_function.index("install-markers"),
+        )
+        self.assertNotIn("PRECANARY_PHASE_DIAGNOSTIC_PASS", runner)
         self.assertNotIn("FIREWALL_PHASE_DIAGNOSTIC_MODE=", runner)
 
     def test_precanary_phase_classifier_covers_every_phase_and_chain(self) -> None:
@@ -4285,10 +4468,20 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
                     snapshots = [(name, 0, 0, 0) for name in phases[:phase_index]]
                     snapshots.append((phase, *counts))
                     result = self._run_phase_contract(snapshots)
+                    output_is_admitted = (
+                        chain == "OUTPUT"
+                        and phase not in {"post_install", "quiescence_second"}
+                    )
+                    if output_is_admitted:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(
+                            "FIRST:ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT:1",
+                            result.stdout,
+                        )
+                        continue
                     self.assertEqual(result.returncode, 91, result.stderr)
                     expected = {
                         "post_install": "INSTALL_WINDOW_HIT",
-                        "quiescence_first": "QUIESCENCE_HIT",
                         "quiescence_second": "QUIESCENCE_HIT",
                     }.get(
                         phase,
@@ -4342,7 +4535,7 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
         self.assertIn("FINISH:FIREWALL_COUNTER_NONMONOTONIC", result.stdout)
         self.assertIn("FIRST:PACKET_INPUT_SETUP_HIT:1", result.stdout)
 
-    def test_precanary_phase_classifier_accepts_only_complete_stable_zero_manifest(self) -> None:
+    def test_precanary_phase_classifier_accepts_zero_or_ambiguous_output_only_after_stable_quiescence(self) -> None:
         phases = (
             "post_install",
             "host_listener_ready",
@@ -4355,18 +4548,32 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
             "quiescence_first",
             "quiescence_second",
         )
-        snapshots = [(phase, 0, 0, 0) for phase in phases]
-        first = self._run_phase_contract(snapshots, complete=True)
-        second = self._run_phase_contract(snapshots, complete=True)
-        for result in (first, second):
+        zero_snapshots = [(phase, 0, 0, 0) for phase in phases]
+        output_snapshots = [
+            (phase, 0, 0, 16 if index >= 5 else 0)
+            for index, phase in enumerate(phases)
+        ]
+        first = self._run_phase_contract(zero_snapshots, complete=True)
+        second = self._run_phase_contract(zero_snapshots, complete=True)
+        output = self._run_phase_contract(output_snapshots, complete=True)
+        for result in (first, second, output):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(
-                "RECORD:diagnostic.precanary.terminal_class:str:PRECANARY_HIT_NOT_REPRODUCED",
+                "RECORD:diagnostic.precanary.terminal_class:str:PRECANARY_SETUP_QUIESCENT",
                 result.stdout,
             )
             self.assertIn("RECORD:diagnostic.precanary.phase_manifest_count:int:10", result.stdout)
             self.assertIn("RECORD:diagnostic.precanary.delta_sum_matches_final:bool:true", result.stdout)
-            self.assertIn("PASS:1:1", result.stdout)
+            self.assertIn("RECORD:diagnostic.precanary.quiescent:bool:true", result.stdout)
+        self.assertIn(
+            "RECORD:diagnostic.precanary.setup_class:str:NO_SETUP_ENFORCEMENT_HIT",
+            first.stdout,
+        )
+        self.assertIn(
+            "RECORD:diagnostic.precanary.setup_class:str:ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT",
+            output.stdout,
+        )
+        self.assertIn("RECORD:diagnostic.precanary.setup_output_total:int:16", output.stdout)
         digest_pattern = re.compile(
             r"RECORD:diagnostic\.precanary\.phase_manifest_sha256:str:([0-9a-f]{64})"
         )
@@ -4374,7 +4581,7 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
             digest_pattern.search(first.stdout).group(1),
             digest_pattern.search(second.stdout).group(1),
         )
-        missing = self._run_phase_contract(snapshots[:-1], complete=True)
+        missing = self._run_phase_contract(zero_snapshots[:-1], complete=True)
         self.assertEqual(missing.returncode, 91, missing.stderr)
         self.assertIn("BLOCK:FIREWALL_PHASE_MANIFEST_INVALID", missing.stdout)
 
@@ -4415,6 +4622,16 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
             "gateway_input_deny_delta",
             "gateway_forward_deny_delta",
             "gateway_output_deny_delta",
+            "preinstall_gap_input_delta",
+            "preinstall_gap_forward_delta",
+            "preinstall_gap_output_delta",
+            "install_enforcement_input_delta",
+            "install_enforcement_forward_delta",
+            "install_enforcement_output_delta",
+            "enforcement_input_delta",
+            "enforcement_forward_delta",
+            "enforcement_output_delta",
+            "<marker>_delta",
         ):
             self.assertIn(f"`{signed_field}`", contract)
         self.assertIn("Those fields alone admit signed base-10 integers", contract)
@@ -4422,8 +4639,8 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
 
     def test_gateway_canary_records_complete_sanitized_evidence_before_classification(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
-        start = runner.index("expect_firewall_block() {")
-        end = runner.index("\n}\n\nwait_healthy_container()", start) + 2
+        start = runner.index("firewall_validate_marker_deltas() {")
+        end = runner.index("\nexpect_same_network_positive() {", start)
         function = runner[start:end]
 
         def execute(
@@ -4445,6 +4662,11 @@ BEFORE_OUTPUT={before[2]}
 AFTER_INPUT={after[0]}
 AFTER_FORWARD={after[1]}
 AFTER_OUTPUT={after[2]}
+AFTER_GATEWAY=$(( AFTER_INPUT >= BEFORE_INPUT ? AFTER_INPUT - BEFORE_INPUT : 0 ))
+declare -A FIREWALL_MARKER_EXPECTED_TOTAL=(
+  [same_network]=0 [external_dns]=0 [literal_ip]=0 [metadata]=0
+  [gateway]=0 [host_listener]=0 [foreign_network]=0
+)
 firewall_counter_value() {{
   local name="$1" prefix=BEFORE variable
   [[ ! -e "$PHASE_FILE" ]] || prefix=AFTER
@@ -4455,6 +4677,17 @@ firewall_counter_value() {{
   esac
   printf '%s\\n' "${{!variable}}"
 }}
+firewall_marker_snapshot() {{
+  local -n target="$1"
+  target=(
+    [same_network]=0 [external_dns]=0 [literal_ip]=0 [metadata]=0
+    [gateway]=0 [host_listener]=0 [foreign_network]=0
+  )
+  [[ ! -e "$PHASE_FILE" ]] || target[gateway]="$AFTER_GATEWAY"
+}}
+firewall_record_canary_evidence() {{
+  record "canaries.firewall.$1.enforcement_input_delta" int "$4"
+}}
 record() {{ printf 'RECORD:%s:%s:%s\\n' "$1" "$2" "$3"; }}
 block() {{ printf 'BLOCK:%s\\n' "$1"; exit 91; }}
 trigger() {{
@@ -4463,7 +4696,7 @@ trigger() {{
   return "$COMMAND_RC"
 }}
 {function}
-expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED trigger
+expect_firewall_block gateway input_deny gateway PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED trigger
 printf 'expected-input=%s\\n' "$EXPECTED_INPUT_DENIES"
 """
                 return subprocess.run(
@@ -4520,11 +4753,11 @@ printf 'expected-input=%s\\n' "$EXPECTED_INPUT_DENIES"
     def test_gateway_diagnostic_preserves_following_tcp_host_listener_proof(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
         gateway = (
-            "expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE "
+            "expect_firewall_block gateway input_deny gateway PACKET_GATEWAY_REACHABLE "
             "GATEWAY_NOT_FIREWALL_CORRELATED"
         )
         host_listener = (
-            "expect_firewall_block host_listener input_deny HOST_TEST_LISTENER_REACHABLE "
+            "expect_firewall_block host_listener input_deny host_listener HOST_TEST_LISTENER_REACHABLE "
             "HOST_TEST_LISTENER_NOT_FIREWALL_CORRELATED"
         )
         self.assertLess(runner.index(gateway), runner.index(host_listener))
@@ -4535,8 +4768,8 @@ printf 'expected-input=%s\\n' "$EXPECTED_INPUT_DENIES"
 
     def test_output_canary_rejects_any_simultaneous_unrelated_counter_hit(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
-        start = runner.index("expect_firewall_block() {")
-        end = runner.index("\n}\n\nwait_healthy_container()", start) + 2
+        start = runner.index("firewall_validate_marker_deltas() {")
+        end = runner.index("\nexpect_same_network_positive() {", start)
         function = runner[start:end]
 
         def execute(after_input: int, after_forward: int, after_output: int) -> subprocess.CompletedProcess[str]:
@@ -4553,6 +4786,10 @@ BEFORE_OUTPUT=0
 AFTER_INPUT={after_input}
 AFTER_FORWARD={after_forward}
 AFTER_OUTPUT={after_output}
+declare -A FIREWALL_MARKER_EXPECTED_TOTAL=(
+  [same_network]=0 [external_dns]=0 [literal_ip]=0 [metadata]=0
+  [gateway]=0 [host_listener]=0 [foreign_network]=0
+)
 firewall_counter_value() {{
   local name="$1" prefix=BEFORE variable
   [[ ! -e "$PHASE_FILE" ]] || prefix=AFTER
@@ -4563,11 +4800,20 @@ firewall_counter_value() {{
   esac
   printf '%s\\n' "${{!variable}}"
 }}
+firewall_marker_snapshot() {{
+  local -n target="$1"
+  target=(
+    [same_network]=0 [external_dns]=0 [literal_ip]=0 [metadata]=0
+    [gateway]=0 [host_listener]=0 [foreign_network]=0
+  )
+  [[ ! -e "$PHASE_FILE" ]] || target[external_dns]="$AFTER_OUTPUT"
+}}
+firewall_record_canary_evidence() {{ :; }}
 record() {{ :; }}
 block() {{ printf '%s\\n' "$1"; exit 91; }}
 trigger() {{ : >"$PHASE_FILE"; return 1; }}
 {function}
-expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED trigger
+expect_firewall_block external_dns output_deny external_dns EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED trigger
 printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
 """
                 return subprocess.run(
@@ -4648,6 +4894,9 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
             saved = firewall_boundary.read_ledger(ledger)
             self.assertTrue(saved["installed"])
+            self.assertFalse(saved["markers_installed"])
+            self.assertEqual(saved["marker_sha256"], "")
+            self.assertEqual(saved["combined_sha256"], "")
             self.assertRegex(saved["owned_sha256"], r"^[0-9a-f]{64}$")
             state = sanitized.getvalue()
             self.assertIn("firewall.daemon_class\tstr\tsingle-root-owned-dockerd", state)
@@ -4679,6 +4928,129 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     firewall_boundary.install(ledger, "br-fpro001", "172.31.253.0/24")
             self.assertTrue(ledger.exists())
 
+    def test_marker_install_is_atomic_one_shot_and_sanitized(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                {
+                    "schema": firewall_boundary.SCHEMA,
+                    "table": firewall_boundary.TABLE,
+                    "interface": "br-fpro001",
+                    "subnet": "172.31.253.0/24",
+                    "preimage_sha256": pre_sha,
+                    "preimage_counts": pre_counts,
+                    "installed": True,
+                    "owned_sha256": owned_sha,
+                    "markers_installed": False,
+                    "marker_sha256": "",
+                    "combined_sha256": "",
+                },
+            )
+            state = io.StringIO()
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[
+                    foreign + owned_firewall_entries(),
+                    foreign + owned_firewall_entries_with_markers(),
+                ],
+            ), mock.patch.object(
+                firewall_boundary, "_run", return_value=success
+            ), contextlib.redirect_stdout(state):
+                firewall_boundary.install_markers(
+                    ledger,
+                    "172.31.253.10",
+                    "172.31.253.11",
+                    "172.17.0.4",
+                    "172.31.253.1",
+                    18080,
+                )
+            saved = firewall_boundary.read_ledger(ledger)
+            self.assertTrue(saved["markers_installed"])
+            self.assertRegex(saved["marker_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(saved["combined_sha256"], r"^[0-9a-f]{64}$")
+            sanitized = state.getvalue()
+            self.assertIn("firewall.markers.counter_count\tint\t7", sanitized)
+            self.assertIn("firewall.markers.rule_count\tint\t7", sanitized)
+            for raw in ("172.31.253.10", "172.31.253.11", "172.17.0.4"):
+                self.assertNotIn(raw, sanitized)
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError, "FIREWALL_MARKER_COLLISION"
+            ):
+                firewall_boundary.install_markers(
+                    ledger,
+                    "172.31.253.10",
+                    "172.31.253.11",
+                    "172.17.0.4",
+                    "172.31.253.1",
+                    18080,
+                )
+
+    def test_marker_apply_failure_preserves_base_ledger_for_exact_cleanup(self) -> None:
+        foreign = [{"table": {"family": "ip", "name": "foreign"}}]
+        pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        checked = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        rejected = subprocess.CompletedProcess([], 1, stdout="", stderr="rejected")
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                {
+                    "schema": firewall_boundary.SCHEMA,
+                    "table": firewall_boundary.TABLE,
+                    "interface": "br-fpro001",
+                    "subnet": "172.31.253.0/24",
+                    "preimage_sha256": pre_sha,
+                    "preimage_counts": pre_counts,
+                    "installed": True,
+                    "owned_sha256": owned_sha,
+                    "markers_installed": False,
+                    "marker_sha256": "",
+                    "combined_sha256": "",
+                },
+            )
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                return_value=foreign + owned_firewall_entries(),
+            ), mock.patch.object(
+                firewall_boundary, "_run", side_effect=[checked, rejected]
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError,
+                    "FIREWALL_MARKER_ATOMIC_INSTALL_FAILED",
+                ):
+                    firewall_boundary.install_markers(
+                        ledger,
+                        "172.31.253.10",
+                        "172.31.253.11",
+                        "172.17.0.4",
+                        "172.31.253.1",
+                        18080,
+                    )
+            saved = firewall_boundary.read_ledger(ledger)
+            self.assertFalse(saved["markers_installed"])
+            self.assertEqual(saved["marker_sha256"], "")
+            self.assertEqual(saved["combined_sha256"], "")
+
     def test_counter_schema_is_closed_and_exact(self) -> None:
         entries = owned_firewall_entries()
         entries[1]["counter"]["packets"] = 7
@@ -4696,6 +5068,16 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
     def test_exact_atomic_rollback_and_duplicate_cleanup(self) -> None:
         foreign = [{"table": {"family": "ip", "name": "foreign"}}]
         pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        owned_sha, _ = firewall_boundary.validate_owned(
+            owned_firewall_entries(), firewall_boundary.TABLE
+        )
+        marked = owned_firewall_entries_with_markers()
+        combined_sha, _ = firewall_boundary.validate_owned(
+            marked, firewall_boundary.TABLE, markers_installed=True
+        )
+        marker_sha, _ = firewall_boundary.canonical_snapshot(
+            firewall_boundary.marker_entries(marked, firewall_boundary.TABLE)
+        )
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
@@ -4709,11 +5091,14 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "preimage_sha256": pre_sha,
                     "preimage_counts": pre_counts,
                     "installed": True,
-                    "owned_sha256": "a" * 64,
+                    "owned_sha256": owned_sha,
+                    "markers_installed": True,
+                    "marker_sha256": marker_sha,
+                    "combined_sha256": combined_sha,
                 },
             )
             with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(
-                firewall_boundary, "read_ruleset", side_effect=[foreign + owned_firewall_entries(), foreign]
+                firewall_boundary, "read_ruleset", side_effect=[foreign + marked, foreign]
             ), mock.patch.object(firewall_boundary, "_run", return_value=success), contextlib.redirect_stdout(io.StringIO()):
                 firewall_boundary.remove(ledger)
             self.assertFalse(ledger.exists())
@@ -4739,6 +5124,9 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "preimage_counts": pre_counts,
                     "installed": True,
                     "owned_sha256": "a" * 64,
+                    "markers_installed": False,
+                    "marker_sha256": "",
+                    "combined_sha256": "",
                 },
             )
             with mock.patch.object(firewall_boundary, "privileged_prefix", return_value=(["nft"], "nftables-v1")), mock.patch.object(

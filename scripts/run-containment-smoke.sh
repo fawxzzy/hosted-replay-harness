@@ -65,6 +65,7 @@ FIREWALL_LEDGER="$ROOT/artifacts/.firewall-ledger.json"
 FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/.firewall-rollback.tsv"
 FIREWALL_STATE_FILE="$RUNTIME/firewall-state.tsv"
 FIREWALL_PHASE_MANIFEST="$RUNTIME/firewall-phase-manifest.tsv"
+FIREWALL_MARKER_MANIFEST="$RUNTIME/firewall-marker-manifest.tsv"
 HOST_TEST_READY="$RUNTIME/host-test-listener.ready"
 WATCH_PID=""
 DOCKER_API_OBSERVER_PID=""
@@ -85,7 +86,6 @@ LISTENER_SORT_BIN="sort"
 LISTENER_COUNT_BIN="awk"
 LISTENER_HASH_BIN="sha256sum"
 SMOKE_PASSED=0
-PRECANARY_PHASE_DIAGNOSTIC_PASSED=0
 FINALIZING=0
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
@@ -99,6 +99,20 @@ FIREWALL_PHASE_SUM_FORWARD=0
 FIREWALL_PHASE_SUM_OUTPUT=0
 FIREWALL_FIRST_HIT_FROZEN=0
 FIREWALL_FIRST_HIT_CLASS=""
+FIREWALL_SETUP_OUTPUT_TOTAL=0
+FIREWALL_MARKER_MANIFEST_COUNT=0
+FIREWALL_CANARY_BASE_INPUT=0
+FIREWALL_CANARY_BASE_FORWARD=0
+FIREWALL_CANARY_BASE_OUTPUT=0
+declare -A FIREWALL_MARKER_EXPECTED_TOTAL=(
+  [same_network]=0
+  [external_dns]=0
+  [literal_ip]=0
+  [metadata]=0
+  [gateway]=0
+  [host_listener]=0
+  [foreign_network]=0
+)
 
 CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
@@ -938,12 +952,12 @@ cleanup_exact() {
   record cleanup.networks_remaining int "$count"
   if capture_listener_snapshot cleanup "$DB_PORT"; then
     listener_count="$LISTENER_SNAPSHOT_COUNT"
+    record cleanup.listeners_remaining int "$listener_count"
   else
-    listener_count=-1
+    listener_count=""
     record cleanup.listener_failure_code str "${LISTENER_FAILURE_CODE:-LISTENER_UNEXPECTED_INTERRUPTION}" || true
     record cleanup.listener_failure_phase str "${LISTENER_LAST_PHASE:-CLEANUP_PORT_56422_UNKNOWN}" || true
   fi
-  record cleanup.listeners_remaining int "$listener_count"
 
   [[ "$container_count" == "0" ]] || return 1
   [[ "$volume_count" == "0" ]] || return 1
@@ -1001,10 +1015,6 @@ finalize() {
     if [[ "$MODE" == "direct-port" ]]; then
       record status str DIRECT_DOCKER_PORT_PATH_PASS
       final_status=DIRECT_DOCKER_PORT_PATH_PASS
-    elif [[ "$MODE" == "firewall-rehearsal" && "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" == "1" ]]; then
-      record status str PRECANARY_PHASE_DIAGNOSTIC_PASS
-      record failure json null
-      final_status=PRECANARY_PHASE_DIAGNOSTIC_PASS
     elif [[ "$MODE" == "firewall-rehearsal" ]]; then
       record status str FIREWALL_PUBLICATION_REHEARSAL_PASS
       record failure json null
@@ -1150,7 +1160,7 @@ firewall_counter_value() {
 }
 
 firewall_phase_finish() {
-  local terminal_class="$1" manifest_count manifest_sha accounting_matches=true
+  local terminal_class="$1" manifest_count manifest_sha accounting_matches=true setup_class
   manifest_count="$(wc -l <"$FIREWALL_PHASE_MANIFEST" | tr -d ' ')"
   [[ "$manifest_count" =~ ^[0-9]+$ && "$manifest_count" == "$FIREWALL_PHASE_SNAPSHOT_COUNT" ]] \
     || block FIREWALL_PHASE_MANIFEST_INVALID
@@ -1158,6 +1168,8 @@ firewall_phase_finish() {
   [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || block FIREWALL_PHASE_MANIFEST_INVALID
   record diagnostic.precanary.phase_manifest_count int "$manifest_count"
   record diagnostic.precanary.phase_manifest_sha256 str "$manifest_sha"
+  record diagnostic.precanary.enforcement_manifest_count int "$manifest_count"
+  record diagnostic.precanary.enforcement_manifest_sha256 str "$manifest_sha"
   record diagnostic.precanary.final_input_count int "$FIREWALL_PHASE_PREV_INPUT"
   record diagnostic.precanary.final_forward_count int "$FIREWALL_PHASE_PREV_FORWARD"
   record diagnostic.precanary.final_output_count int "$FIREWALL_PHASE_PREV_OUTPUT"
@@ -1169,11 +1181,19 @@ firewall_phase_finish() {
   record diagnostic.precanary.delta_sum_matches_final bool "$accounting_matches"
   record diagnostic.precanary.terminal_class str "$terminal_class"
   [[ "$accounting_matches" == "true" ]] || block FIREWALL_PHASE_ACCOUNTING_FAILED
-  if [[ "$terminal_class" == "PRECANARY_HIT_NOT_REPRODUCED" ]]; then
+  if [[ "$terminal_class" == "PRECANARY_SETUP_QUIESCENT" ]]; then
     [[ "$manifest_count" == "10" ]] || block FIREWALL_PHASE_MANIFEST_INVALID
+    if [[ "$FIREWALL_FIRST_HIT_FROZEN" == "1" ]]; then
+      [[ "$FIREWALL_FIRST_HIT_CLASS" == "ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT" ]] \
+        || block FIREWALL_SETUP_CLASS_INVALID
+      setup_class="$FIREWALL_FIRST_HIT_CLASS"
+    else
+      setup_class=NO_SETUP_ENFORCEMENT_HIT
+    fi
+    record diagnostic.precanary.setup_class str "$setup_class"
+    record diagnostic.precanary.setup_output_total int "$FIREWALL_SETUP_OUTPUT_TOTAL"
+    record diagnostic.precanary.quiescent bool true
     record diagnostic.precanary.complete bool true
-    PRECANARY_PHASE_DIAGNOSTIC_PASSED=1
-    SMOKE_PASSED=1
     return 0
   fi
   block "$terminal_class"
@@ -1238,8 +1258,7 @@ firewall_phase_snapshot() {
     firewall_phase_finish FIREWALL_COUNTER_NONMONOTONIC
     return $?
   fi
-  if [[ "$FIREWALL_FIRST_HIT_FROZEN" == "0" ]] \
-    && (( input_delta > 0 || forward_delta > 0 || output_delta > 0 )); then
+  if (( input_delta > 0 || forward_delta > 0 || output_delta > 0 )); then
     if (( (input_delta > 0) + (forward_delta > 0) + (output_delta > 0) > 1 )); then
       chain=MULTIPLE
       terminal_class=MULTICHAIN_SETUP_HIT
@@ -1255,30 +1274,173 @@ firewall_phase_snapshot() {
     fi
     if [[ "$phase" == "post_install" ]]; then
       terminal_class=INSTALL_WINDOW_HIT
-    elif [[ "$phase" == "quiescence_first" || "$phase" == "quiescence_second" ]]; then
+    elif [[ "$phase" == "quiescence_second" ]]; then
       terminal_class=QUIESCENCE_HIT
     fi
-    FIREWALL_FIRST_HIT_FROZEN=1
-    FIREWALL_FIRST_HIT_CLASS="$terminal_class"
-    record diagnostic.precanary.first_hit_phase str "$phase"
-    record diagnostic.precanary.first_hit_chain str "$chain"
-    record diagnostic.precanary.first_hit_input_delta int "$input_delta"
-    record diagnostic.precanary.first_hit_forward_delta int "$forward_delta"
-    record diagnostic.precanary.first_hit_output_delta int "$output_delta"
-    record diagnostic.precanary.first_hit_monotonic bool true
-    firewall_phase_finish "$terminal_class"
-    return $?
+    if [[ "$FIREWALL_FIRST_HIT_FROZEN" == "0" ]]; then
+      FIREWALL_FIRST_HIT_FROZEN=1
+      FIREWALL_FIRST_HIT_CLASS="$terminal_class"
+      record diagnostic.precanary.first_hit_phase str "$phase"
+      record diagnostic.precanary.first_hit_chain str "$chain"
+      record diagnostic.precanary.first_hit_input_delta int "$input_delta"
+      record diagnostic.precanary.first_hit_forward_delta int "$forward_delta"
+      record diagnostic.precanary.first_hit_output_delta int "$output_delta"
+      record diagnostic.precanary.first_hit_monotonic bool true
+    fi
+    if [[ "$terminal_class" != "ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT" ]]; then
+      firewall_phase_finish "$terminal_class"
+      return $?
+    fi
+    FIREWALL_SETUP_OUTPUT_TOTAL="$(( FIREWALL_SETUP_OUTPUT_TOTAL + output_delta ))"
   fi
 }
 
+firewall_marker_snapshot() {
+  local target_name="$1" marker_file="$RUNTIME/firewall-marker-counters.tsv" name value
+  local -n target="$target_name"
+  python3 -B "$ROOT/scripts/firewall_boundary.py" marker-counters --ledger "$FIREWALL_LEDGER" \
+    >"$marker_file" 2>"$RAW/firewall-marker-counters.log" || block FIREWALL_MARKER_COUNTER_READ_FAILED
+  [[ "$(wc -l <"$marker_file" | tr -d ' ')" == "7" ]] || block FIREWALL_MARKER_COUNTER_INVALID
+  target=()
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    value="$(awk -F '\t' -v key="firewall.markers.counters.${name}" \
+      '$1==key && $2=="int"{print $3; exit}' "$marker_file")"
+    [[ "$value" =~ ^[0-9]+$ ]] || block FIREWALL_MARKER_COUNTER_INVALID
+    target["$name"]="$value"
+  done
+}
+
+firewall_install_marker_boundary() {
+  local client_ip="$1" service_ip="$2" foreign_ip="$3"
+  local marker_install_state="$RUNTIME/firewall-marker-install.tsv" failure_code
+  local input_before forward_before output_before input_after forward_after output_after
+  local gap_input_delta gap_forward_delta gap_output_delta
+  local input_delta forward_delta output_delta baseline_sha name
+  local -A marker_baseline=()
+  input_before="$(firewall_counter_value input_deny)"
+  forward_before="$(firewall_counter_value forward_deny)"
+  output_before="$(firewall_counter_value output_deny)"
+  gap_input_delta="$(( input_before - FIREWALL_PHASE_PREV_INPUT ))"
+  gap_forward_delta="$(( forward_before - FIREWALL_PHASE_PREV_FORWARD ))"
+  gap_output_delta="$(( output_before - FIREWALL_PHASE_PREV_OUTPUT ))"
+  record firewall.markers.preinstall_gap_input_delta int "$gap_input_delta"
+  record firewall.markers.preinstall_gap_forward_delta int "$gap_forward_delta"
+  record firewall.markers.preinstall_gap_output_delta int "$gap_output_delta"
+  (( gap_input_delta >= 0 && gap_forward_delta >= 0 && gap_output_delta >= 0 )) \
+    || block FIREWALL_COUNTER_NONMONOTONIC
+  (( gap_input_delta == 0 && gap_forward_delta == 0 && gap_output_delta == 0 )) \
+    || block FIREWALL_QUIESCENCE_LOST_BEFORE_MARKER_INSTALL
+  python3 -B "$ROOT/scripts/firewall_boundary.py" install-markers \
+    --ledger "$FIREWALL_LEDGER" \
+    --client-ip "$client_ip" \
+    --service-ip "$service_ip" \
+    --foreign-ip "$foreign_ip" \
+    --gateway-ip "$SUBNET_GATEWAY" \
+    --host-port "$HOST_TEST_PORT" >"$marker_install_state" 2>"$RAW/firewall-marker-install.log" \
+    || {
+      failure_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$marker_install_state" 2>/dev/null || true)"
+      [[ "$failure_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || failure_code=FIREWALL_MARKER_INSTALL_FAILED
+      block "$failure_code"
+    }
+  cat "$marker_install_state" >>"$STATE_FILE"
+  input_after="$(firewall_counter_value input_deny)"
+  forward_after="$(firewall_counter_value forward_deny)"
+  output_after="$(firewall_counter_value output_deny)"
+  input_delta="$(( input_after - input_before ))"
+  forward_delta="$(( forward_after - forward_before ))"
+  output_delta="$(( output_after - output_before ))"
+  record firewall.markers.install_enforcement_input_delta int "$input_delta"
+  record firewall.markers.install_enforcement_forward_delta int "$forward_delta"
+  record firewall.markers.install_enforcement_output_delta int "$output_delta"
+  (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) || block FIREWALL_COUNTER_NONMONOTONIC
+  (( input_delta == 0 && forward_delta == 0 && output_delta == 0 )) \
+    || block FIREWALL_ENFORCEMENT_MOVED_DURING_MARKER_INSTALL
+  firewall_marker_snapshot marker_baseline
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    record "firewall.markers.baseline.${name}" int "${marker_baseline[$name]}"
+    [[ "${marker_baseline[$name]}" == "0" ]] || block FIREWALL_MARKER_BASELINE_NONZERO
+  done
+  baseline_sha="$(printf '%s\n' \
+    "same_network=${marker_baseline[same_network]}" \
+    "external_dns=${marker_baseline[external_dns]}" \
+    "literal_ip=${marker_baseline[literal_ip]}" \
+    "metadata=${marker_baseline[metadata]}" \
+    "gateway=${marker_baseline[gateway]}" \
+    "host_listener=${marker_baseline[host_listener]}" \
+    "foreign_network=${marker_baseline[foreign_network]}" \
+    | sha256sum | awk '{print $1}')"
+  [[ "$baseline_sha" =~ ^[0-9a-f]{64}$ ]] || block FIREWALL_MARKER_BASELINE_INVALID
+  record firewall.markers.baseline_zero bool true
+  record firewall.markers.baseline_sha256 str "$baseline_sha"
+  FIREWALL_CANARY_BASE_INPUT="$input_after"
+  FIREWALL_CANARY_BASE_FORWARD="$forward_after"
+  FIREWALL_CANARY_BASE_OUTPUT="$output_after"
+  record firewall.enforcement.canary_baseline_input int "$FIREWALL_CANARY_BASE_INPUT"
+  record firewall.enforcement.canary_baseline_forward int "$FIREWALL_CANARY_BASE_FORWARD"
+  record firewall.enforcement.canary_baseline_output int "$FIREWALL_CANARY_BASE_OUTPUT"
+}
+
+firewall_record_canary_evidence() {
+  local receipt_key="$1" command_rc="$2" command_exit_class="$3"
+  local input_delta="$4" forward_delta="$5" output_delta="$6"
+  local before_name="$7" after_name="$8" marker_delta name
+  local -n before_ref="$before_name" after_ref="$after_name"
+  FIREWALL_MARKER_MANIFEST_COUNT="$(( FIREWALL_MARKER_MANIFEST_COUNT + 1 ))"
+  if [[ "$FIREWALL_MARKER_MANIFEST_COUNT" == "1" ]]; then
+    [[ ! -e "$FIREWALL_MARKER_MANIFEST" ]] || block FIREWALL_MARKER_MANIFEST_COLLISION
+    : >"$FIREWALL_MARKER_MANIFEST"
+  fi
+  record "canaries.firewall.${receipt_key}.command_exit_code" int "$command_rc"
+  record "canaries.firewall.${receipt_key}.command_exit_class" str "$command_exit_class"
+  record "canaries.firewall.${receipt_key}.enforcement_input_delta" int "$input_delta"
+  record "canaries.firewall.${receipt_key}.enforcement_forward_delta" int "$forward_delta"
+  record "canaries.firewall.${receipt_key}.enforcement_output_delta" int "$output_delta"
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    marker_delta="$(( after_ref[$name] - before_ref[$name] ))"
+    record "canaries.firewall.${receipt_key}.markers.${name}_delta" int "$marker_delta"
+  done
+  printf '%02d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$FIREWALL_MARKER_MANIFEST_COUNT" "$receipt_key" "$command_exit_class" "$command_rc" \
+    "$input_delta" "$forward_delta" "$output_delta" \
+    "$(( after_ref[same_network] - before_ref[same_network] ))" \
+    "$(( after_ref[external_dns] - before_ref[external_dns] ))" \
+    "$(( after_ref[literal_ip] - before_ref[literal_ip] ))" \
+    "$(( after_ref[metadata] - before_ref[metadata] ))" \
+    "$(( after_ref[gateway] - before_ref[gateway] ))" \
+    "$(( after_ref[host_listener] - before_ref[host_listener] ))" \
+    "$(( after_ref[foreign_network] - before_ref[foreign_network] ))" \
+    >>"$FIREWALL_MARKER_MANIFEST"
+}
+
+firewall_validate_marker_deltas() {
+  local receipt_key="$1" expected_marker="$2" before_name="$3" after_name="$4" result_name="$5"
+  local name delta expected_delta=0 unexpected_delta=0
+  local -n before_ref="$before_name" after_ref="$after_name"
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    delta="$(( after_ref[$name] - before_ref[$name] ))"
+    (( delta >= 0 )) || block FIREWALL_MARKER_COUNTER_NONMONOTONIC
+    if [[ "$name" == "$expected_marker" ]]; then
+      expected_delta="$delta"
+    else
+      unexpected_delta="$(( unexpected_delta + delta ))"
+    fi
+  done
+  record "canaries.firewall.${receipt_key}.expected_marker_delta" int "$expected_delta"
+  record "canaries.firewall.${receipt_key}.unexpected_marker_delta" int "$unexpected_delta"
+  (( unexpected_delta == 0 )) || block FIREWALL_MARKER_UNEXPECTED_DELTA
+  printf -v "$result_name" '%s' "$expected_delta"
+}
+
 expect_firewall_block() {
-  local receipt_key="$1" counter="$2" success_code="$3" correlation_code="$4"
-  shift 4
-  local before_input before_forward before_output after_input after_forward after_output before after command_rc
-  local input_delta forward_delta output_delta command_exit_class
+  local receipt_key="$1" counter="$2" expected_marker="$3" success_code="$4" correlation_code="$5"
+  shift 5
+  local before_input before_forward before_output after_input after_forward after_output command_rc
+  local input_delta forward_delta output_delta command_exit_class marker_delta
+  local -A marker_before=() marker_after=()
   before_input="$(firewall_counter_value input_deny)"
   before_forward="$(firewall_counter_value forward_deny)"
   before_output="$(firewall_counter_value output_deny)"
+  firewall_marker_snapshot marker_before
   set +e
   "$@" >"$RAW/canary-${receipt_key}.log" 2>&1
   command_rc="$?"
@@ -1286,16 +1448,23 @@ expect_firewall_block() {
   after_input="$(firewall_counter_value input_deny)"
   after_forward="$(firewall_counter_value forward_deny)"
   after_output="$(firewall_counter_value output_deny)"
+  firewall_marker_snapshot marker_after
   input_delta="$(( after_input - before_input ))"
   forward_delta="$(( after_forward - before_forward ))"
   output_delta="$(( after_output - before_output ))"
+  if [[ "$command_rc" == "0" ]]; then
+    command_exit_class=SUCCESS
+  elif [[ "$receipt_key" == "gateway" && "$command_rc" == "1" ]]; then
+    command_exit_class=NO_REPLY
+  elif [[ "$receipt_key" == "gateway" ]]; then
+    command_exit_class=RUNTIME_ERROR
+  else
+    command_exit_class=BLOCKED
+  fi
+  firewall_record_canary_evidence "$receipt_key" "$command_rc" "$command_exit_class" \
+    "$input_delta" "$forward_delta" "$output_delta" marker_before marker_after
 
   if [[ "$receipt_key" == "gateway" ]]; then
-    case "$command_rc" in
-      0) command_exit_class="SUCCESS" ;;
-      1) command_exit_class="NO_REPLY" ;;
-      *) command_exit_class="RUNTIME_ERROR" ;;
-    esac
     record canaries.firewall.gateway_command_exit_code int "$command_rc"
     record canaries.firewall.gateway_command_exit_class str "$command_exit_class"
     record canaries.firewall.gateway_input_deny_delta int "$input_delta"
@@ -1303,49 +1472,111 @@ expect_firewall_block() {
     record canaries.firewall.gateway_output_deny_delta int "$output_delta"
 
     [[ "$command_exit_class" != "SUCCESS" ]] || block PACKET_GATEWAY_REACHABLE
-    (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) \
-      || block FIREWALL_COUNTER_NONMONOTONIC
+    (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) || block FIREWALL_COUNTER_NONMONOTONIC
     [[ "$command_exit_class" != "RUNTIME_ERROR" ]] || block GATEWAY_COMMAND_RUNTIME_FAILED
     (( forward_delta == 0 && output_delta == 0 )) || block GATEWAY_UNEXPECTED_COUNTER_DELTA
     (( input_delta > 0 )) || block GATEWAY_INPUT_COUNTER_DELTA_MISSING
-    record canaries.firewall.gateway_failed bool true
-    record canaries.firewall.gateway_deny_delta int "$input_delta"
-    EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + input_delta ))"
-    return 0
   fi
 
   [[ "$command_rc" != "0" ]] || block "$success_code"
+  (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) || block FIREWALL_COUNTER_NONMONOTONIC
+  firewall_validate_marker_deltas "$receipt_key" "$expected_marker" marker_before marker_after marker_delta
+  (( marker_delta > 0 )) || block "$correlation_code"
   case "$counter" in
     input_deny)
-      before="$before_input"
-      after="$after_input"
-      [[ "$after_forward" == "$before_forward" && "$after_output" == "$before_output" ]] \
-        || block "$correlation_code"
+      (( input_delta == marker_delta && forward_delta == 0 && output_delta == 0 )) || block "$correlation_code"
       ;;
     forward_deny)
-      before="$before_forward"
-      after="$after_forward"
-      [[ "$after_input" == "$before_input" && "$after_output" == "$before_output" ]] \
-        || block "$correlation_code"
+      (( forward_delta == marker_delta && input_delta == 0 && output_delta == 0 )) || block "$correlation_code"
       ;;
     output_deny)
-      before="$before_output"
-      after="$after_output"
-      [[ "$after_input" == "$before_input" && "$after_forward" == "$before_forward" ]] \
-        || block "$correlation_code"
+      (( output_delta == marker_delta && input_delta == 0 && forward_delta == 0 )) || block "$correlation_code"
       ;;
     *) block FIREWALL_COUNTER_INVALID ;;
   esac
-  (( after > before )) || block "$correlation_code"
   record "canaries.firewall.${receipt_key}_failed" bool true
-  record "canaries.firewall.${receipt_key}_deny_delta" int "$(( after - before ))"
+  record "canaries.firewall.${receipt_key}_deny_delta" int "$marker_delta"
+  FIREWALL_MARKER_EXPECTED_TOTAL["$expected_marker"]="$(( FIREWALL_MARKER_EXPECTED_TOTAL[$expected_marker] + marker_delta ))"
   if [[ "$counter" == "input_deny" ]]; then
-    EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + after - before ))"
+    EXPECTED_INPUT_DENIES="$(( EXPECTED_INPUT_DENIES + marker_delta ))"
   elif [[ "$counter" == "forward_deny" ]]; then
-    EXPECTED_FORWARD_DENIES="$(( EXPECTED_FORWARD_DENIES + after - before ))"
+    EXPECTED_FORWARD_DENIES="$(( EXPECTED_FORWARD_DENIES + marker_delta ))"
   else
-    EXPECTED_OUTPUT_DENIES="$(( EXPECTED_OUTPUT_DENIES + after - before ))"
+    EXPECTED_OUTPUT_DENIES="$(( EXPECTED_OUTPUT_DENIES + marker_delta ))"
   fi
+}
+
+expect_same_network_positive() {
+  local receipt_key="$1" expected_marker="$2" failure_code="$3" deny_code="$4"
+  shift 4
+  local before_input before_forward before_output after_input after_forward after_output command_rc marker_delta name
+  local input_delta forward_delta output_delta unexpected_delta=0
+  local -A marker_before=() marker_after=()
+  before_input="$(firewall_counter_value input_deny)"
+  before_forward="$(firewall_counter_value forward_deny)"
+  before_output="$(firewall_counter_value output_deny)"
+  firewall_marker_snapshot marker_before
+  set +e
+  "$@" >"$RAW/canary-${receipt_key}.log" 2>&1
+  command_rc="$?"
+  set -e
+  after_input="$(firewall_counter_value input_deny)"
+  after_forward="$(firewall_counter_value forward_deny)"
+  after_output="$(firewall_counter_value output_deny)"
+  firewall_marker_snapshot marker_after
+  input_delta="$(( after_input - before_input ))"
+  forward_delta="$(( after_forward - before_forward ))"
+  output_delta="$(( after_output - before_output ))"
+  firewall_record_canary_evidence "$receipt_key" "$command_rc" \
+    "$([[ "$command_rc" == "0" ]] && printf SUCCESS || printf RUNTIME_ERROR)" \
+    "$input_delta" "$forward_delta" "$output_delta" marker_before marker_after
+  (( input_delta >= 0 && forward_delta >= 0 && output_delta >= 0 )) || block FIREWALL_COUNTER_NONMONOTONIC
+  [[ "$command_rc" == "0" ]] || block "$failure_code"
+  (( input_delta == 0 && forward_delta == 0 && output_delta == 0 )) || block "$deny_code"
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    marker_delta="$(( marker_after[$name] - marker_before[$name] ))"
+    (( marker_delta >= 0 )) || block FIREWALL_MARKER_COUNTER_NONMONOTONIC
+    if [[ "$expected_marker" == "none" ]]; then
+      unexpected_delta="$(( unexpected_delta + marker_delta ))"
+    elif [[ "$name" == "$expected_marker" ]]; then
+      FIREWALL_MARKER_EXPECTED_TOTAL["$name"]="$(( FIREWALL_MARKER_EXPECTED_TOTAL[$name] + marker_delta ))"
+      (( marker_delta > 0 )) || block SAME_NETWORK_MARKER_DELTA_MISSING
+    else
+      unexpected_delta="$(( unexpected_delta + marker_delta ))"
+    fi
+  done
+  (( unexpected_delta == 0 )) || block FIREWALL_MARKER_UNEXPECTED_DELTA
+  record "canaries.firewall.${receipt_key}" bool true
+}
+
+firewall_marker_finish() {
+  local manifest_count manifest_sha input_final forward_final output_final name
+  local -A marker_final=()
+  manifest_count="$(wc -l <"$FIREWALL_MARKER_MANIFEST" | tr -d ' ')"
+  [[ "$manifest_count" == "8" && "$manifest_count" == "$FIREWALL_MARKER_MANIFEST_COUNT" ]] \
+    || block FIREWALL_MARKER_MANIFEST_INVALID
+  manifest_sha="$(sha256sum <"$FIREWALL_MARKER_MANIFEST" | awk '{print $1}')"
+  [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || block FIREWALL_MARKER_MANIFEST_INVALID
+  record canaries.firewall.marker_manifest_count int "$manifest_count"
+  record canaries.firewall.marker_manifest_sha256 str "$manifest_sha"
+  firewall_marker_snapshot marker_final
+  for name in same_network external_dns literal_ip metadata gateway host_listener foreign_network; do
+    record "canaries.firewall.markers.final.${name}" int "${marker_final[$name]}"
+    record "canaries.firewall.markers.expected.${name}" int "${FIREWALL_MARKER_EXPECTED_TOTAL[$name]}"
+    [[ "${marker_final[$name]}" == "${FIREWALL_MARKER_EXPECTED_TOTAL[$name]}" ]] \
+      || block FIREWALL_MARKER_FINAL_MISMATCH
+  done
+  input_final="$(firewall_counter_value input_deny)"
+  forward_final="$(firewall_counter_value forward_deny)"
+  output_final="$(firewall_counter_value output_deny)"
+  [[ "$input_final" == "$(( FIREWALL_CANARY_BASE_INPUT + EXPECTED_INPUT_DENIES ))" \
+    && "$forward_final" == "$(( FIREWALL_CANARY_BASE_FORWARD + EXPECTED_FORWARD_DENIES ))" \
+    && "$output_final" == "$(( FIREWALL_CANARY_BASE_OUTPUT + EXPECTED_OUTPUT_DENIES ))" ]] \
+    || block FIREWALL_UNEXPECTED_DENY_HIT
+  record firewall.final_input_deny_count int "$input_final"
+  record firewall.final_forward_deny_count int "$forward_final"
+  record firewall.final_output_deny_count int "$output_final"
+  record firewall.unexpected_deny_hit_count int 0
 }
 
 wait_healthy_container() {
@@ -1430,7 +1661,7 @@ raise SystemExit(0 if legacy_tmpfs_matches(payload, sys.argv[2]) else 1)
 }
 
 run_firewall_publication_rehearsal() {
-  local db_password service_id foreign_id client_id foreign_ip probe_rc failure_code
+  local db_password service_id foreign_id client_id client_ip service_ip foreign_ip probe_rc failure_code
   local probe_state="$RUNTIME/firewall-port-probe.tsv" firewall_install_state="$RUNTIME/firewall-install.tsv"
   local input_before forward_before output_before input_after forward_after output_after
 
@@ -1579,58 +1810,46 @@ while True:
   ' >"$RAW/firewall-client-preflight.log" 2>&1 || block FIREWALL_CLIENT_TOOLING_MISMATCH
   record network.default_route_present bool true
   firewall_phase_snapshot client_tool_preflight_complete
+
+  client_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$client_id" 2>/dev/null || true)"
+  service_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$service_id" 2>/dev/null || true)"
+  foreign_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$foreign_id" 2>/dev/null || true)"
+  [[ "$client_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ \
+    && "$service_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ \
+    && "$foreign_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+    || block FIREWALL_MARKER_IDENTITY_UNAVAILABLE
   firewall_phase_snapshot quiescence_first
   sleep 2
   firewall_phase_snapshot quiescence_second
-  firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED
-  return 0
+  firewall_phase_finish PRECANARY_SETUP_QUIESCENT
+  firewall_install_marker_boundary "$client_ip" "$service_ip" "$foreign_ip"
 
-  docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME" \
-    >"$RAW/same-network-resolution.log" 2>&1 || block SAME_NETWORK_SERVICE_DISCOVERY_FAILED
-  input_after="$(firewall_counter_value input_deny)"
-  forward_after="$(firewall_counter_value forward_deny)"
-  output_after="$(firewall_counter_value output_deny)"
-  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" && "$output_after" == "$output_before" ]] \
-    || block SAME_NETWORK_RESOLUTION_HIT_DENY_RULE
-  record canaries.firewall.same_network_resolution bool true
-  docker exec "$client_id" pg_isready -h "$FIREWALL_DB_NAME" -p 5432 -t 5 \
-    >"$RAW/same-network-connect.log" 2>&1 || block SAME_NETWORK_CONTAINER_CONNECT_FAILED
-  input_after="$(firewall_counter_value input_deny)"
-  forward_after="$(firewall_counter_value forward_deny)"
-  output_after="$(firewall_counter_value output_deny)"
-  [[ "$input_after" == "$input_before" && "$forward_after" == "$forward_before" && "$output_after" == "$output_before" ]] \
-    || block SAME_NETWORK_TRAFFIC_HIT_DENY_RULE
-  record canaries.firewall.same_network_connect bool true
+  expect_same_network_positive same_network_resolution none SAME_NETWORK_SERVICE_DISCOVERY_FAILED \
+    SAME_NETWORK_RESOLUTION_HIT_DENY_RULE \
+    docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME"
+  expect_same_network_positive same_network_connect same_network SAME_NETWORK_CONTAINER_CONNECT_FAILED \
+    SAME_NETWORK_TRAFFIC_HIT_DENY_RULE \
+    docker exec "$client_id" pg_isready -h "$FIREWALL_DB_NAME" -p 5432 -t 5
 
-  expect_firewall_block external_dns output_deny EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED \
-    docker exec "$client_id" timeout 5 getent ahostsv4 example.com
-  expect_firewall_block literal_ip forward_deny LITERAL_IP_EGRESS_SUCCEEDED LITERAL_IP_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block external_dns output_deny external_dns EXTERNAL_DNS_SUCCEEDED EXTERNAL_DNS_NOT_FIREWALL_CORRELATED \
+    docker exec "$client_id" timeout 5 getent ahostsv4 example.com.
+  expect_firewall_block literal_ip forward_deny literal_ip LITERAL_IP_EGRESS_SUCCEEDED LITERAL_IP_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 3 bash -ceu '</dev/tcp/1.1.1.1/443'
-  expect_firewall_block metadata forward_deny METADATA_EGRESS_SUCCEEDED METADATA_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block metadata forward_deny metadata METADATA_EGRESS_SUCCEEDED METADATA_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 3 bash -ceu '</dev/tcp/169.254.169.254/80'
-  expect_firewall_block gateway input_deny PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block gateway input_deny gateway PACKET_GATEWAY_REACHABLE GATEWAY_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" ping -c 1 -W 1 "$SUBNET_GATEWAY"
-  expect_firewall_block host_listener input_deny HOST_TEST_LISTENER_REACHABLE HOST_TEST_LISTENER_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block host_listener input_deny host_listener HOST_TEST_LISTENER_REACHABLE HOST_TEST_LISTENER_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 3 bash -ceu "</dev/tcp/${SUBNET_GATEWAY}/${HOST_TEST_PORT}"
 
-  foreign_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$foreign_id" 2>/dev/null || true)"
-  [[ "$foreign_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || block FOREIGN_CANARY_ADDRESS_UNAVAILABLE
-  expect_firewall_block foreign_network forward_deny FOREIGN_NETWORK_REACHABLE FOREIGN_NETWORK_NOT_FIREWALL_CORRELATED \
+  expect_firewall_block foreign_network forward_deny foreign_network FOREIGN_NETWORK_REACHABLE FOREIGN_NETWORK_NOT_FIREWALL_CORRELATED \
     docker exec "$client_id" timeout 3 bash -ceu "</dev/tcp/${foreign_ip}/5432"
-  unset foreign_ip
+  unset client_ip service_ip foreign_ip
 
   docker version --format '{{.Server.Version}}' >"$RAW/docker-control-after-firewall.log" 2>&1 \
     || block DOCKER_CONTROL_UNAVAILABLE_UNDER_FIREWALL
   record canaries.firewall.docker_control_available bool true
-  input_after="$(firewall_counter_value input_deny)"
-  forward_after="$(firewall_counter_value forward_deny)"
-  output_after="$(firewall_counter_value output_deny)"
-  [[ "$input_after" == "$EXPECTED_INPUT_DENIES" && "$forward_after" == "$EXPECTED_FORWARD_DENIES" && "$output_after" == "$EXPECTED_OUTPUT_DENIES" ]] \
-    || block FIREWALL_UNEXPECTED_DENY_HIT
-  record firewall.final_input_deny_count int "$input_after"
-  record firewall.final_forward_deny_count int "$forward_after"
-  record firewall.final_output_deny_count int "$output_after"
-  record firewall.unexpected_deny_hit_count int 0
+  firewall_marker_finish
   native_listener_contract post_cli \
     || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"
   record source_contract.supabase_cli_invoked bool false
