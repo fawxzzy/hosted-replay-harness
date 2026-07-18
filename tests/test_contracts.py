@@ -277,8 +277,39 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertEqual(rehearsal.count("docker run -d"), 3)
         self.assertEqual(rehearsal.count('"$POSTGRES_PULL"'), 4)
         self.assertEqual(rehearsal.count("--tmpfs"), 3)
+        for exact_tmpfs in (
+            '--tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=1g"',
+            '--tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=64m"',
+        ):
+            self.assertIn(exact_tmpfs, rehearsal)
         self.assertNotIn('"$GOTRUE_PULL"', rehearsal)
         self.assertNotRegex(rehearsal, r"docker (pull|build|network create|volume create)")
+
+    def test_unpublished_container_uses_exact_legacy_tmpfs_inspection_contract(self) -> None:
+        validator = self.runner[
+            self.runner.index("validate_unpublished_container() {") : self.runner.index(
+                "run_firewall_publication_rehearsal() {"
+            )
+        ]
+        for fragment in (
+            "{{len .HostConfig.Binds}}",
+            "{{len .HostConfig.Mounts}}",
+            "{{len .HostConfig.VolumesFrom}}",
+            "{{len .Mounts}}",
+            "{{json .HostConfig.Tmpfs}}",
+            "from direct_port_probe import legacy_tmpfs_matches",
+        ):
+            self.assertIn(fragment, validator)
+        self.assertIn("legacy_tmpfs_matches(payload, sys.argv[2])", validator)
+        self.assertNotIn("expected_mount_count", validator)
+        self.assertIn(
+            'validate_unpublished_container "$client_id" "$NETWORK_ID" 64m FIREWALL_CLIENT',
+            self.runner,
+        )
+        self.assertIn(
+            'validate_unpublished_container "$foreign_id" bridge 1g FOREIGN_CANARY',
+            self.runner,
+        )
 
     def test_firewall_gateway_request_and_exact_ipam_readback_precede_mutation(self) -> None:
         request_check = 'gateway_contract request "$SUBNET" "$SUBNET_GATEWAY"'
@@ -3070,8 +3101,10 @@ def direct_inspection() -> dict:
         "pid_mode": "",
         "ipc_mode": "private",
         "binds": [],
+        "host_mounts": [],
+        "volumes_from": [],
         "tmpfs": {
-            "/var/lib/postgresql/data": "rw,nosuid,nodev,noexec,size=1073741824"
+            "/var/lib/postgresql/data": "rw,nosuid,nodev,noexec,size=1g"
         },
         "devices": [],
         "device_requests": [],
@@ -3080,14 +3113,7 @@ def direct_inspection() -> dict:
         "extra_hosts": [],
         "port_bindings": {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]},
         "restart_policy": {"Name": "no", "MaximumRetryCount": 0},
-        "mounts": [
-            {
-                "Type": "tmpfs",
-                "Source": "",
-                "Destination": "/var/lib/postgresql/data",
-                "RW": True,
-            }
-        ],
+        "mounts": [],
         "networks": {"packet": {"NetworkID": network_id}},
         "published_ports": {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}]},
         "restart_count": 0,
@@ -3115,6 +3141,76 @@ class DirectPortProbeTests(unittest.TestCase):
         self.assertRegex(direct_port.identity_digest("opaque"), r"^sha256:[0-9a-f]{64}$")
         self.assertNotIn("Config.Env", direct_port.INSPECT_TEMPLATE)
         self.assertNotIn("__ENV__", direct_port.INSPECT_TEMPLATE)
+        self.assertIn("{{json .HostConfig.Mounts}}", direct_port.INSPECT_TEMPLATE)
+        self.assertIn("{{json .HostConfig.VolumesFrom}}", direct_port.INSPECT_TEMPLATE)
+
+    def test_legacy_tmpfs_requires_one_exact_destination_and_normalized_options(self) -> None:
+        destination = "/var/lib/postgresql/data"
+        self.assertTrue(
+            direct_port.legacy_tmpfs_matches(
+                {destination: "size=1g,noexec,nodev,nosuid,rw"}, "1g"
+            )
+        )
+        rejected = (
+            None,
+            {},
+            {destination: "rw,nosuid,nodev,noexec"},
+            {destination: "rw,nosuid,nodev,noexec,size=64m"},
+            {destination: "rw,nosuid,nodev,noexec,size=1g,rw"},
+            {destination: "rw,nosuid,nodev,noexec,size=1g,exec"},
+            {destination: ["rw", "nosuid", "nodev", "noexec", "size=1g"]},
+            {"/unexpected": "rw,nosuid,nodev,noexec,size=1g"},
+            {
+                destination: "rw,nosuid,nodev,noexec,size=1g",
+                "/unexpected": "rw,nosuid,nodev,noexec,size=1g",
+            },
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload):
+                self.assertFalse(direct_port.legacy_tmpfs_matches(payload, "1g"))
+        exact_options = {"rw", "nosuid", "nodev", "noexec", "size=1g"}
+        for removed in exact_options:
+            with self.subTest(removed=removed):
+                remaining = sorted(exact_options - {removed})
+                self.assertFalse(
+                    direct_port.legacy_tmpfs_matches(
+                        {destination: ",".join(remaining)}, "1g"
+                    )
+                )
+
+    def test_rejects_every_mount_substitution_and_requires_empty_top_level_mounts(self) -> None:
+        substitutions = (
+            ("binds", ["named:/var/lib/postgresql/data"], "DIRECT_BIND_MOUNT_REJECTED"),
+            (
+                "host_mounts",
+                [{"Type": "tmpfs", "Target": "/var/lib/postgresql/data"}],
+                "DIRECT_MOUNT_CONTRACT_MISMATCH",
+            ),
+            ("volumes_from", ["foreign:rw"], "DIRECT_MOUNT_CONTRACT_MISMATCH"),
+            (
+                "mounts",
+                [
+                    {
+                        "Type": "volume",
+                        "Source": "opaque",
+                        "Destination": "/var/lib/postgresql/data",
+                        "RW": True,
+                    }
+                ],
+                "DIRECT_MOUNT_CONTRACT_MISMATCH",
+            ),
+        )
+        for field, value, code in substitutions:
+            with self.subTest(field=field):
+                data = direct_inspection()
+                data[field] = value
+                self.assertIn(code, self.validate(data))
+
+        socket_data = direct_inspection()
+        socket_data["host_mounts"] = [
+            {"Type": "bind", "Source": "/var/run/docker.sock", "Target": "/socket"}
+        ]
+        self.assertIn("DIRECT_DOCKER_SOCKET_REJECTED", self.validate(socket_data))
 
     def test_unknown_or_corrupt_inspection_schema_fails_closed(self) -> None:
         self.assertEqual(self.validate({}), ["DIRECT_INSPECTION_SCHEMA_INVALID"])

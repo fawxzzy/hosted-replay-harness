@@ -1168,7 +1168,8 @@ wait_healthy_container() {
 }
 
 validate_unpublished_container() {
-  local container_id="$1" expected_network_mode="$2" expected_mount_count="$3" code_prefix="$4"
+  local container_id="$1" expected_network_mode="$2" expected_tmpfs_size="$3" code_prefix="$4"
+  local tmpfs_json
   [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == "$expected_network_mode" ]] \
     || block "${code_prefix}_NETWORK_MISMATCH"
   [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container_id")" == "false" ]] \
@@ -1181,14 +1182,33 @@ validate_unpublished_container() {
     || block "${code_prefix}_EXTRA_NETWORK_REJECTED"
   [[ "$(docker inspect --format '{{len .HostConfig.Binds}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_BIND_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.Mounts}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_MOUNT_REJECTED"
+  [[ "$(docker inspect --format '{{len .HostConfig.VolumesFrom}}' "$container_id")" == "0" ]] \
+    || block "${code_prefix}_MOUNT_REJECTED"
   [[ "$(docker inspect --format '{{len .HostConfig.CapAdd}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_CAPABILITY_REJECTED"
   [[ "$(docker inspect --format '{{len .HostConfig.Devices}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_DEVICE_REJECTED"
   [[ "$(docker inspect --format '{{len .HostConfig.SecurityOpt}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_SECURITY_OPTION_REJECTED"
-  [[ "$(docker inspect --format '{{len .Mounts}}' "$container_id")" == "$expected_mount_count" ]] \
+  [[ "$(docker inspect --format '{{len .Mounts}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_MOUNT_REJECTED"
+  tmpfs_json="$(docker inspect --format '{{json .HostConfig.Tmpfs}}' "$container_id")" \
+    || block "${code_prefix}_MOUNT_REJECTED"
+  printf '%s' "$tmpfs_json" | python3 -B -c '
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from direct_port_probe import legacy_tmpfs_matches
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if legacy_tmpfs_matches(payload, sys.argv[2]) else 1)
+' "$ROOT/scripts" "$expected_tmpfs_size" || block "${code_prefix}_MOUNT_REJECTED"
   [[ "$(docker inspect --format '{{len (index .NetworkSettings.Ports "5432/tcp")}}' "$container_id")" == "0" ]] \
     || block "${code_prefix}_PUBLICATION_REJECTED"
 }
@@ -1298,8 +1318,8 @@ while True:
     "$POSTGRES_PULL" sleep 300 2>"$RAW/firewall-client-create.log")" \
     || block FIREWALL_CLIENT_CONTAINER_CREATE_FAILED
 
-  validate_unpublished_container "$client_id" "$NETWORK_ID" 1 FIREWALL_CLIENT
-  validate_unpublished_container "$foreign_id" bridge 1 FOREIGN_CANARY
+  validate_unpublished_container "$client_id" "$NETWORK_ID" 64m FIREWALL_CLIENT
+  validate_unpublished_container "$foreign_id" bridge 1g FOREIGN_CANARY
 
   wait_healthy_container "$foreign_id" FOREIGN_CANARY_NOT_HEALTHY
   wait_healthy_container "$service_id" FIREWALL_SERVICE_NOT_HEALTHY

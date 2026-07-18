@@ -25,6 +25,7 @@ ROLE = "direct-postgres"
 CONTAINER_NAME = f"{PROJECT}-direct-postgres"
 DB_PORT = "56422"
 DB_DESTINATION = "/var/lib/postgresql/data"
+LEGACY_TMPFS_BASE_OPTIONS = frozenset({"rw", "nosuid", "nodev", "noexec"})
 EXPECTED_LABELS = {
     "io.fawxzzy.packet": PACKET,
     "io.fawxzzy.role": ROLE,
@@ -47,6 +48,8 @@ def _template() -> str:
             "pid_mode": "__PID_MODE__",
             "ipc_mode": "__IPC_MODE__",
             "binds": "__BINDS__",
+            "host_mounts": "__HOST_MOUNTS__",
+            "volumes_from": "__VOLUMES_FROM__",
             "tmpfs": "__TMPFS__",
             "devices": "__DEVICES__",
             "device_requests": "__DEVICE_REQUESTS__",
@@ -80,6 +83,8 @@ def _template() -> str:
         '"__PID_MODE__"': "{{json .HostConfig.PidMode}}",
         '"__IPC_MODE__"': "{{json .HostConfig.IpcMode}}",
         '"__BINDS__"': "{{json .HostConfig.Binds}}",
+        '"__HOST_MOUNTS__"': "{{json .HostConfig.Mounts}}",
+        '"__VOLUMES_FROM__"': "{{json .HostConfig.VolumesFrom}}",
         '"__TMPFS__"': "{{json .HostConfig.Tmpfs}}",
         '"__DEVICES__"': "{{json .HostConfig.Devices}}",
         '"__DEVICE_REQUESTS__"': "{{json .HostConfig.DeviceRequests}}",
@@ -113,6 +118,33 @@ def identity_digest(value: str) -> str:
 
 def _empty(value: Any) -> bool:
     return value in (None, [], {})
+
+
+def legacy_tmpfs_matches(value: Any, expected_size: str) -> bool:
+    """Validate Docker's legacy --tmpfs HostConfig representation exactly."""
+
+    if not isinstance(value, dict) or set(value) != {DB_DESTINATION}:
+        return False
+    raw_options = value.get(DB_DESTINATION)
+    if not isinstance(raw_options, str):
+        return False
+    options = raw_options.split(",")
+    if not options or any(not option for option in options):
+        return False
+    if len(options) != len(set(options)):
+        return False
+    return set(options) == LEGACY_TMPFS_BASE_OPTIONS | {f"size={expected_size}"}
+
+
+def _contains_docker_socket(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _contains_docker_socket(key) or _contains_docker_socket(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_docker_socket(item) for item in value)
+    return isinstance(value, str) and "docker.sock" in value
 
 
 def validate_inspection(
@@ -164,31 +196,23 @@ def validate_inspection(
         violations.append("DIRECT_SECURITY_OPTION_REJECTED")
     if not _empty(data.get("extra_hosts")):
         violations.append("DIRECT_EXTRA_HOST_REJECTED")
-    if not _empty(data.get("binds")):
+    binds = data.get("binds")
+    host_mounts = data.get("host_mounts")
+    volumes_from = data.get("volumes_from")
+    mounts = data.get("mounts")
+    if not _empty(binds):
         violations.append("DIRECT_BIND_MOUNT_REJECTED")
+    if not _empty(host_mounts) or not _empty(volumes_from) or not _empty(mounts):
+        violations.append("DIRECT_MOUNT_CONTRACT_MISMATCH")
+    if any(
+        _contains_docker_socket(value)
+        for value in (binds, host_mounts, volumes_from, mounts)
+    ):
+        violations.append("DIRECT_DOCKER_SOCKET_REJECTED")
 
     tmpfs = data.get("tmpfs")
-    if not isinstance(tmpfs, dict) or set(tmpfs) != {DB_DESTINATION}:
+    if not legacy_tmpfs_matches(tmpfs, "1g"):
         violations.append("DIRECT_TMPFS_CONTRACT_MISMATCH")
-    else:
-        options = {item for item in str(tmpfs[DB_DESTINATION]).split(",") if item}
-        if not {"rw", "nosuid", "nodev", "noexec"}.issubset(options) or not any(
-            item in options for item in ("size=1073741824", "size=1g")
-        ):
-            violations.append("DIRECT_TMPFS_CONTRACT_MISMATCH")
-
-    mounts = data.get("mounts")
-    if not (
-        isinstance(mounts, list)
-        and len(mounts) == 1
-        and isinstance(mounts[0], dict)
-        and mounts[0].get("Type") == "tmpfs"
-        and mounts[0].get("Destination") == DB_DESTINATION
-        and mounts[0].get("RW") is True
-    ):
-        violations.append("DIRECT_MOUNT_CONTRACT_MISMATCH")
-    elif any("docker.sock" in str(mounts[0].get(key, "")) for key in ("Source", "Destination")):
-        violations.append("DIRECT_DOCKER_SOCKET_REJECTED")
 
     requested = data.get("port_bindings")
     if requested != {"5432/tcp": [{"HostIp": "", "HostPort": DB_PORT}]}:
