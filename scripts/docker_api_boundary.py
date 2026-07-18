@@ -19,6 +19,12 @@ from urllib.parse import parse_qs, unquote, urlsplit
 SCHEMA: Final = "fawxzzy.hosted-replay-harness.docker-api-boundary.v2"
 POLICY_SCHEMA: Final = "fawxzzy.hosted-replay-harness.db-start-policy.v1"
 POLICY_MATRIX_SHA256: Final = "9669ebd4ae75cfdc3950c9db8b2786270023ce0e26dde993806b3f7b6b2c5492"
+MOBY_VERSION: Final = "v28.5.2"
+MOBY_CREATE_REQUEST_BLOB_SHA: Final = "e98dd6ad449b016b21e6be138b231c3a1c0907dd"
+MOBY_CONTAINER_CREATE_BLOB_SHA: Final = "0625cb125ccb4df10be660265dcb4ed8075c619c"
+NESTED_CREATE_REQUEST_SHAPE_SHA256: Final = "659f6de31b8eb20f2602c078389db457ecbf9e0e4c2bd3920f8832131bd223b4"
+FLAT_CREATE_REQUEST_SHAPE_SHA256: Final = "983cd463a268bd157911f3d37d78903acfb03513f342339fcb3d08ad83bad62e"
+FLAT_GOTRUE_CREATE_REQUEST_SHAPE_SHA256: Final = "d5af8a9a506e8e1893c04e96297c774e71e39ce9707891523093f653118192a1"
 PHASES: Final = (
     "API_NEGOTIATION",
     "IMAGE_INSPECT",
@@ -182,6 +188,22 @@ def _empty(value: object) -> bool:
     return False
 
 
+def _json_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "unknown"
+
+
 def _exact_keys(value: dict[str, object], allowed: Iterable[str]) -> None:
     if not set(value).issubset(set(allowed)):
         raise PolicyViolation("POLICY_BODY_REJECTED")
@@ -206,6 +228,35 @@ def _split_env(values: object, allowed: set[str]) -> dict[str, str]:
 class DBStartPolicy:
     """Closed one-shot policy for the pinned database-only CLI lifecycle."""
 
+    # Moby v28.5.2 CreateRequest anonymously embeds *container.Config. Go's
+    # JSON encoder therefore places these exact fields beside HostConfig and
+    # NetworkingConfig instead of under a nested Config key.
+    DB_CONFIG_WIRE_TYPES: Final = {
+        "AttachStderr": "boolean",
+        "AttachStdin": "boolean",
+        "AttachStdout": "boolean",
+        "Cmd": "null",
+        "Domainname": "string",
+        "Entrypoint": "array",
+        "Env": "array",
+        "Healthcheck": "object",
+        "Hostname": "string",
+        "Image": "string",
+        "Labels": "object",
+        "OnBuild": "null",
+        "OpenStdin": "boolean",
+        "StdinOnce": "boolean",
+        "Tty": "boolean",
+        "User": "string",
+        "Volumes": "null",
+        "WorkingDir": "string",
+    }
+    GOTRUE_CONFIG_WIRE_TYPES: Final = {
+        **DB_CONFIG_WIRE_TYPES,
+        "Cmd": "array",
+        "Entrypoint": "null",
+    }
+    del GOTRUE_CONFIG_WIRE_TYPES["Healthcheck"]
     CONFIG_KEYS: Final = {
         "Hostname", "Domainname", "User", "AttachStdin", "AttachStdout", "AttachStderr",
         "ExposedPorts", "Tty", "OpenStdin", "StdinOnce", "Env", "Cmd", "Healthcheck",
@@ -389,11 +440,15 @@ class DBStartPolicy:
                 self.fail("POLICY_BODY_REJECTED")
 
     def _container_body(self, body: dict[str, object], database: bool) -> None:
-        if set(body) != {"Config", "HostConfig", "NetworkingConfig"}:
+        wire_types = self.DB_CONFIG_WIRE_TYPES if database else self.GOTRUE_CONFIG_WIRE_TYPES
+        expected_keys = set(wire_types) | {"HostConfig", "NetworkingConfig"}
+        if set(body) != expected_keys or "Config" in body:
             self.fail("POLICY_BODY_REJECTED")
-        config = body["Config"]
+        if any(_json_type(body[key]) != kind for key, kind in wire_types.items()):
+            self.fail("POLICY_BODY_REJECTED")
+        config = {key: body[key] for key in wire_types}
         host = body["HostConfig"]
-        if not isinstance(config, dict) or not isinstance(host, dict):
+        if not isinstance(host, dict) or not isinstance(body["NetworkingConfig"], dict):
             self.fail("POLICY_BODY_REJECTED")
         expected_image = self.data["postgres_image_ref"] if database else self.data["gotrue_image_ref"]
         if config.get("Image") != expected_image:

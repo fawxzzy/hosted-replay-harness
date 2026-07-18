@@ -1566,23 +1566,34 @@ class DbStartPolicyTests(unittest.TestCase):
 
     def db_create_body(self) -> dict[str, object]:
         return {
-            "Config": {
-                "Image": "public.ecr.aws/supabase/postgres:17.6.1.143",
-                "Labels": self.labels(),
-                "Env": [
-                    "POSTGRES_PASSWORD=private-password",
-                    "POSTGRES_HOST=/var/run/postgresql",
-                    "JWT_SECRET=private-jwt",
-                    "JWT_EXP=3600",
-                ],
-                "Healthcheck": {
-                    "Test": ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1", "-p", "5432"],
-                    "Interval": 10_000_000_000,
-                    "Timeout": 2_000_000_000,
-                    "Retries": 3,
-                },
-                "Entrypoint": ["sh", "-c", "schema material private-root-key\ndocker-entrypoint.sh postgres -D /etc/postgresql"],
+            "Hostname": "",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": False,
+            "AttachStdout": False,
+            "AttachStderr": False,
+            "Tty": False,
+            "OpenStdin": False,
+            "StdinOnce": False,
+            "Env": [
+                "POSTGRES_PASSWORD=private-password",
+                "POSTGRES_HOST=/var/run/postgresql",
+                "JWT_SECRET=private-jwt",
+                "JWT_EXP=3600",
+            ],
+            "Cmd": None,
+            "Healthcheck": {
+                "Test": ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1", "-p", "5432"],
+                "Interval": 10_000_000_000,
+                "Timeout": 2_000_000_000,
+                "Retries": 3,
             },
+            "Image": "public.ecr.aws/supabase/postgres:17.6.1.143",
+            "Volumes": None,
+            "WorkingDir": "",
+            "Entrypoint": ["sh", "-c", "schema material private-root-key\ndocker-entrypoint.sh postgres -D /etc/postgresql"],
+            "OnBuild": None,
+            "Labels": self.labels(),
             "HostConfig": {
                 "Binds": ["supabase_db_fp-hosted-replay-ro-001:/var/lib/postgresql/data"],
                 "NetworkMode": "fp-hosted-replay-ro-001-net",
@@ -1601,25 +1612,93 @@ class DbStartPolicyTests(unittest.TestCase):
 
     def gotrue_create_body(self) -> dict[str, object]:
         return {
-            "Config": {
-                "Image": "public.ecr.aws/supabase/gotrue:v2.192.0",
-                "Labels": self.labels(),
-                "Env": [
-                    "API_EXTERNAL_URL=http://127.0.0.1:54321",
-                    "GOTRUE_LOG_LEVEL=error",
-                    "GOTRUE_DB_DRIVER=postgres",
-                    "GOTRUE_DB_DATABASE_URL=postgresql://supabase_auth_admin:private-password@supabase_db_fp-hosted-replay-ro-001:5432/postgres",
-                    "GOTRUE_SITE_URL=http://localhost:3000",
-                    "GOTRUE_JWT_SECRET=private-jwt",
-                ],
-                "Cmd": ["gotrue", "migrate"],
-            },
+            "Hostname": "",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": False,
+            "AttachStdout": False,
+            "AttachStderr": False,
+            "Tty": False,
+            "OpenStdin": False,
+            "StdinOnce": False,
+            "Env": [
+                "API_EXTERNAL_URL=http://127.0.0.1:54321",
+                "GOTRUE_LOG_LEVEL=error",
+                "GOTRUE_DB_DRIVER=postgres",
+                "GOTRUE_DB_DATABASE_URL=postgresql://supabase_auth_admin:private-password@supabase_db_fp-hosted-replay-ro-001:5432/postgres",
+                "GOTRUE_SITE_URL=http://localhost:3000",
+                "GOTRUE_JWT_SECRET=private-jwt",
+            ],
+            "Cmd": ["gotrue", "migrate"],
+            "Image": "public.ecr.aws/supabase/gotrue:v2.192.0",
+            "Volumes": None,
+            "WorkingDir": "",
+            "Entrypoint": None,
+            "OnBuild": None,
+            "Labels": self.labels(),
             "HostConfig": {
                 "NetworkMode": "fp-hosted-replay-ro-001-net",
                 "ExtraHosts": ["host.docker.internal:host-gateway"],
             },
             "NetworkingConfig": {},
         }
+
+    @staticmethod
+    def shape_digest(body: dict[str, object]) -> str:
+        canonical = "".join(
+            f"{key}\t{docker_api_boundary._json_type(body[key])}\n"
+            for key in sorted(body)
+        ).encode()
+        return hashlib.sha256(canonical).hexdigest()
+
+    def test_moby_source_identity_and_exact_flat_create_shapes(self) -> None:
+        self.assertEqual(docker_api_boundary.MOBY_VERSION, "v28.5.2")
+        self.assertEqual(
+            docker_api_boundary.MOBY_CREATE_REQUEST_BLOB_SHA,
+            "e98dd6ad449b016b21e6be138b231c3a1c0907dd",
+        )
+        self.assertEqual(
+            docker_api_boundary.MOBY_CONTAINER_CREATE_BLOB_SHA,
+            "0625cb125ccb4df10be660265dcb4ed8075c619c",
+        )
+        nested_shape = {
+            "Config": {},
+            "HostConfig": {},
+            "NetworkingConfig": {},
+        }
+        self.assertEqual(len(nested_shape), 3)
+        self.assertEqual(
+            self.shape_digest(nested_shape),
+            docker_api_boundary.NESTED_CREATE_REQUEST_SHAPE_SHA256,
+        )
+        database = self.db_create_body()
+        self.assertEqual(len(database), 20)
+        self.assertEqual(
+            self.shape_digest(database),
+            docker_api_boundary.FLAT_CREATE_REQUEST_SHAPE_SHA256,
+        )
+        gotrue = self.gotrue_create_body()
+        self.assertEqual(len(gotrue), 19)
+        self.assertEqual(
+            self.shape_digest(gotrue),
+            docker_api_boundary.FLAT_GOTRUE_CREATE_REQUEST_SHAPE_SHA256,
+        )
+        self.assertNotIn("Config", database)
+        self.assertNotIn("Config", gotrue)
+        self.assertEqual(
+            set(database) - {"HostConfig", "NetworkingConfig"},
+            set(docker_api_boundary.DBStartPolicy.DB_CONFIG_WIRE_TYPES),
+        )
+        self.assertEqual(
+            set(gotrue) - {"HostConfig", "NetworkingConfig"},
+            set(docker_api_boundary.DBStartPolicy.GOTRUE_CONFIG_WIRE_TYPES),
+        )
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        policy._container_body(database, database=True)
+        policy._container_body(gotrue, database=False)
+        gotrue["Cmd"] = ["gotrue", "serve"]
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_BODY_REJECTED"):
+            policy._container_body(gotrue, database=False)
 
     def inspect_body(self, database: bool, health: str = "healthy") -> dict[str, object]:
         value: dict[str, object] = {
@@ -1781,14 +1860,32 @@ class DbStartPolicyTests(unittest.TestCase):
 
     def test_identity_port_privilege_bind_capability_and_unknown_fields_rejected(self) -> None:
         mutations = (
-            ("Config", "Image", "drifted/image:tag"),
-            ("Config", "Labels", {"com.supabase.cli.project": "other"}),
+            ("TopLevel", "Image", "drifted/image:tag"),
+            ("TopLevel", "Labels", {"com.supabase.cli.project": "other"}),
+            ("TopLevel", "Env", [
+                "POSTGRES_PASSWORD=private-password",
+                "POSTGRES_HOST=/var/run/postgresql",
+                "JWT_SECRET=private-jwt",
+                "JWT_EXP=3600",
+                "UNEXPECTED=value",
+            ]),
+            ("TopLevel", "Healthcheck", {"Test": ["NONE"]}),
+            ("TopLevel", "Entrypoint", ["sh", "-c", "unexpected"]),
             ("HostConfig", "NetworkMode", "other-network"),
             ("HostConfig", "PortBindings", {"5432/tcp": [{"HostIp": "0.0.0.0", "HostPort": "56422"}]}),
             ("HostConfig", "Privileged", True),
+            ("HostConfig", "PidMode", "host"),
+            ("HostConfig", "IpcMode", "host"),
             ("HostConfig", "Binds", ["foreign:/var/lib/postgresql/data"]),
             ("HostConfig", "CapAdd", ["SYS_ADMIN"]),
+            ("HostConfig", "Devices", [{"PathOnHost": "opaque"}]),
+            ("HostConfig", "SecurityOpt", ["label:disable"]),
+            ("HostConfig", "Mounts", [{"Type": "bind"}]),
             ("HostConfig", "UnknownField", "value"),
+            ("NetworkingConfig", "EndpointsConfig", {
+                "fp-hosted-replay-ro-001-net": {"Aliases": ["db", "db.supabase.internal"]},
+                "foreign-network": {},
+            }),
         )
         for section, key, value in mutations:
             with self.subTest(section=section, key=key):
@@ -1799,7 +1896,10 @@ class DbStartPolicyTests(unittest.TestCase):
                 self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
                 self.exchange(policy, b"POST", "/v1.48/volumes/create", 201, request=volume, response={"Name": volume["Name"]})
                 body = self.db_create_body()
-                body[section][key] = value
+                if section == "TopLevel":
+                    body[key] = value
+                else:
+                    body[section][key] = value
                 with self.assertRaises(docker_api_boundary.PolicyViolation):
                     self.exchange(
                         policy,
@@ -1809,6 +1909,161 @@ class DbStartPolicyTests(unittest.TestCase):
                         request=body,
                         response={"Id": self.DB_ID},
                     )
+
+    def test_flat_create_shape_rejects_nested_missing_unknown_wrong_types_and_substitution(self) -> None:
+        database = self.db_create_body()
+        config = {
+            key: value
+            for key, value in database.items()
+            if key not in {"HostConfig", "NetworkingConfig"}
+        }
+        invalid_bodies: list[dict[str, object]] = []
+
+        nested = {
+            "Config": config,
+            "HostConfig": database["HostConfig"],
+            "NetworkingConfig": database["NetworkingConfig"],
+        }
+        invalid_bodies.append(nested)
+        for missing in ("Hostname", "Env", "HostConfig", "NetworkingConfig"):
+            body = self.db_create_body()
+            body.pop(missing)
+            invalid_bodies.append(body)
+        for key, value in (
+            ("UnknownTopLevel", None),
+            ("Hostname", None),
+            ("AttachStdin", 0),
+            ("Env", {}),
+            ("Cmd", []),
+            ("Healthcheck", []),
+            ("HostConfig", []),
+            ("NetworkingConfig", []),
+        ):
+            body = self.db_create_body()
+            body[key] = value
+            invalid_bodies.append(body)
+        swapped = self.db_create_body()
+        swapped["HostConfig"], swapped["NetworkingConfig"] = (
+            swapped["NetworkingConfig"],
+            swapped["HostConfig"],
+        )
+        invalid_bodies.append(swapped)
+
+        for index, body in enumerate(invalid_bodies):
+            with self.subTest(index=index):
+                policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+                self.advance_to_network(policy)
+                network = {"Name": "fp-hosted-replay-ro-001-net", "Labels": self.labels()}
+                volume = {"Name": "supabase_db_fp-hosted-replay-ro-001", "Labels": self.labels()}
+                self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
+                self.exchange(policy, b"POST", "/v1.48/volumes/create", 201, request=volume, response={"Name": volume["Name"]})
+                with self.assertRaises(docker_api_boundary.PolicyViolation):
+                    self.exchange(
+                        policy,
+                        b"POST",
+                        "/v1.48/containers/create?name=supabase_db_fp-hosted-replay-ro-001",
+                        201,
+                        request=body,
+                        response={"Id": self.DB_ID},
+                    )
+
+        duplicate = json.dumps(database, separators=(",", ":"))[:-1] + ',"Hostname":""}'
+        with self.assertRaisesRegex(docker_api_boundary.PolicyViolation, "POLICY_BODY_REJECTED"):
+            docker_api_boundary._closed_json(duplicate.encode(), 1024 * 1024)
+
+    def test_rejected_create_is_not_forwarded_and_cleanup_list_is_separate(self) -> None:
+        class FramedReader:
+            def __init__(self, data: bytes) -> None:
+                self.data = bytearray(data)
+
+            async def readuntil(self, separator: bytes) -> bytes:
+                index = self.data.find(separator)
+                if index < 0:
+                    partial = bytes(self.data)
+                    self.data.clear()
+                    raise asyncio.IncompleteReadError(partial, None)
+                end = index + len(separator)
+                value = bytes(self.data[:end])
+                del self.data[:end]
+                return value
+
+            async def readexactly(self, size: int) -> bytes:
+                if len(self.data) < size:
+                    partial = bytes(self.data)
+                    self.data.clear()
+                    raise asyncio.IncompleteReadError(partial, size)
+                value = bytes(self.data[:size])
+                del self.data[:size]
+                return value
+
+        policy = docker_api_boundary.DBStartPolicy(self.policy_data())
+        self.advance_to_network(policy)
+        network = {"Name": "fp-hosted-replay-ro-001-net", "Labels": self.labels()}
+        volume = {"Name": "supabase_db_fp-hosted-replay-ro-001", "Labels": self.labels()}
+        self.exchange(policy, b"POST", "/v1.48/networks/create", 409, request=network)
+        self.exchange(policy, b"POST", "/v1.48/volumes/create", 201, request=volume, response={"Name": volume["Name"]})
+
+        flat = self.db_create_body()
+        nested = {
+            "Config": {
+                key: value
+                for key, value in flat.items()
+                if key not in {"HostConfig", "NetworkingConfig"}
+            },
+            "HostConfig": flat["HostConfig"],
+            "NetworkingConfig": flat["NetworkingConfig"],
+        }
+        raw = json.dumps(nested, separators=(",", ":")).encode()
+        create_request = (
+            b"POST /v1.48/containers/create?name=supabase_db_fp-hosted-replay-ro-001 HTTP/1.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(raw)}\r\n\r\n".encode()
+            + raw
+        )
+        cleanup_request = b"GET /v1.48/containers/json HTTP/1.1\r\n\r\n"
+
+        async def exercise() -> tuple[bytes, bytes, dict[str, object]]:
+            receipt = docker_api_boundary.Receipt()
+            server = docker_api_boundary.PolicyBoundaryServer(
+                Path("packet.sock"), Path("docker.sock"), receipt, policy
+            )
+            upstream_writers = [
+                DockerApiBoundaryTests.FakeWriter(),
+                DockerApiBoundaryTests.FakeWriter(),
+            ]
+            upstreams = iter(
+                (FramedReader(b""), writer) for writer in upstream_writers
+            )
+
+            async def open_upstream(_path: str) -> tuple[FramedReader, DockerApiBoundaryTests.FakeWriter]:
+                return next(upstreams)
+
+            with mock.patch.object(
+                docker_api_boundary.asyncio,
+                "open_unix_connection",
+                side_effect=open_upstream,
+                create=True,
+            ):
+                await server.handle(
+                    FramedReader(create_request), DockerApiBoundaryTests.FakeWriter()
+                )
+                await server.handle(
+                    FramedReader(cleanup_request), DockerApiBoundaryTests.FakeWriter()
+                )
+            return (
+                bytes(upstream_writers[0].data),
+                bytes(upstream_writers[1].data),
+                receipt.sanitized(),
+            )
+
+        create_forwarded, cleanup_forwarded, result = asyncio.run(exercise())
+        self.assertEqual(create_forwarded, b"")
+        self.assertEqual(cleanup_forwarded, b"")
+        self.assertEqual(result["policy_violation_count"], 2)
+        self.assertEqual(result["policy_failure_code"], "POLICY_BODY_REJECTED")
+        self.assertEqual(result["phase_counts"]["CONTAINER_CREATE"], 1)
+        self.assertEqual(result["phase_counts"]["CONTAINER_LIST"], 1)
+        self.assertEqual(result["response_count"], 0)
 
     def test_broad_cleanup_image_pull_exec_and_prune_are_denied(self) -> None:
         prohibited = (

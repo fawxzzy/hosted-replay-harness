@@ -22,6 +22,8 @@ The Docker observer remains read-only when no policy descriptor is supplied. DB 
 
 The admitted endpoint denominator is the source-proven 47-row matrix with SHA-256 `9669ebd4ae75cfdc3950c9db8b2786270023ce0e26dde993806b3f7b6b2c5492`: 18 child lifecycle rows, 17 prohibited rows, and 12 outer-harness rows, with zero endpoint unknowns. Optional `/vX.Y` prefixes must exactly equal the daemon version negotiated by `/_ping`.
 
+Container-create bodies follow the immutable Moby `v28.5.2` wire contract: `api/types/container/create_request.go` blob `e98dd6ad449b016b21e6be138b231c3a1c0907dd` anonymously embeds `*container.Config`, and `client/container_create.go` blob `0625cb125ccb4df10be660265dcb4ed8075c619c` sends that `CreateRequest`. `HostConfig` and `NetworkingConfig` are therefore the only nested wrapper fields; admitted `container.Config` fields are flattened at the top level and projected back into the existing closed validator before forwarding. The obsolete three-field nested shape has canonical SHA-256 `659f6de31b8eb20f2602c078389db457ecbf9e0e4c2bd3920f8832131bd223b4` and is rejected. The exact database shape has 20 fields and SHA-256 `983cd463a268bd157911f3d37d78903acfb03513f342339fcb3d08ad83bad62e`; the exact GoTrue shape has 19 fields and SHA-256 `d5af8a9a506e8e1893c04e96297c774e71e39ce9707891523093f653118192a1`. Each digest is computed over sorted `field<TAB>JSON-type<LF>` records. These source identities and shape digests are committed constants and tests; the hosted runner never fetches source at runtime.
+
 The child sequence is single-use and ordered:
 
 1. `HEAD /_ping`, with the source-conditional `GET` fallback only.
