@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -164,6 +165,8 @@ VERSION_RE = re.compile(r"^nftables v([0-9]+)\.([0-9]+)\.([0-9]+)(?:[ -].*)?$")
 SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 SAFE_IFACE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
 SAFE_SUBNET_RE = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}/[0-9]{1,2}$")
+RESTORATION_POLL_ATTEMPTS = 20
+RESTORATION_POLL_INTERVAL_SECONDS = 0.5
 LEDGER_KEYS = {
     "schema",
     "table",
@@ -2293,6 +2296,36 @@ def marker_counters(ledger_path: Path) -> None:
     )
 
 
+def wait_for_restoration_preimage(
+    prefix: list[str], ledger: dict[str, Any], entries: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Wait boundedly for Docker teardown to restore the immutable preimage.
+
+    The helper never adopts a different foreign state.  It also revalidates the
+    exact packet-owned table on every observation so the wait cannot hide owned
+    drift before the atomic deletion transaction.
+    """
+
+    for attempt in range(RESTORATION_POLL_ATTEMPTS):
+        selected = owned_entries(entries, TABLE)
+        if selected:
+            if ledger.get("markers_installed") is True:
+                _validated_current_owned(entries, ledger)
+            else:
+                validate_owned(entries, TABLE, markers_installed=False)
+        foreign_sha, foreign_counts = canonical_snapshot(entries, exclude_table=TABLE)
+        if (
+            foreign_sha == ledger["preimage_sha256"]
+            and foreign_counts == ledger["preimage_counts"]
+        ):
+            return entries, selected
+        if attempt + 1 == RESTORATION_POLL_ATTEMPTS:
+            break
+        time.sleep(RESTORATION_POLL_INTERVAL_SECONDS)
+        entries = read_ruleset(prefix)
+    raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
+
+
 def remove(ledger_path: Path) -> None:
     prefix, _ = privileged_prefix()
     entries = read_ruleset(prefix)
@@ -2388,15 +2421,8 @@ def remove(ledger_path: Path) -> None:
             ]
         )
         return
-    before_sha, before_counts = canonical_snapshot(entries, exclude_table=TABLE)
-    foreign_drift = before_sha != ledger["preimage_sha256"] or before_counts != ledger["preimage_counts"]
-    if foreign_drift:
-        raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
+    entries, selected = wait_for_restoration_preimage(prefix, ledger, entries)
     if selected:
-        if ledger.get("markers_installed") is True:
-            _validated_current_owned(entries, ledger)
-        else:
-            validate_owned(entries, TABLE, markers_installed=False)
         batch = f"delete table inet {TABLE}\n"
         checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
         if checked.returncode != 0:

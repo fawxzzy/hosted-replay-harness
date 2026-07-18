@@ -6696,7 +6696,10 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
         network_state = baseline + [
             {"chain": {"family": "ip", "table": "docker", "name": "packet-network"}}
         ]
-        owned = owned_firewall_entries()
+        marked = owned_firewall_entries_with_markers()
+        for entry in marked:
+            if entry.get("counter", {}).get("name") == firewall_boundary.OUTPUT_COUNTER:
+                entry["counter"]["packets"] = 24
         success = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
@@ -6704,8 +6707,17 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 ledger,
                 self._restoration_ledger_payload(baseline, markers_installed=False),
             )
+            _, installed = self._write_marker_state(ledger, marked)
+            installed_path = firewall_boundary.marker_installed_path(ledger)
+            installed_path.unlink()
+            installed["mismatch_class"] = "RIGHT_VALUE_IDENTITY"
+            installed["evidence_sha256"] = firewall_boundary.marker_evidence_sha256(
+                installed
+            )
+            firewall_boundary.write_marker_installed(installed_path, installed)
             completion = firewall_boundary.restoration_completion_path(ledger)
             remove_command = mock.Mock(return_value=success)
+            pause = mock.Mock()
             with mock.patch.object(
                 firewall_boundary,
                 "privileged_prefix",
@@ -6713,30 +6725,30 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             ), mock.patch.object(
                 firewall_boundary,
                 "read_ruleset",
-                return_value=network_state + owned,
-            ), mock.patch.object(firewall_boundary, "_run", remove_command):
-                with self.assertRaisesRegex(
-                    firewall_boundary.BoundaryError, "FIREWALL_FOREIGN_STATE_DRIFT"
-                ):
-                    firewall_boundary.remove(ledger)
-            remove_command.assert_not_called()
-            self.assertTrue(ledger.exists())
-            self.assertFalse(completion.exists())
-
-            with mock.patch.object(
-                firewall_boundary,
-                "privileged_prefix",
-                return_value=(["nft"], "nftables-v1"),
+                side_effect=[
+                    network_state + marked,
+                    network_state + marked,
+                    baseline + marked,
+                    baseline,
+                ],
             ), mock.patch.object(
-                firewall_boundary,
-                "read_ruleset",
-                side_effect=[baseline + owned, baseline],
+                firewall_boundary, "_run", remove_command
             ), mock.patch.object(
-                firewall_boundary, "_run", return_value=success
+                firewall_boundary.time, "sleep", pause
             ), contextlib.redirect_stdout(io.StringIO()):
                 firewall_boundary.remove(ledger)
+            self.assertEqual(remove_command.call_count, 2)
+            self.assertEqual(pause.call_count, 2)
+            pause.assert_has_calls(
+                [
+                    mock.call(firewall_boundary.RESTORATION_POLL_INTERVAL_SECONDS),
+                    mock.call(firewall_boundary.RESTORATION_POLL_INTERVAL_SECONDS),
+                ]
+            )
             self.assertFalse(ledger.exists())
             self.assertTrue(completion.exists())
+            self.assertFalse(firewall_boundary.marker_intent_path(ledger).exists())
+            self.assertFalse(firewall_boundary.marker_installed_path(ledger).exists())
 
             with mock.patch.object(
                 firewall_boundary,
@@ -6746,6 +6758,131 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 firewall_boundary, "read_ruleset", return_value=baseline
             ), contextlib.redirect_stdout(io.StringIO()):
                 firewall_boundary.remove(ledger)
+            self.assertFalse(completion.exists())
+
+    def test_cleanup_never_adopts_persistent_foreign_drift(self) -> None:
+        baseline = [{"table": {"family": "ip", "name": "foreign"}}]
+        changed = baseline + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "concurrent"}}
+        ]
+        owned = owned_firewall_entries()
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                self._restoration_ledger_payload(baseline, markers_installed=False),
+            )
+            original = ledger.read_bytes()
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            command = mock.Mock()
+            pause = mock.Mock()
+            ruleset = mock.Mock(return_value=changed + owned)
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary, "read_ruleset", ruleset
+            ), mock.patch.object(
+                firewall_boundary, "_run", command
+            ), mock.patch.object(
+                firewall_boundary.time, "sleep", pause
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_FOREIGN_STATE_DRIFT"
+                ):
+                    firewall_boundary.remove(ledger)
+            self.assertEqual(
+                ruleset.call_count, firewall_boundary.RESTORATION_POLL_ATTEMPTS
+            )
+            self.assertEqual(
+                pause.call_count, firewall_boundary.RESTORATION_POLL_ATTEMPTS - 1
+            )
+            command.assert_not_called()
+            self.assertEqual(ledger.read_bytes(), original)
+            self.assertFalse(completion.exists())
+
+    def test_cleanup_revalidates_owned_shape_during_restoration_wait(self) -> None:
+        baseline = [{"table": {"family": "ip", "name": "foreign"}}]
+        changed = baseline + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "pending"}}
+        ]
+        marked = owned_firewall_entries_with_markers()
+        drifted = copy.deepcopy(marked)
+        self._marker_rules(drifted)[0]["expr"][0]["match"]["right"] = "changed"
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                self._restoration_ledger_payload(baseline, markers_installed=False),
+            )
+            self._write_marker_state(ledger, marked)
+            command = mock.Mock()
+            pause = mock.Mock()
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[changed + marked, changed + drifted],
+            ), mock.patch.object(
+                firewall_boundary, "_run", command
+            ), mock.patch.object(
+                firewall_boundary.time, "sleep", pause
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_INSTALLATION_MISMATCH"
+                ):
+                    firewall_boundary.remove(ledger)
+            pause.assert_called_once_with(
+                firewall_boundary.RESTORATION_POLL_INTERVAL_SECONDS
+            )
+            command.assert_not_called()
+            self.assertTrue(ledger.exists())
+
+    def test_cleanup_wait_inspection_failure_keeps_retry_evidence(self) -> None:
+        baseline = [{"table": {"family": "ip", "name": "foreign"}}]
+        changed = baseline + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "pending"}}
+        ]
+        owned = owned_firewall_entries()
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            firewall_boundary.write_ledger(
+                ledger,
+                self._restoration_ledger_payload(baseline, markers_installed=False),
+            )
+            original = ledger.read_bytes()
+            completion = firewall_boundary.restoration_completion_path(ledger)
+            command = mock.Mock()
+            pause = mock.Mock()
+            with mock.patch.object(
+                firewall_boundary,
+                "privileged_prefix",
+                return_value=(["nft"], "nftables-v1"),
+            ), mock.patch.object(
+                firewall_boundary,
+                "read_ruleset",
+                side_effect=[
+                    changed + owned,
+                    firewall_boundary.BoundaryError("FIREWALL_INSPECTION_FAILED"),
+                ],
+            ), mock.patch.object(
+                firewall_boundary, "_run", command
+            ), mock.patch.object(
+                firewall_boundary.time, "sleep", pause
+            ):
+                with self.assertRaisesRegex(
+                    firewall_boundary.BoundaryError, "FIREWALL_INSPECTION_FAILED"
+                ):
+                    firewall_boundary.remove(ledger)
+            pause.assert_called_once_with(
+                firewall_boundary.RESTORATION_POLL_INTERVAL_SECONDS
+            )
+            command.assert_not_called()
+            self.assertEqual(ledger.read_bytes(), original)
             self.assertFalse(completion.exists())
 
     def test_prepared_or_applied_install_interruption_remains_cleanup_retryable(self) -> None:
