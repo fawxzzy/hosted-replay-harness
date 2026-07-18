@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -1580,21 +1581,9 @@ class DbStartPolicyTests(unittest.TestCase):
 class DbStartLogClassifierTests(unittest.TestCase):
     def test_every_admitted_category_has_a_synthetic_fixture(self) -> None:
         fixtures = {
-            "CONFIG_VALIDATION_FAILED": b"failed to validate config\n",
             "CLI_USAGE_ERROR": b"unknown flag: --not-real\n",
-            "DOCKER_CLIENT_API_NEGOTIATION_FAILED": b"failed to initialize Docker client\n",
-            "IMAGE_RESOLUTION_FAILED": b"manifest unknown\n",
-            "NETWORK_REUSE_ATTACHMENT_REJECTED": b"failed to create docker network\n",
-            "NETWORK_CONFIGURATION_REJECTED": b"network pool is invalid\n",
-            "VOLUME_CREATE_REJECTED": b"failed to create volume\n",
-            "VOLUME_PREPARATION_FAILED": b"failed to parse docker volume\n",
-            "CONTAINER_CREATE_REJECTED": b"failed to create docker container\n",
-            "CONTAINER_CREATE_FAILED": b"failed to create the container\n",
-            "CONTAINER_START_FAILED": b"failed to start docker container\n",
-            "PORT_BIND_FAILED": b"port is already allocated\n",
-            "DATABASE_HEALTH_FAILED": b"database is not healthy\n",
-            "GOTRUE_MIGRATION_FAILED": b"gotrue migrate failed\n",
-            "DOCKER_DAEMON_ERROR": b"cannot connect to the Docker daemon\n",
+            "CONFIG_LOAD_OR_VALIDATION_FAILED": b"failed to parse config: fixture\n",
+            "DOCKER_CLIENT_INITIALIZATION_FAILED": b"failed to initialize Docker client: fixture\n",
             "UNKNOWN_SANITIZED": b"unrecognized opaque failure\n",
         }
         self.assertEqual(set(fixtures), set(db_start_log.ALLOWED_CATEGORIES))
@@ -1616,6 +1605,11 @@ class DbStartLogClassifierTests(unittest.TestCase):
                     "debug_enabled",
                     "sensitive_shape_detected",
                     "sensitive_shape_count",
+                    "normalization_status",
+                    "sgr_count",
+                    "rejected_control_count",
+                    "matched_family_count",
+                    "known_fingerprint",
                 }
                 if expected != "UNKNOWN_SANITIZED":
                     expected_keys.add("first_match_line")
@@ -1626,14 +1620,15 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 self.assertFalse(result["debug_enabled"])
                 self.assertFalse(result["sensitive_shape_detected"])
                 self.assertEqual(result["sensitive_shape_count"], 0)
+                self.assertEqual(result["normalization_status"], "PLAIN")
+                self.assertEqual(result["sgr_count"], 0)
+                self.assertEqual(result["rejected_control_count"], 0)
+                self.assertEqual(
+                    result["matched_family_count"],
+                    0 if expected == "UNKNOWN_SANITIZED" else 1,
+                )
+                self.assertFalse(result["known_fingerprint"])
                 self.assertEqual(set(result), expected_keys)
-
-    def test_specific_network_rule_precedes_generic_daemon_rule(self) -> None:
-        raw = b"Error response from daemon: failed to create docker network\n"
-        self.assertEqual(
-            db_start_log.classify(raw, 1)["category"],
-            "NETWORK_REUSE_ATTACHMENT_REJECTED",
-        )
 
     def test_empty_log_defaults_without_leaking_input(self) -> None:
         result = db_start_log.classify(b"", 7)
@@ -1642,38 +1637,134 @@ class DbStartLogClassifierTests(unittest.TestCase):
         self.assertEqual(result["raw_byte_count"], 0)
         self.assertEqual(result["raw_line_count"], 0)
         rendered = db_start_log.format_state_lines(result)
-        self.assertEqual(len(rendered.splitlines()), 9)
+        self.assertEqual(len(rendered.splitlines()), 14)
 
-    def test_exact_cli_source_wrappers_and_match_location(self) -> None:
-        fixtures = {
-            b"failed to create Docker CLI: fixture\n": "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
-            b"failed to initialize Docker CLI: fixture\n": "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
-            b"failed to inspect docker image: fixture\n": "IMAGE_RESOLUTION_FAILED",
-            b"failed to pull docker image from all registries: fixture\n": "IMAGE_RESOLUTION_FAILED",
-            b"failed to create docker network: fixture\n": "NETWORK_REUSE_ATTACHMENT_REJECTED",
-            b"failed to parse docker volume: fixture\n": "VOLUME_PREPARATION_FAILED",
-            b"failed to create volume: fixture\n": "VOLUME_CREATE_REJECTED",
-            b"failed to create docker container: fixture\n": "CONTAINER_CREATE_REJECTED",
-            b"failed to start docker container fixture: fixture\n": "CONTAINER_START_FAILED",
-        }
-        for raw, expected in fixtures.items():
-            with self.subTest(expected=expected):
-                result = db_start_log.classify(b"prefix\n" + raw + raw, 1)
-                self.assertEqual(result["category"], expected)
+    def test_exact_cobra_and_pflag_source_phrases(self) -> None:
+        fixtures = (
+            b'unknown command "opaque" for "supabase db"\n',
+            b"unknown flag: --opaque\n",
+            b"unknown shorthand flag: 'x' in -xz\n",
+            b"requires at least 2 arg(s), only received 1\n",
+            b"accepts at most 1 arg(s), received 2\n",
+            b"accepts 0 arg(s), received 1\n",
+            b"accepts between 1 and 2 arg(s), received 3\n",
+            b"flag needs an argument: --workdir\n",
+            b"flag needs an argument: 'w' in -w\n",
+            b'flag "opaque" does not exist\n',
+            b"no such flag -x\n",
+        )
+        for raw in fixtures:
+            with self.subTest(raw=raw):
+                result = db_start_log.classify(raw, 1)
+                self.assertEqual(result["category"], "CLI_USAGE_ERROR")
+                self.assertEqual(result["matched_family_count"], 1)
+
+    def test_every_admitted_config_prefix(self) -> None:
+        prefixes = (
+            "failed to get repo directory:",
+            "failed to change directory:",
+            "failed to parse environment file:",
+            "failed to restore directory:",
+            "failed to get working directory:",
+            "failed to initialise config:",
+            "failed to merge default values:",
+            "failed to read file config:",
+            "failed to merge file config:",
+            "failed to merge remote config:",
+            "failed to parse config:",
+            "Missing required field in config:",
+            "Invalid config for auth.jwt_secret.",
+            "Failed reading config: Invalid db.major_version:",
+            "duplicate project_id for [remotes.fixture] and [remotes.other]",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                result = db_start_log.classify((prefix + " fixture\n").encode(), 1)
+                self.assertEqual(
+                    result["category"], "CONFIG_LOAD_OR_VALIDATION_FAILED"
+                )
+
+    def test_exact_docker_initialization_wrappers(self) -> None:
+        for wrapper in (
+            b"Failed to create Docker client: fixture\n",
+            b"Failed to initialize Docker client: fixture\n",
+        ):
+            with self.subTest(wrapper=wrapper):
+                result = db_start_log.classify(b"prefix\n" + wrapper + wrapper, 1)
+                self.assertEqual(
+                    result["category"], "DOCKER_CLIENT_INITIALIZATION_FAILED"
+                )
                 self.assertEqual(result["match_count"], 2)
                 self.assertEqual(result["first_match_line"], 2)
 
-    def test_mixed_input_uses_narrow_deterministic_priority(self) -> None:
-        raw = (
-            b"failed to create docker container: lower-priority\n"
-            b"failed to create volume: higher-priority\n"
-            b"failed to inspect docker image: highest-priority\n"
+    def test_sgr_whole_line_and_token_splitting(self) -> None:
+        fixtures = (
+            b"\x1b[31munknown flag: --opaque\x1b[0m\n",
+            b"unknown \x1b[1mflag\x1b[0m: --opaque\n",
+            b"\x1b[38;5;9mfailed to parse config:\x1b[m fixture\n",
         )
+        expected = (
+            "CLI_USAGE_ERROR",
+            "CLI_USAGE_ERROR",
+            "CONFIG_LOAD_OR_VALIDATION_FAILED",
+        )
+        for raw, category in zip(fixtures, expected, strict=True):
+            with self.subTest(category=category):
+                result = db_start_log.classify(raw, 1)
+                self.assertEqual(result["category"], category)
+                self.assertEqual(result["normalization_status"], "SGR_STRIPPED")
+                self.assertGreater(result["sgr_count"], 0)
+
+    def test_unsupported_controls_fail_closed(self) -> None:
+        fixtures = (
+            b"\x1b]8;;https://invalid\x07unknown flag: --opaque\n",
+            b"\x1b[31unknown flag: --opaque\n",
+            b"\x00unknown flag: --opaque\n",
+            "\u0085unknown flag: --opaque\n".encode(),
+        )
+        for raw in fixtures:
+            with self.subTest(raw=raw):
+                result = db_start_log.classify(raw, 1)
+                self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
+                self.assertEqual(result["normalization_status"], "REJECTED_CONTROL")
+                self.assertGreater(result["rejected_control_count"], 0)
+                self.assertEqual(result["matched_family_count"], 0)
+
+    def test_invalid_utf8_fails_closed(self) -> None:
+        result = db_start_log.classify(b"unknown flag: --opaque\xff\n", 1)
+        self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
+        self.assertEqual(result["normalization_status"], "INVALID_UTF8")
+        self.assertGreater(result["rejected_control_count"], 0)
+
+    def test_cross_family_input_is_ambiguous_and_unknown(self) -> None:
+        raw = b"unknown flag: --opaque\nfailed to parse config: fixture\n"
         result = db_start_log.classify(raw, 1, debug_enabled=True)
-        self.assertEqual(result["category"], "IMAGE_RESOLUTION_FAILED")
-        self.assertEqual(result["match_count"], 1)
-        self.assertEqual(result["first_match_line"], 3)
+        self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
+        self.assertEqual(result["matched_family_count"], 2)
+        self.assertEqual(result["match_count"], 0)
+        self.assertNotIn("first_match_line", result)
         self.assertTrue(result["debug_enabled"])
+
+    def test_near_misses_remain_unknown(self) -> None:
+        fixtures = (
+            b"unknown flags: --opaque\n",
+            b"accepts one arg(s), received two\n",
+            b"failed parsing config: fixture\n",
+            b"failed to initialize container client: fixture\n",
+        )
+        for raw in fixtures:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    db_start_log.classify(raw, 1)["category"], "UNKNOWN_SANITIZED"
+                )
+
+    def test_crlf_is_normalized_without_changing_raw_metadata(self) -> None:
+        raw = b"prefix\r\nunknown flag: --opaque\r\n"
+        result = db_start_log.classify(raw, 1)
+        self.assertEqual(result["category"], "CLI_USAGE_ERROR")
+        self.assertEqual(result["raw_byte_count"], len(raw))
+        self.assertEqual(result["raw_line_count"], 2)
+        self.assertEqual(result["raw_sha256"], hashlib.sha256(raw).hexdigest())
 
     def test_secret_shaped_input_is_counted_but_never_emitted(self) -> None:
         secrets = (
@@ -1681,9 +1772,11 @@ class DbStartLogClassifierTests(unittest.TestCase):
             "Authorization: Bearer opaque-token-value\n"
             "JWT_SECRET=opaque-secret-value\n"
             "-----BEGIN PRIVATE KEY-----\n"
+            "failed to parse config: fixture\n"
         ).encode()
         result = db_start_log.classify(secrets, 1, debug_enabled=True)
         rendered = db_start_log.format_state_lines(result)
+        self.assertEqual(result["category"], "UNKNOWN_SANITIZED")
         self.assertTrue(result["sensitive_shape_detected"])
         self.assertEqual(result["sensitive_shape_count"], 4)
         for forbidden in (
@@ -1700,25 +1793,37 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 has_first_match=False,
             )
 
-    def test_prior_unknown_fingerprint_schema_remains_compatible(self) -> None:
-        prior = {
-            "category": "UNKNOWN_SANITIZED",
-            "exit_code": 1,
-            "match_count": 0,
-            "raw_byte_count": 1078,
-            "raw_line_count": 23,
-            "raw_sha256": "d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31",
-            "debug_enabled": False,
-            "sensitive_shape_detected": False,
-            "sensitive_shape_count": 0,
-        }
-        rendered = db_start_log.format_state_lines(prior)
-        self.assertIn(prior["raw_sha256"], rendered)
-        self.assertIn("UNKNOWN_SANITIZED", rendered)
-        self.assertNotIn("OTHER_PRECONTAINER_FAILURE", rendered)
+    def test_known_fingerprint_metadata_never_promotes_a_category(self) -> None:
+        byte_count, line_count, digest = db_start_log.KNOWN_FINGERPRINT
+        self.assertTrue(db_start_log.is_known_fingerprint(byte_count, line_count, digest))
+        category, matches, family_count = db_start_log.classify_normalized(
+            "opaque pre-docker failure"
+        )
+        self.assertEqual(category, "UNKNOWN_SANITIZED")
+        self.assertEqual(matches, [])
+        self.assertEqual(family_count, 0)
+
+    def test_state_schema_is_closed_and_deterministic(self) -> None:
+        result = db_start_log.classify(b"unknown flag: --opaque\n", 1)
+        rendered = db_start_log.format_state_lines(result)
+        self.assertEqual(rendered, db_start_log.format_state_lines(result))
+        self.assertEqual(len(rendered.splitlines()), 15)
+        with self.assertRaises(ValueError):
+            db_start_log.validate_state_lines(
+                rendered + "unclassified.raw\tstr\topaque\n",
+                has_first_match=True,
+            )
+
+    def test_runner_deletes_the_transient_raw_file(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        classify_at = runner.index('"$ROOT/scripts/classify_db_start_log.py"')
+        delete_at = runner.index('rm -f -- "$RAW/supabase-db-start.log"', classify_at)
+        assert_at = runner.index('[[ ! -e "$RAW/supabase-db-start.log" ]]', delete_at)
+        self.assertLess(classify_at, delete_at)
+        self.assertLess(delete_at, assert_at)
 
     def test_executable_path_emits_only_sanitized_state(self) -> None:
-        raw = b"failed to create docker network opaque-fixture-text\n"
+        raw = b"failed to parse config: opaque-fixture-text\n"
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "db-start.log"
             path.write_bytes(raw)
@@ -1737,8 +1842,8 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-        self.assertEqual(len(completed.stdout.splitlines()), 10)
-        self.assertIn("NETWORK_REUSE_ATTACHMENT_REJECTED", completed.stdout)
+        self.assertEqual(len(completed.stdout.splitlines()), 15)
+        self.assertIn("CONFIG_LOAD_OR_VALIDATION_FAILED", completed.stdout)
         self.assertIn("debug_enabled\tbool\ttrue", completed.stdout)
         self.assertNotIn("opaque-fixture-text", completed.stdout)
         self.assertEqual(completed.stderr, "")

@@ -12,6 +12,10 @@ The manual workflow has one fixed `run` path. It invokes the pinned v2.109.1 CLI
 
 The earlier loader diagnostic proved `Config.Load` succeeds under a fresh child environment. Database start therefore uses the same `env -i` boundary: fixed system `PATH`, packet-local `HOME`, XDG roots and `TMPDIR`, `DO_NOT_TRACK=1`, and child-only `DOCKER_HOST`. It inherits no `SUPABASE_*`, CI, runner home/config, linked state, credential, provider, or application value. The local CLI upgrade cache is pre-seeded with the pinned version.
 
+The transient DB-start classifier is source-pinned and has exactly four outcomes: `CLI_USAGE_ERROR`, `CONFIG_LOAD_OR_VALIDATION_FAILED`, `DOCKER_CLIENT_INITIALIZATION_FAILED`, and `UNKNOWN_SANITIZED`. It strips only well-formed ANSI SGR sequences. TAB, LF, and CR are the only admitted controls; malformed escapes, OSC/DCS, NUL, other C0/C1 controls, and invalid UTF-8 fail closed to `UNKNOWN_SANITIZED`. Exact Cobra v1.10.2 and pflag v1.0.10 dispatch phrases, exact Config.Load read/merge/decode/traversal/validation prefixes, and the two exact Supabase Docker-client initialization wrappers are the only matching families. Cross-family matches, sensitive-shaped input, and near matches stay unknown.
+
+The receipt retains only raw byte/line counts and SHA-256, normalization status, SGR and rejected-control counts, matched-family count, optional first-match line, and whether the raw metadata equals the accepted recurring fingerprint. The fingerprint (`1,078` bytes, `23` lines, SHA-256 `d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31`) establishes recurrence only and can never select a category. Normalized or matched text is never emitted or retained, and the raw file is deleted before artifact construction.
+
 The Docker observer remains read-only when no policy descriptor is supplied. DB start is admitted only by a private one-shot `fawxzzy.hosted-replay-harness.db-start-policy.v1` descriptor. The harness creates it with mode `0600`, passes it to the observer on an inherited descriptor, unlinks the path, and closes the harness copy before starting the CLI child. The descriptor contains only frozen public identities plus a fresh nonce. It never reaches the CLI child, and observer generation other than zero terminates `POLICY_LEDGER_LOST` rather than resuming state.
 
 The admitted endpoint denominator is the source-proven 47-row matrix with SHA-256 `9669ebd4ae75cfdc3950c9db8b2786270023ce0e26dde993806b3f7b6b2c5492`: 18 child lifecycle rows, 17 prohibited rows, and 12 outer-harness rows, with zero endpoint unknowns. Optional `/vX.Y` prefixes must exactly equal the daemon version negotiated by `/_ping`.
@@ -43,7 +47,7 @@ Every returned container ID is recorded only in the observer's private transient
 
 ## Fail-closed result
 
-Every failure maps to a stable uppercase code, and cleanup evidence cannot overwrite the first explicit failure code. The prior database-start/status fingerprint is admitted only as the exact root-persistent comparison fingerprint; the packet cannot invoke either command that originally produced it.
+Every failure maps to a stable uppercase code, and cleanup evidence cannot overwrite the first explicit failure code. The accepted database-start fingerprint is correlation metadata only: it cannot select or promote a classifier category.
 
 The sanitizer's output schema is closed: only fixed dotted keys, scalar types, uppercase enums, booleans, nonnegative integers, and a 64-character lowercase SHA-256 are admitted. Credential-bearing URLs, JWTs, bearer tokens, password/secret/token/key assignments, connection strings, private keys, environment dumps, SQL, Auth rows, PII, and arbitrary text can never be values in the sanitized state. Secret-shaped input is counted only as a boolean and line count; its content is never retained.
 

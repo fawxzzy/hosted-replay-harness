@@ -12,22 +12,21 @@ from typing import Final
 
 UNKNOWN: Final = "UNKNOWN_SANITIZED"
 ALLOWED_CATEGORIES: Final = (
-    "CONFIG_VALIDATION_FAILED",
     "CLI_USAGE_ERROR",
-    "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
-    "IMAGE_RESOLUTION_FAILED",
-    "NETWORK_REUSE_ATTACHMENT_REJECTED",
-    "NETWORK_CONFIGURATION_REJECTED",
-    "VOLUME_CREATE_REJECTED",
-    "VOLUME_PREPARATION_FAILED",
-    "CONTAINER_CREATE_REJECTED",
-    "CONTAINER_CREATE_FAILED",
-    "CONTAINER_START_FAILED",
-    "PORT_BIND_FAILED",
-    "DATABASE_HEALTH_FAILED",
-    "GOTRUE_MIGRATION_FAILED",
-    "DOCKER_DAEMON_ERROR",
+    "CONFIG_LOAD_OR_VALIDATION_FAILED",
+    "DOCKER_CLIENT_INITIALIZATION_FAILED",
     UNKNOWN,
+)
+NORMALIZATION_STATUSES: Final = (
+    "PLAIN",
+    "SGR_STRIPPED",
+    "REJECTED_CONTROL",
+    "INVALID_UTF8",
+)
+KNOWN_FINGERPRINT: Final = (
+    1078,
+    23,
+    "d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31",
 )
 
 STATE_PREFIX: Final = "supabase_cli.db_start_diagnostic."
@@ -41,6 +40,11 @@ BASE_STATE_FIELDS: Final = {
     "debug_enabled": ("bool", r"^(?:true|false)$"),
     "sensitive_shape_detected": ("bool", r"^(?:true|false)$"),
     "sensitive_shape_count": ("int", r"^[0-9]+$"),
+    "normalization_status": ("str", r"^(?:PLAIN|SGR_STRIPPED|REJECTED_CONTROL|INVALID_UTF8)$"),
+    "sgr_count": ("int", r"^[0-9]+$"),
+    "rejected_control_count": ("int", r"^[0-9]+$"),
+    "matched_family_count": ("int", r"^[0-9]+$"),
+    "known_fingerprint": ("bool", r"^(?:true|false)$"),
 }
 
 SENSITIVE_PATTERNS: Final = tuple(
@@ -54,129 +58,55 @@ SENSITIVE_PATTERNS: Final = tuple(
     )
 )
 
-# Specific categories precede generic Docker daemon errors by design.
+# These phrases are pinned to Cobra v1.10.2, pflag v1.0.10, and Supabase CLI
+# source commit 6d4c19870ed213ba7f682f117d0345c8a40bfa94. No generic fallback is
+# admitted: an unmatched or cross-family message remains UNKNOWN_SANITIZED.
 RULES: Final = (
-    (
-        "CONFIG_VALIDATION_FAILED",
-        (
-            r"\bfailed to (?:load|parse|validate) (?:the )?config(?:uration)?\b",
-            r"\binvalid config(?:uration)?\b",
-            r"\bconfig\.toml:.*\b(?:invalid|parse|validation)\b",
-        ),
-    ),
     (
         "CLI_USAGE_ERROR",
         (
-            r"\bunknown (?:flag|command)\b",
-            r"\baccepts? \d+ arg(?:ument)?s?\b",
-            r"(?m)^usage:\s+supabase\b",
+            r'^unknown command "[^"]+" for "[^"]+"(?:.*)?$',
+            r"^unknown flag: --[a-z0-9][a-z0-9_-]*$",
+            r"^unknown shorthand flag: '.+' in -[a-z0-9]+$",
+            r"^requires at least \d+ arg\(s\), only received \d+$",
+            r"^accepts at most \d+ arg\(s\), received \d+$",
+            r"^accepts \d+ arg\(s\), received \d+$",
+            r"^accepts between \d+ and \d+ arg\(s\), received \d+$",
+            r"^flag needs an argument: (?:--[a-z0-9][a-z0-9_-]*|'.+' in -[a-z0-9]+)$",
+            r'^flag "[^"]+" does not exist$',
+            r"^no such flag -[a-z0-9]+$",
         ),
     ),
     (
-        "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
+        "CONFIG_LOAD_OR_VALIDATION_FAILED",
         (
-            r"\bfailed to create docker cli(?:ent)?\b",
-            r"\bfailed to initialize docker cli(?:ent)?\b",
-            r"\bclient is newer than server\b",
-            r"\bserver api version\b[^\r\n]{0,160}\b(?:unsupported|too old|mismatch)\b",
-            r"\bdocker api\b[^\r\n]{0,160}\b(?:negotiat|version)\w*\b[^\r\n]{0,160}\b(?:fail|error|mismatch|unsupported)\w*\b",
+            r"^failed to get repo directory:",
+            r"^failed to change directory:",
+            r"^failed to parse environment file:",
+            r"^failed to restore directory:",
+            r"^failed to get working directory:",
+            r"^failed to initialise config:",
+            r"^failed to merge default values:",
+            r"^failed to read file config:",
+            r"^failed to merge file config:",
+            r"^failed to merge remote config:",
+            r"^failed to parse config:",
+            r"^missing required field in config:",
+            r"^invalid config for ",
+            r"^failed reading config: invalid ",
+            r"^duplicate project_id for \[remotes\.",
         ),
     ),
     (
-        "IMAGE_RESOLUTION_FAILED",
+        "DOCKER_CLIENT_INITIALIZATION_FAILED",
         (
-            r"\bmanifest unknown\b",
-            r"\bpull access denied\b",
-            r"\bno such image\b",
-            r"\bfailed to inspect docker image\b",
-            r"\bfailed to pull docker image(?: from all registries)?\b",
-            r"\breference does not match digest\b",
-            r"\bimage\b[^\r\n]{0,160}\b(?:tag|digest|identity)\b[^\r\n]{0,160}\b(?:mismatch|invalid|unexpected)\b",
-            r"\b(?:unable|failed) to (?:find|pull|resolve) (?:the )?image\b",
-        ),
-    ),
-    (
-        "NETWORK_REUSE_ATTACHMENT_REJECTED",
-        (
-            r"\bfailed to create (?:docker )?network\b",
-            r"\binvalid endpoint settings\b",
-            r"\bcould not attach to network\b",
-            r"\bnetwork-scoped alias is supported only for containers in user defined networks\b",
-        ),
-    ),
-    (
-        "NETWORK_CONFIGURATION_REJECTED",
-        (
-            r"\bnetwork\b[^\r\n]{0,160}\b(?:not found|already exists|invalid)\b",
-            r"\bpool overlaps with other one on this address space\b",
-        ),
-    ),
-    (
-        "PORT_BIND_FAILED",
-        (
-            r"\bport is already allocated\b",
-            r"\baddress already in use\b",
-            r"\bfailed to bind\b",
-            r"\blisten tcp\b[^\r\n]{0,160}\bbind\b",
-        ),
-    ),
-    (
-        "VOLUME_CREATE_REJECTED",
-        (r"\bfailed to create volume\b",),
-    ),
-    (
-        "VOLUME_PREPARATION_FAILED",
-        (
-            r"\bfailed to parse docker volume\b",
-        ),
-    ),
-    (
-        "GOTRUE_MIGRATION_FAILED",
-        (
-            r"\bgotrue\b[^\r\n]{0,160}\bmigrat\w*\b[^\r\n]{0,160}\b(?:fail|error|exit)\w*\b",
-            r"\b(?:fail|error)\w*\b[^\r\n]{0,160}\bgotrue\b[^\r\n]{0,160}\bmigrat\w*\b",
-            r"\bauth migration\b[^\r\n]{0,160}\bfailed\b",
-        ),
-    ),
-    (
-        "DATABASE_HEALTH_FAILED",
-        (
-            r"\bdatabase\b[^\r\n]{0,160}\b(?:unhealthy|not healthy)\b",
-            r"\btimed out waiting for\b[^\r\n]{0,160}\b(?:database|postgres)\b",
-            r"\bhealth ?check\b[^\r\n]{0,160}\bfailed\b",
-            r"\bfailed to connect to postgres\b",
-            r"\bpostgres\b[^\r\n]{0,160}\bnot ready\b",
-        ),
-    ),
-    (
-        "CONTAINER_CREATE_REJECTED",
-        (r"\bfailed to create docker container\b",),
-    ),
-    (
-        "CONTAINER_CREATE_FAILED",
-        (
-            r"\bfailed to create (?:the )?container\b",
-            r"\bcontainer name\b[^\r\n]{0,160}\balready in use\b",
-            r"\binvalid mount config\b",
-            r"\bcontainer create failed\b",
-        ),
-    ),
-    (
-        "CONTAINER_START_FAILED",
-        (
-            r"\bfailed to start docker container\b",
-            r"\bcontainer start failed\b",
-        ),
-    ),
-    (
-        "DOCKER_DAEMON_ERROR",
-        (
-            r"\bcannot connect to the docker daemon\b",
-            r"\bdocker daemon\b[^\r\n]{0,160}\b(?:not running|unavailable)\b",
-            r"\berror response from daemon\b",
+            r"^failed to create docker client:",
+            r"^failed to initialize docker client:",
         ),
     ),
 )
+
+SGR_PATTERN: Final = re.compile(rb"\x1b\[[0-9;:]*m")
 
 
 def count_sensitive_shapes(text: str) -> int:
@@ -187,30 +117,93 @@ def count_sensitive_shapes(text: str) -> int:
     )
 
 
-def classify(raw: bytes, exit_code: int, *, debug_enabled: bool = False) -> dict[str, bool | int | str]:
-    text = raw.decode("utf-8", errors="replace").lower()
-    category = UNKNOWN
-    matching_lines: list[int] = []
-    for candidate, patterns in RULES:
+def normalize(raw: bytes) -> tuple[str, str, int, int]:
+    output = bytearray()
+    sgr_count = 0
+    rejected_control_count = 0
+    index = 0
+    while index < len(raw):
+        value = raw[index]
+        if value == 0x1B:
+            match = SGR_PATTERN.match(raw, index)
+            if match is None:
+                rejected_control_count += 1
+                index += 1
+                continue
+            sgr_count += 1
+            index = match.end()
+            continue
+        if (value < 0x20 and value not in (0x09, 0x0A, 0x0D)) or value == 0x7F:
+            rejected_control_count += 1
+            index += 1
+            continue
+        output.append(value)
+        index += 1
+
+    try:
+        text = output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return "", "INVALID_UTF8", sgr_count, max(1, rejected_control_count)
+
+    c1_count = sum(1 for character in text if 0x80 <= ord(character) <= 0x9F)
+    rejected_control_count += c1_count
+    if rejected_control_count:
+        return "", "REJECTED_CONTROL", sgr_count, rejected_control_count
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lower()
+    status = "SGR_STRIPPED" if sgr_count else "PLAIN"
+    return text, status, sgr_count, 0
+
+
+def classify_normalized(text: str) -> tuple[str, list[int], int]:
+    family_matches: dict[str, list[int]] = {}
+    lines = text.splitlines()
+    for category, patterns in RULES:
         matching_lines = [
             line_number
-            for line_number, line in enumerate(text.splitlines(), start=1)
+            for line_number, line in enumerate(lines, start=1)
             if any(re.search(pattern, line) for pattern in patterns)
         ]
         if matching_lines:
-            category = candidate
-            break
-    sensitive_shape_count = count_sensitive_shapes(text)
+            family_matches[category] = matching_lines
+    if len(family_matches) != 1:
+        return UNKNOWN, [], len(family_matches)
+    category, matching_lines = next(iter(family_matches.items()))
+    return category, matching_lines, 1
+
+
+def is_known_fingerprint(byte_count: int, line_count: int, digest: str) -> bool:
+    return (byte_count, line_count, digest) == KNOWN_FINGERPRINT
+
+
+def classify(raw: bytes, exit_code: int, *, debug_enabled: bool = False) -> dict[str, bool | int | str]:
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    raw_line_count = len(raw.splitlines())
+    text, normalization_status, sgr_count, rejected_control_count = normalize(raw)
+    sensitive_text = raw.decode("utf-8", errors="ignore").lower()
+    sensitive_shape_count = count_sensitive_shapes(sensitive_text)
+
+    category = UNKNOWN
+    matching_lines: list[int] = []
+    matched_family_count = 0
+    if normalization_status in ("PLAIN", "SGR_STRIPPED") and sensitive_shape_count == 0:
+        category, matching_lines, matched_family_count = classify_normalized(text)
+
     result: dict[str, bool | int | str] = {
         "category": category,
         "exit_code": exit_code,
         "match_count": len(matching_lines),
         "raw_byte_count": len(raw),
-        "raw_line_count": len(raw.splitlines()),
-        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "raw_line_count": raw_line_count,
+        "raw_sha256": raw_sha256,
         "debug_enabled": debug_enabled,
         "sensitive_shape_detected": sensitive_shape_count > 0,
         "sensitive_shape_count": sensitive_shape_count,
+        "normalization_status": normalization_status,
+        "sgr_count": sgr_count,
+        "rejected_control_count": rejected_control_count,
+        "matched_family_count": matched_family_count,
+        "known_fingerprint": is_known_fingerprint(len(raw), raw_line_count, raw_sha256),
     }
     if matching_lines:
         result["first_match_line"] = matching_lines[0]
@@ -239,35 +232,35 @@ def validate_state_lines(rendered: str, *, has_first_match: bool) -> None:
         raise ValueError("sanitized state fields are incomplete")
     if observed["category"][1] not in ALLOWED_CATEGORIES:
         raise ValueError("category is not allowlisted")
+    if observed["normalization_status"][1] not in NORMALIZATION_STATUSES:
+        raise ValueError("normalization status is not allowlisted")
 
 
 def format_state_lines(result: dict[str, bool | int | str]) -> str:
     if result["category"] not in ALLOWED_CATEGORIES:
         raise ValueError("category is not allowlisted")
     fields = (
-        ("supabase_cli.db_start_diagnostic.category", "str", result["category"]),
-        ("supabase_cli.db_start_diagnostic.exit_code", "int", result["exit_code"]),
-        ("supabase_cli.db_start_diagnostic.match_count", "int", result["match_count"]),
-        ("supabase_cli.db_start_diagnostic.raw_byte_count", "int", result["raw_byte_count"]),
-        ("supabase_cli.db_start_diagnostic.raw_line_count", "int", result["raw_line_count"]),
-        ("supabase_cli.db_start_diagnostic.raw_sha256", "str", result["raw_sha256"]),
-        ("supabase_cli.db_start_diagnostic.debug_enabled", "bool", str(result["debug_enabled"]).lower()),
-        (
-            "supabase_cli.db_start_diagnostic.sensitive_shape_detected",
-            "bool",
-            str(result["sensitive_shape_detected"]).lower(),
-        ),
-        (
-            "supabase_cli.db_start_diagnostic.sensitive_shape_count",
-            "int",
-            result["sensitive_shape_count"],
-        ),
+        ("category", "str", result["category"]),
+        ("exit_code", "int", result["exit_code"]),
+        ("match_count", "int", result["match_count"]),
+        ("raw_byte_count", "int", result["raw_byte_count"]),
+        ("raw_line_count", "int", result["raw_line_count"]),
+        ("raw_sha256", "str", result["raw_sha256"]),
+        ("debug_enabled", "bool", str(result["debug_enabled"]).lower()),
+        ("sensitive_shape_detected", "bool", str(result["sensitive_shape_detected"]).lower()),
+        ("sensitive_shape_count", "int", result["sensitive_shape_count"]),
+        ("normalization_status", "str", result["normalization_status"]),
+        ("sgr_count", "int", result["sgr_count"]),
+        ("rejected_control_count", "int", result["rejected_control_count"]),
+        ("matched_family_count", "int", result["matched_family_count"]),
+        ("known_fingerprint", "bool", str(result["known_fingerprint"]).lower()),
     )
-    rendered = "".join(f"{key}\t{kind}\t{value}\n" for key, kind, value in fields)
+    rendered = "".join(
+        f"{STATE_PREFIX}{field}\t{kind}\t{value}\n" for field, kind, value in fields
+    )
     if "first_match_line" in result:
         rendered += (
-            "supabase_cli.db_start_diagnostic.first_match_line\tint\t"
-            f"{result['first_match_line']}\n"
+            f"{STATE_PREFIX}first_match_line\tint\t{result['first_match_line']}\n"
         )
     validate_state_lines(rendered, has_first_match="first_match_line" in result)
     return rendered
