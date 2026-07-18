@@ -303,6 +303,16 @@ INSPECT_TERMINAL_CLASSES = frozenset(
         "DIRECT_INSPECT_COMPOSITION_FAILED",
     }
 )
+EXACT_CONTAINER_ID_LENGTH = 64
+EXACT_CONTAINER_ID_CHARACTERS = frozenset("0123456789abcdef")
+
+
+class CompositionContractError(ValueError):
+    """Raised when individually valid inspect groups cannot be safely composed."""
+
+    def __init__(self, group: str = "NONE") -> None:
+        super().__init__("closed inspect group composition rejected")
+        self.group = group
 
 
 def identity_digest(value: str) -> str:
@@ -719,10 +729,218 @@ def _diagnostic_envelope(
     return result
 
 
-def _group_succeeds(container_id: str, template: str) -> tuple[bool, subprocess.CompletedProcess[bytes]]:
+def _exact_container_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == EXACT_CONTAINER_ID_LENGTH
+        and set(value) <= EXACT_CONTAINER_ID_CHARACTERS
+    )
+
+
+def _closed_object(value: Any, keys: set[str]) -> bool:
+    return isinstance(value, dict) and set(value) == keys
+
+
+def _optional_container(value: Any, expected: type) -> bool:
+    return value is None or isinstance(value, expected)
+
+
+def validate_group_payload(group: str, payload: dict[str, Any]) -> None:
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != SCHEMA_VERSION
+    ):
+        raise ValueError("inspect group schema version rejected")
+    if group == "IDENTITY_CONFIG":
+        keys = {"schema_version", "id", "name", "image_id", "config_image", "labels"}
+        if not _closed_object(payload, keys):
+            raise ValueError("identity group keys rejected")
+        if not all(isinstance(payload[key], str) for key in ("id", "name", "image_id", "config_image")):
+            raise ValueError("identity group types rejected")
+        if not isinstance(payload["labels"], dict):
+            raise ValueError("identity labels rejected")
+        return
+    if group == "HOSTCONFIG_SECURITY_TMPFS":
+        keys = {
+            "schema_version",
+            "network_mode",
+            "privileged",
+            "pid_mode",
+            "ipc_mode",
+            "binds",
+            "host_mounts",
+            "volumes_from",
+            "tmpfs",
+            "devices",
+            "device_requests",
+            "cap_add",
+            "security_opt",
+            "extra_hosts",
+            "restart_policy",
+        }
+        if not _closed_object(payload, keys):
+            raise ValueError("host configuration group keys rejected")
+        if not (
+            isinstance(payload["network_mode"], str)
+            and isinstance(payload["privileged"], bool)
+            and isinstance(payload["pid_mode"], str)
+            and isinstance(payload["ipc_mode"], str)
+            and _optional_container(payload["binds"], list)
+            and _optional_container(payload["host_mounts"], list)
+            and _optional_container(payload["volumes_from"], list)
+            and _optional_container(payload["tmpfs"], dict)
+            and _optional_container(payload["devices"], list)
+            and _optional_container(payload["device_requests"], list)
+            and _optional_container(payload["cap_add"], list)
+            and _optional_container(payload["security_opt"], list)
+            and _optional_container(payload["extra_hosts"], list)
+            and isinstance(payload["restart_policy"], dict)
+        ):
+            raise ValueError("host configuration group types rejected")
+        return
+    if group == "PUBLICATION":
+        if not _closed_object(
+            payload, {"schema_version", "config", "host_config", "network_settings"}
+        ):
+            raise ValueError("publication group keys rejected")
+        if not (
+            _closed_object(payload["config"], {"exposed_ports"})
+            and _closed_object(payload["host_config"], {"port_bindings", "publish_all_ports"})
+            and _closed_object(payload["network_settings"], {"ports"})
+            and _optional_container(payload["config"]["exposed_ports"], dict)
+            and _optional_container(payload["host_config"]["port_bindings"], dict)
+            and isinstance(payload["host_config"]["publish_all_ports"], bool)
+            and _optional_container(payload["network_settings"]["ports"], dict)
+        ):
+            raise ValueError("publication group types rejected")
+        return
+    if group == "NETWORK_RUNTIME_MOUNTS":
+        if not _closed_object(payload, {"schema_version", "mounts", "networks"}):
+            raise ValueError("network group keys rejected")
+        if not (
+            _optional_container(payload["mounts"], list)
+            and isinstance(payload["networks"], dict)
+        ):
+            raise ValueError("network group types rejected")
+        return
+    if group == "STATE_HEALTH":
+        if not _closed_object(
+            payload, {"schema_version", "restart_count", "state", "health"}
+        ):
+            raise ValueError("state group keys rejected")
+        if not (
+            _closed_object(payload["state"], {"Status", "Running", "Restarting", "OOMKilled"})
+            and _closed_object(payload["health"], {"Status", "FailingStreak"})
+            and isinstance(payload["restart_count"], int)
+            and not isinstance(payload["restart_count"], bool)
+            and isinstance(payload["state"]["Status"], str)
+            and isinstance(payload["state"]["Running"], bool)
+            and isinstance(payload["state"]["Restarting"], bool)
+            and isinstance(payload["state"]["OOMKilled"], bool)
+            and isinstance(payload["health"]["Status"], str)
+            and isinstance(payload["health"]["FailingStreak"], int)
+            and not isinstance(payload["health"]["FailingStreak"], bool)
+        ):
+            raise ValueError("state group types rejected")
+        return
+    raise ValueError("unknown inspect field group")
+
+
+def _merge_unique(
+    target: dict[str, Any], source: dict[str, Any], group: str
+) -> None:
+    if set(target) & set(source):
+        raise CompositionContractError(group)
+    target.update(source)
+
+
+def compose_group_payloads(
+    container_id: str, payloads: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    if not _exact_container_id(container_id):
+        raise CompositionContractError("IDENTITY_CONFIG")
+    expected_groups = {group for group, _, _ in INSPECT_FIELD_GROUPS}
+    if set(payloads) != expected_groups:
+        raise CompositionContractError("NONE")
+    for group in expected_groups:
+        validate_group_payload(group, payloads[group])
+    identity = payloads["IDENTITY_CONFIG"]
+    if identity["id"] != container_id:
+        raise CompositionContractError("IDENTITY_CONFIG")
+
+    composed: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
+    _merge_unique(
+        composed,
+        {key: value for key, value in identity.items() if key != "schema_version"},
+        "IDENTITY_CONFIG",
+    )
+    host_config = payloads["HOSTCONFIG_SECURITY_TMPFS"]
+    _merge_unique(
+        composed,
+        {key: value for key, value in host_config.items() if key != "schema_version"},
+        "HOSTCONFIG_SECURITY_TMPFS",
+    )
+    publication = payloads["PUBLICATION"]
+    _merge_unique(
+        composed,
+        {
+            "config_exposed_ports": publication["config"]["exposed_ports"],
+            "port_bindings": publication["host_config"]["port_bindings"],
+            "publish_all_ports": publication["host_config"]["publish_all_ports"],
+            "published_ports": publication["network_settings"]["ports"],
+        },
+        "PUBLICATION",
+    )
+    for group in ("NETWORK_RUNTIME_MOUNTS", "STATE_HEALTH"):
+        _merge_unique(
+            composed,
+            {key: value for key, value in payloads[group].items() if key != "schema_version"},
+            group,
+        )
+    expected_flat_keys = {
+        "schema_version",
+        "id",
+        "name",
+        "image_id",
+        "config_image",
+        "labels",
+        "network_mode",
+        "privileged",
+        "pid_mode",
+        "ipc_mode",
+        "binds",
+        "host_mounts",
+        "volumes_from",
+        "tmpfs",
+        "devices",
+        "device_requests",
+        "cap_add",
+        "security_opt",
+        "extra_hosts",
+        "config_exposed_ports",
+        "port_bindings",
+        "publish_all_ports",
+        "restart_policy",
+        "mounts",
+        "networks",
+        "published_ports",
+        "restart_count",
+        "state",
+        "health",
+    }
+    if set(composed) != expected_flat_keys:
+        raise CompositionContractError("NONE")
+    return composed
+
+
+def _inspect_group_payload(
+    container_id: str, template: str
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any] | None]:
     completed = _run_inspect(container_id, template)
-    _, parse_class, _ = parse_inspect_output(completed.stdout)
-    return completed.returncode == 0 and parse_class == "VALID_OBJECT", completed
+    _, parse_class, payload = parse_inspect_output(completed.stdout)
+    if completed.returncode != 0 or parse_class != "VALID_OBJECT":
+        return completed, None
+    return completed, payload
 
 
 def safe_inspect(
@@ -751,8 +969,8 @@ def safe_inspect(
             successful_group_count=0,
         )
 
-    available, _ = _group_succeeds(container_id, OBJECT_AVAILABILITY_TEMPLATE)
-    if not available:
+    _, availability = _inspect_group_payload(container_id, OBJECT_AVAILABILITY_TEMPLATE)
+    if availability is None:
         return None, _diagnostic_envelope(
             completed,
             attempt_index=attempt_index,
@@ -762,11 +980,31 @@ def safe_inspect(
             first_failed_group="IDENTITY_CONFIG",
             successful_group_count=0,
         )
+    if not (
+        _closed_object(availability, {"schema_version", "id"})
+        and availability["schema_version"] == SCHEMA_VERSION
+        and _exact_container_id(container_id)
+        and availability["id"] == container_id
+    ):
+        return None, _diagnostic_envelope(
+            completed,
+            attempt_index=attempt_index,
+            terminal_class="DIRECT_INSPECT_COMPOSITION_FAILED",
+            utf8_status=utf8_status,
+            parse_class=parse_class,
+            first_failed_group="IDENTITY_CONFIG",
+            successful_group_count=0,
+        )
 
     successful_group_count = 0
+    group_payloads: dict[str, dict[str, Any]] = {}
     for group, terminal_class, template in INSPECT_FIELD_GROUPS:
-        succeeded, _ = _group_succeeds(container_id, template)
-        if not succeeded:
+        _, group_payload = _inspect_group_payload(container_id, template)
+        try:
+            if group_payload is None:
+                raise ValueError("inspect group command or parse rejected")
+            validate_group_payload(group, group_payload)
+        except ValueError:
             return None, _diagnostic_envelope(
                 completed,
                 attempt_index=attempt_index,
@@ -776,17 +1014,21 @@ def safe_inspect(
                 first_failed_group=group,
                 successful_group_count=successful_group_count,
             )
+        group_payloads[group] = group_payload
         successful_group_count += 1
 
-    return None, _diagnostic_envelope(
-        completed,
-        attempt_index=attempt_index,
-        terminal_class="DIRECT_INSPECT_COMPOSITION_FAILED",
-        utf8_status=utf8_status,
-        parse_class=parse_class,
-        first_failed_group="NONE",
-        successful_group_count=successful_group_count,
-    )
+    try:
+        return compose_group_payloads(container_id, group_payloads), None
+    except CompositionContractError as error:
+        return None, _diagnostic_envelope(
+            completed,
+            attempt_index=attempt_index,
+            terminal_class="DIRECT_INSPECT_COMPOSITION_FAILED",
+            utf8_status=utf8_status,
+            parse_class=parse_class,
+            first_failed_group=error.group,
+            successful_group_count=successful_group_count,
+        )
 
 
 def inspection_state_lines(result: dict[str, Any]) -> list[str]:
@@ -862,8 +1104,16 @@ def inspection_state_lines(result: dict[str, Any]) -> list[str]:
     elif terminal_class == "DIRECT_INSPECT_COMPOSITION_FAILED":
         if (
             result["command_exit_class"] == "ZERO"
-            or result["first_failed_group"] != "NONE"
-            or result["successful_group_count"] != len(INSPECT_FIELD_GROUPS)
+            or not (
+                (
+                    result["successful_group_count"] == 0
+                    and result["first_failed_group"] == "IDENTITY_CONFIG"
+                )
+                or (
+                    result["successful_group_count"] == len(INSPECT_FIELD_GROUPS)
+                    and result["first_failed_group"] in INSPECT_FIELD_GROUP_NAMES
+                )
+            )
         ):
             raise ValueError("inspection diagnostic composition fields disagree")
     else:

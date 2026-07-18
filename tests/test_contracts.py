@@ -3160,6 +3160,69 @@ def direct_inspection() -> dict:
     }
 
 
+def direct_group_payloads(container_id: str = "b" * 64) -> dict[str, dict]:
+    inspection = direct_inspection()
+    inspection["id"] = container_id
+    return {
+        "IDENTITY_CONFIG": {
+            "schema_version": 1,
+            **{
+                key: inspection[key]
+                for key in ("id", "name", "image_id", "config_image", "labels")
+            },
+        },
+        "HOSTCONFIG_SECURITY_TMPFS": {
+            "schema_version": 1,
+            **{
+                key: inspection[key]
+                for key in (
+                    "network_mode",
+                    "privileged",
+                    "pid_mode",
+                    "ipc_mode",
+                    "binds",
+                    "host_mounts",
+                    "volumes_from",
+                    "tmpfs",
+                    "devices",
+                    "device_requests",
+                    "cap_add",
+                    "security_opt",
+                    "extra_hosts",
+                    "restart_policy",
+                )
+            },
+        },
+        "PUBLICATION": {
+            "schema_version": 1,
+            "config": {"exposed_ports": inspection["config_exposed_ports"]},
+            "host_config": {
+                "port_bindings": inspection["port_bindings"],
+                "publish_all_ports": inspection["publish_all_ports"],
+            },
+            "network_settings": {"ports": inspection["published_ports"]},
+        },
+        "NETWORK_RUNTIME_MOUNTS": {
+            "schema_version": 1,
+            "mounts": inspection["mounts"],
+            "networks": inspection["networks"],
+        },
+        "STATE_HEALTH": {
+            "schema_version": 1,
+            "restart_count": inspection["restart_count"],
+            "state": inspection["state"],
+            "health": inspection["health"],
+        },
+    }
+
+
+def inspect_completed(
+    payload: object, returncode: int = 0, stderr: bytes = b""
+) -> subprocess.CompletedProcess[bytes]:
+    stdout = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
 class DirectPortProbeTests(unittest.TestCase):
     def validate(self, data: dict) -> list[str]:
         return direct_port.validate_inspection(
@@ -3474,12 +3537,14 @@ class DirectPortProbeTests(unittest.TestCase):
         failed = subprocess.CompletedProcess(
             [], 1, stdout=b"partial\n", stderr=b"private-command-error\n"
         )
-        valid = subprocess.CompletedProcess([], 0, stdout=b"{}\n", stderr=b"")
+        container_id = "b" * 64
+        availability = inspect_completed({"schema_version": 1, "id": container_id})
+        payloads = direct_group_payloads(container_id)
 
         with mock.patch.object(
             direct_port.subprocess, "run", side_effect=[failed, failed]
         ):
-            observed, diagnostic = direct_port.safe_inspect("opaque-id", 1)
+            observed, diagnostic = direct_port.safe_inspect(container_id, 1)
         self.assertIsNone(observed)
         assert diagnostic is not None
         self.assertEqual(
@@ -3492,36 +3557,216 @@ class DirectPortProbeTests(unittest.TestCase):
             direct_port.INSPECT_FIELD_GROUPS
         ):
             with self.subTest(group=group):
-                sequence = [failed, valid, *([valid] * index), failed]
+                prior = [
+                    inspect_completed(payloads[prior_group])
+                    for prior_group, _, _ in direct_port.INSPECT_FIELD_GROUPS[:index]
+                ]
+                sequence = [failed, availability, *prior, failed]
                 with mock.patch.object(
                     direct_port.subprocess, "run", side_effect=sequence
                 ):
-                    observed, diagnostic = direct_port.safe_inspect("opaque-id", 2)
+                    observed, diagnostic = direct_port.safe_inspect(container_id, 2)
                 self.assertIsNone(observed)
                 assert diagnostic is not None
                 self.assertEqual(diagnostic["terminal_class"], terminal_class)
                 self.assertEqual(diagnostic["first_failed_group"], group)
                 self.assertEqual(diagnostic["successful_group_count"], index)
 
-    def test_all_fixed_groups_passing_is_composition_failure(self) -> None:
+    def test_all_fixed_groups_compose_to_exact_flat_inspection(self) -> None:
+        container_id = "b" * 64
         failed = subprocess.CompletedProcess([], -9, stdout=b"", stderr=b"private")
-        valid = subprocess.CompletedProcess([], 0, stdout=b"{}", stderr=b"")
-        sequence = [failed, valid, *([valid] * len(direct_port.INSPECT_FIELD_GROUPS))]
+        payloads = direct_group_payloads(container_id)
+        sequence = [
+            failed,
+            inspect_completed({"schema_version": 1, "id": container_id}),
+            *[
+                inspect_completed(payloads[group])
+                for group, _, _ in direct_port.INSPECT_FIELD_GROUPS
+            ],
+        ]
+        with mock.patch.object(
+            direct_port.subprocess, "run", side_effect=sequence
+        ) as run:
+            observed, diagnostic = direct_port.safe_inspect(container_id, 4)
+        expected = direct_inspection()
+        expected["id"] = container_id
+        self.assertEqual(observed, expected)
+        self.assertIsNone(diagnostic)
+        self.assertEqual(
+            direct_port.compose_group_payloads(container_id, payloads), expected
+        )
+        self.assertEqual(len(run.call_args_list), 7)
+        self.assertTrue(
+            all(call.args[0][-1] == container_id for call in run.call_args_list)
+        )
+        self.assertTrue(
+            all(len(call.args[0][-1]) == 64 for call in run.call_args_list)
+        )
+
+    def test_group_contracts_reject_unknown_missing_schema_and_wrong_types(self) -> None:
+        payloads = direct_group_payloads()
+        wrong_types = {
+            "IDENTITY_CONFIG": ("id", 7),
+            "HOSTCONFIG_SECURITY_TMPFS": ("privileged", "false"),
+            "PUBLICATION": ("host_config", []),
+            "NETWORK_RUNTIME_MOUNTS": ("networks", []),
+            "STATE_HEALTH": ("state", []),
+        }
+        for group, payload in payloads.items():
+            with self.subTest(group=group, mutation="unknown"):
+                unknown = json.loads(json.dumps(payload))
+                unknown["unknown"] = None
+                with self.assertRaises(ValueError):
+                    direct_port.validate_group_payload(group, unknown)
+            with self.subTest(group=group, mutation="missing"):
+                missing = json.loads(json.dumps(payload))
+                missing.pop(next(key for key in missing if key != "schema_version"))
+                with self.assertRaises(ValueError):
+                    direct_port.validate_group_payload(group, missing)
+            for invalid_schema in (2, True, "1"):
+                with self.subTest(group=group, schema=invalid_schema):
+                    schema = json.loads(json.dumps(payload))
+                    schema["schema_version"] = invalid_schema
+                    with self.assertRaises(ValueError):
+                        direct_port.validate_group_payload(group, schema)
+            with self.subTest(group=group, mutation="wrong_type"):
+                wrong_type = json.loads(json.dumps(payload))
+                key, value = wrong_types[group]
+                wrong_type[key] = value
+                with self.assertRaises(ValueError):
+                    direct_port.validate_group_payload(group, wrong_type)
+
+        nested_cases = (
+            ("PUBLICATION", "config"),
+            ("PUBLICATION", "host_config"),
+            ("PUBLICATION", "network_settings"),
+            ("STATE_HEALTH", "state"),
+            ("STATE_HEALTH", "health"),
+        )
+        for group, nested_key in nested_cases:
+            for mutation in ("unknown", "missing"):
+                with self.subTest(group=group, nested=nested_key, mutation=mutation):
+                    payload = json.loads(json.dumps(payloads[group]))
+                    if mutation == "unknown":
+                        payload[nested_key]["unknown"] = None
+                    else:
+                        payload[nested_key].pop(next(iter(payload[nested_key])))
+                    with self.assertRaises(ValueError):
+                        direct_port.validate_group_payload(group, payload)
+
+    def test_fallback_group_parse_and_schema_failures_preserve_order(self) -> None:
+        container_id = "b" * 64
+        failed = inspect_completed(b"partial", returncode=1, stderr=b"private")
+        availability = inspect_completed({"schema_version": 1, "id": container_id})
+        payloads = direct_group_payloads(container_id)
+        for index, (group, terminal_class, _) in enumerate(
+            direct_port.INSPECT_FIELD_GROUPS
+        ):
+            prior = [
+                inspect_completed(payloads[prior_group])
+                for prior_group, _, _ in direct_port.INSPECT_FIELD_GROUPS[:index]
+            ]
+            invalid_payloads = (
+                b"{",
+                b'{"schema_version":1,"schema_version":1}',
+                {**payloads[group], "unknown": None},
+            )
+            for invalid in invalid_payloads:
+                with self.subTest(group=group, invalid_type=type(invalid).__name__):
+                    sequence = [failed, availability, *prior, inspect_completed(invalid)]
+                    with mock.patch.object(
+                        direct_port.subprocess, "run", side_effect=sequence
+                    ):
+                        observed, diagnostic = direct_port.safe_inspect(container_id, 2)
+                    self.assertIsNone(observed)
+                    assert diagnostic is not None
+                    self.assertEqual(diagnostic["terminal_class"], terminal_class)
+                    self.assertEqual(diagnostic["first_failed_group"], group)
+                    self.assertEqual(diagnostic["successful_group_count"], index)
+
+    def test_composition_rejects_identity_group_set_and_field_conflicts(self) -> None:
+        container_id = "b" * 64
+        payloads = direct_group_payloads(container_id)
+        mismatched = json.loads(json.dumps(payloads))
+        mismatched["IDENTITY_CONFIG"]["id"] = "c" * 64
+        with self.assertRaises(direct_port.CompositionContractError) as identity_error:
+            direct_port.compose_group_payloads(container_id, mismatched)
+        self.assertEqual(identity_error.exception.group, "IDENTITY_CONFIG")
+        with self.assertRaises(direct_port.CompositionContractError):
+            direct_port.compose_group_payloads("short-id", payloads)
+        missing_group = dict(payloads)
+        missing_group.pop("STATE_HEALTH")
+        with self.assertRaises(direct_port.CompositionContractError):
+            direct_port.compose_group_payloads(container_id, missing_group)
+        with self.assertRaises(direct_port.CompositionContractError) as conflict:
+            direct_port._merge_unique(
+                {"published_ports": None},
+                {"published_ports": {}},
+                "PUBLICATION",
+            )
+        self.assertEqual(conflict.exception.group, "PUBLICATION")
+
+    def test_fallback_identity_disagreement_is_closed_composition_failure(self) -> None:
+        container_id = "b" * 64
+        failed = inspect_completed(b"partial", returncode=1, stderr=b"private")
+        payloads = direct_group_payloads(container_id)
+        payloads["IDENTITY_CONFIG"]["id"] = "c" * 64
+        sequence = [
+            failed,
+            inspect_completed({"schema_version": 1, "id": container_id}),
+            *[
+                inspect_completed(payloads[group])
+                for group, _, _ in direct_port.INSPECT_FIELD_GROUPS
+            ],
+        ]
         with mock.patch.object(
             direct_port.subprocess, "run", side_effect=sequence
         ):
-            observed, diagnostic = direct_port.safe_inspect("opaque-id", 4)
+            observed, diagnostic = direct_port.safe_inspect(container_id, 6)
         self.assertIsNone(observed)
         assert diagnostic is not None
         self.assertEqual(
             diagnostic["terminal_class"], "DIRECT_INSPECT_COMPOSITION_FAILED"
         )
-        self.assertEqual(diagnostic["command_exit_class"], "SIGNAL")
-        self.assertEqual(diagnostic["first_failed_group"], "NONE")
+        self.assertEqual(diagnostic["first_failed_group"], "IDENTITY_CONFIG")
         self.assertEqual(
             diagnostic["successful_group_count"],
             len(direct_port.INSPECT_FIELD_GROUPS),
         )
+
+    def test_availability_identity_disagreement_stops_before_field_groups(self) -> None:
+        container_id = "b" * 64
+        failed = inspect_completed(b"partial", returncode=1, stderr=b"private")
+        availability = inspect_completed({"schema_version": 1, "id": "c" * 64})
+        with mock.patch.object(
+            direct_port.subprocess, "run", side_effect=[failed, availability]
+        ) as run:
+            observed, diagnostic = direct_port.safe_inspect(container_id, 7)
+        self.assertIsNone(observed)
+        assert diagnostic is not None
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertEqual(
+            diagnostic["terminal_class"], "DIRECT_INSPECT_COMPOSITION_FAILED"
+        )
+        self.assertEqual(diagnostic["first_failed_group"], "IDENTITY_CONFIG")
+        self.assertEqual(diagnostic["successful_group_count"], 0)
+
+    def test_group_raw_failure_bytes_never_enter_diagnostic_output(self) -> None:
+        container_id = "b" * 64
+        failed = inspect_completed(b"partial", returncode=1, stderr=b"private-full")
+        availability = inspect_completed({"schema_version": 1, "id": container_id})
+        group_raw = b"secret-shaped-group-output"
+        with mock.patch.object(
+            direct_port.subprocess,
+            "run",
+            side_effect=[failed, availability, inspect_completed(group_raw)],
+        ):
+            observed, diagnostic = direct_port.safe_inspect(container_id, 8)
+        self.assertIsNone(observed)
+        assert diagnostic is not None
+        rendered = "\n".join(direct_port.inspection_state_lines(diagnostic))
+        self.assertNotIn(group_raw.decode(), rendered)
+        self.assertNotIn(container_id, rendered)
 
     def test_inspection_envelope_is_closed_deterministic_and_never_emits_raw(self) -> None:
         stdout = b"credential-shaped-output\nsecond-line\n"
