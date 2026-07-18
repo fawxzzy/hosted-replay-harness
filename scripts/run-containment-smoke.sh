@@ -464,7 +464,10 @@ PY
 }
 
 validate_network_ipam_contract() {
-  local network_ref="$1" stage="$2" ipam_path="$RAW/network-ipam-${stage}.json"
+  local network_ref stage ipam_path
+  network_ref="$1"
+  stage="$2"
+  ipam_path="$RAW/network-ipam-${stage}.json"
   docker network inspect --format '{{json .IPAM.Config}}' "$network_ref" \
     >"$ipam_path" 2>>"$RAW/network-contract.log" \
     || return 1

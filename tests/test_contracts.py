@@ -335,6 +335,46 @@ class RunnerStaticContractTests(unittest.TestCase):
                     0,
                 )
 
+    def test_network_ipam_readback_path_is_nounset_safe(self) -> None:
+        match = re.search(
+            r"(?ms)^validate_network_ipam_contract\(\) \{\n.*?^\}\n",
+            self.runner,
+        )
+        self.assertIsNotNone(match)
+        assert match
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw"
+            raw.mkdir()
+            expected_path = raw / "network-ipam-after-create.json"
+            script = f"""
+set -u
+RAW={shlex.quote(raw.as_posix())}
+SUBNET=172.31.253.0/24
+SUBNET_GATEWAY=172.31.253.1
+docker() {{
+  [[ "$1" == network && "$2" == inspect && "$3" == --format ]]
+  printf '%s\n' '[{{"Subnet":"172.31.253.0/24","Gateway":"172.31.253.1"}}]'
+}}
+gateway_contract() {{
+  [[ "$1" == readback ]]
+  [[ "$2" == "$SUBNET" && "$3" == "$SUBNET_GATEWAY" ]]
+  [[ "$4" == "$RAW/network-ipam-after-create.json" ]]
+  grep -Fxq '[{{"Subnet":"172.31.253.0/24","Gateway":"172.31.253.1"}}]' "$4"
+}}
+{match.group(0)}
+validate_network_ipam_contract fixture-network after-create
+"""
+            completed = subprocess.run(
+                [BASH, "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn("unbound variable", completed.stderr)
+            self.assertTrue(expected_path.is_file())
+
     def test_firewall_is_active_before_first_container_and_removed_after_all_containers(self) -> None:
         rehearsal = self.runner[
             self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
