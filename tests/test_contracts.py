@@ -218,6 +218,27 @@ class RunnerStaticContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
 
+    @classmethod
+    def runner_functions(cls, *names: str) -> str:
+        functions: list[str] = []
+        for name in names:
+            match = re.search(
+                rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n",
+                cls.runner,
+            )
+            assert match, name
+            functions.append(match.group(0))
+        return "\n".join(functions)
+
+    @staticmethod
+    def run_bash(source: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [BASH, "-c", source],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def test_cli_containment_acquires_only_the_two_exact_images(self) -> None:
         pulls = re.findall(r"(?m)^\s*docker pull --platform linux/amd64 ", self.runner)
         self.assertEqual(len(pulls), 2)
@@ -451,12 +472,16 @@ validate_network_ipam_contract fixture-network after-create
         cleanup = self.runner[
             self.runner.index("cleanup_exact() {") : self.runner.index("finalize() {")
         ]
-        self.assertLess(cleanup.index("docker rm -f"), cleanup.index('firewall_boundary.py" remove'))
-        self.assertLess(cleanup.index('firewall_boundary.py" remove'), cleanup.index("docker network rm"))
-        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE", cleanup)
+        boundary = self.runner[
+            self.runner.index("cleanup_firewall_boundary() {") : self.runner.index("cleanup_exact() {")
+        ]
+        self.assertIn('firewall_boundary.py" remove', boundary)
+        self.assertLess(cleanup.index("docker rm -f"), cleanup.index("cleanup_firewall_boundary"))
+        self.assertLess(cleanup.index("cleanup_firewall_boundary"), cleanup.index("docker network rm"))
+        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE", boundary)
         self.assertLess(
-            cleanup.index('record cleanup.containers_before_firewall_remove'),
-            cleanup.index('firewall_boundary.py" remove'),
+            boundary.index('record cleanup.containers_before_firewall_remove'),
+            boundary.index('firewall_boundary.py" remove'),
         )
         self.assertNotIn("docker system prune", cleanup)
         self.assertNotIn("docker stop --all", cleanup)
@@ -575,6 +600,400 @@ validate_network_ipam_contract fixture-network after-create
             ),
             2,
         )
+
+    def test_cleanup_mode_contract_is_closed_atomic_and_retry_bounded(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "cleanup_mode_firewall_required",
+            "cleanup_mode_payload",
+            "write_cleanup_mode_contract",
+            "read_cleanup_mode_contract",
+            "resolve_cleanup_mode_contract",
+            "retire_cleanup_mode_contract",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).as_posix()
+            script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root)}
+mkdir -p "$ROOT/artifacts"
+STATE_FILE="$ROOT/artifacts/state.tsv"
+CLEANUP_MODE_FILE="$ROOT/artifacts/.cleanup-mode.tsv"
+CLEANUP_MODE_STAGE_FILE="$ROOT/artifacts/.cleanup-mode.tsv.stage"
+CLEANUP_MODE_SCHEMA=fawxzzy.hosted-replay-harness.cleanup-mode.v1
+CLEANUP_ORIGINAL_MODE=""
+CLEANUP_FIREWALL_REQUIRED=""
+{functions}
+stat() {{
+  if [[ "$1" == -c && "$2" == %a ]]; then printf '600\n'; return 0; fi
+  command stat "$@"
+}}
+for mode in run direct-port firewall-rehearsal; do
+  : >"$STATE_FILE"
+  write_cleanup_mode_contract "$mode"
+  resolve_cleanup_mode_contract "$mode"
+  printf 'MODE:%s:%s\n' "$CLEANUP_ORIGINAL_MODE" "$CLEANUP_FIREWALL_REQUIRED"
+  resolve_cleanup_mode_contract cleanup-only
+  retire_cleanup_mode_contract
+  ! read_cleanup_mode_contract
+done
+! write_cleanup_mode_contract cleanup-only
+write_cleanup_mode_contract run
+! resolve_cleanup_mode_contract direct-port
+resolve_cleanup_mode_contract cleanup-only
+sed -i 's/payload_sha256.*$/payload_sha256\tstr\t{'0' * 64}/' "$CLEANUP_MODE_FILE"
+! read_cleanup_mode_contract
+rm -f "$CLEANUP_MODE_FILE"
+: >"$CLEANUP_MODE_STAGE_FILE"
+! write_cleanup_mode_contract run
+rm -f "$CLEANUP_MODE_STAGE_FILE"
+"""
+            completed = self.run_bash(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            ["MODE:run:false", "MODE:direct-port:false", "MODE:firewall-rehearsal:true"],
+        )
+
+    def test_mode_aware_firewall_cleanup_never_uses_evidence_absence_as_the_selector(self) -> None:
+        functions = self.runner_functions("record", "cleanup_firewall_boundary")
+
+        def execute(
+            original_mode: str,
+            required: str,
+            helper_rc: int = 0,
+            mode_rc: int = 0,
+            precontainers: int = 0,
+            create_ledger: bool = False,
+        ) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).as_posix()
+                script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root)}
+mkdir -p "$ROOT/artifacts" "$ROOT/raw" "$ROOT/runtime"
+STATE_FILE="$ROOT/state.tsv"
+RAW="$ROOT/raw"
+FIREWALL_LEDGER="$ROOT/artifacts/ledger.json"
+FIREWALL_COMPLETION="$FIREWALL_LEDGER.restoration-complete"
+FIREWALL_COMPLETION_STAGE="$ROOT/artifacts/.ledger.json.restoration-complete.stage"
+FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/rollback.tsv"
+FIREWALL_STATE_FILE="$ROOT/runtime/firewall.tsv"
+MODE={'cleanup-only' if original_mode != 'firewall-rehearsal' else 'firewall-rehearsal'}
+CLEANUP_ORIGINAL_MODE={shlex.quote(original_mode)}
+CLEANUP_FIREWALL_REQUIRED={shlex.quote(required)}
+HELPER_RC={helper_rc}
+python3() {{
+  printf 'CALL\n' >>"$ROOT/helper.calls"
+  if [[ "$HELPER_RC" == 0 ]]; then
+    printf 'firewall.rollback_idempotent\tbool\ttrue\n' >"$FIREWALL_STATE_FILE"
+  else
+    printf 'firewall.failure_code\tstr\tFIREWALL_RESTORATION_EVIDENCE_MISSING\n' >"$FIREWALL_STATE_FILE"
+  fi
+  return "$HELPER_RC"
+}}
+{functions}
+{'touch "$FIREWALL_LEDGER"' if create_ledger else ':'}
+set +e
+cleanup_firewall_boundary {precontainers} {mode_rc}
+rc="$?"
+if [[ -f "$ROOT/helper.calls" ]]; then
+  printf 'CALLS:%s\n' "$(wc -l <"$ROOT/helper.calls")"
+else
+  printf 'CALLS:0\n'
+fi
+cat "$STATE_FILE"
+exit "$rc"
+"""
+                return self.run_bash(script)
+
+        for mode in ("run", "direct-port"):
+            with self.subTest(mode=mode):
+                result = execute(mode, "false")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("CALLS:0", result.stdout)
+                self.assertIn(f"cleanup.firewall.skipped_mode\tstr\t{mode}", result.stdout)
+        firewall = execute("firewall-rehearsal", "true")
+        self.assertEqual(firewall.returncode, 0, firewall.stderr)
+        self.assertIn("CALLS:1", firewall.stdout)
+        missing = execute("firewall-rehearsal", "true", helper_rc=1)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("FIREWALL_RESTORATION_EVIDENCE_MISSING", missing.stdout)
+        mismatch = execute("run", "false", create_ledger=True)
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("CLEANUP_MODE_FIREWALL_STATE_MISMATCH", mismatch.stdout)
+        invalid = execute("run", "false", mode_rc=1)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("CLEANUP_MODE_CONTRACT_INVALID", invalid.stdout)
+        residue = execute("firewall-rehearsal", "true", precontainers=1)
+        self.assertNotEqual(residue.returncode, 0)
+        self.assertIn("FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE", residue.stdout)
+
+    def test_finalize_result_writer_failure_blocks_pass_and_preserves_prior_failure(self) -> None:
+        functions = self.runner_functions("record", "current_failure_code", "finalize")
+
+        def execute(smoke_passed: int, initial_failure: str, original_rc: int) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).as_posix()
+                script = f"""set -uo pipefail
+ROOT={shlex.quote(root)}
+mkdir -p "$ROOT/artifacts" "$ROOT/raw" "$ROOT/runtime"
+STATE_FILE="$ROOT/artifacts/.state.tsv"
+RESULT_FILE="$ROOT/artifacts/result.json"
+RESULT_STAGE_FILE="$ROOT/artifacts/result.stage"
+RAW="$ROOT/raw"
+RUNTIME="$ROOT/runtime"
+AUDIT_FILE="$RUNTIME/audit"
+MODE=direct-port
+FINALIZING=0
+SMOKE_PASSED={smoke_passed}
+NETWORK_ID=""
+printf 'status\tstr\tBLOCKED\nfailure.code\tstr\t{initial_failure}\nfailure.detail\tstr\tfrozen\n' >"$STATE_FILE"
+{functions}
+current_listener_phase() {{ :; }}
+listener_phase_is_unexpected() {{ return 1; }}
+cleanup_exact() {{ return 0; }}
+network_contract_code() {{ printf 'PASS\n'; }}
+publish_result_receipt() {{ return 1; }}
+set +e
+(
+  if [[ {original_rc} == 0 ]]; then true; else false; fi
+  finalize
+)
+rc="$?"
+cat "$STATE_FILE" >&2
+exit "$rc"
+"""
+                return self.run_bash(script)
+
+        passing = execute(1, "HARNESS_INTERRUPTED", 0)
+        self.assertNotEqual(passing.returncode, 0)
+        self.assertNotIn("DIRECT_DOCKER_PORT_PATH_PASS", passing.stdout)
+        self.assertIn("BLOCKED: RESULT_RECEIPT_PUBLICATION_FAILED", passing.stdout)
+        self.assertIn("failure.code\tstr\tRESULT_RECEIPT_PUBLICATION_FAILED", passing.stderr)
+        self.assertNotRegex(passing.stdout, r"(?m)^DIRECT_DOCKER_PORT_PATH_PASS$")
+        blocked = execute(0, "DATABASE_HEALTH_FAILED", 1)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("BLOCKED: RESULT_RECEIPT_PUBLICATION_FAILED", blocked.stdout)
+        failure_codes = re.findall(r"(?m)^failure\.code\tstr\t(\S+)$", blocked.stderr)
+        self.assertEqual(failure_codes, ["DATABASE_HEALTH_FAILED"])
+        self.assertIn(
+            "receipt.publication_failure_code\tstr\tRESULT_RECEIPT_PUBLICATION_FAILED",
+            blocked.stderr,
+        )
+
+    def test_cleanup_recovery_writer_failure_is_nonzero_and_retains_state(self) -> None:
+        functions = self.runner_functions("record", "current_failure_code", "cleanup_only")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).as_posix()
+            script = f"""set -uo pipefail
+ROOT={shlex.quote(root)}
+RUNTIME="$ROOT/runtime"
+RAW="$RUNTIME/raw"
+RUNTIME_HOME="$RUNTIME/home"
+PROJECT_DIR="$RUNTIME/project"
+STATE_FILE="$ROOT/artifacts/.state.tsv"
+CLEANUP_STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
+RESULT_FILE="$ROOT/artifacts/result.json"
+RESULT_STAGE_FILE="$ROOT/artifacts/result.stage"
+AUDIT_FILE="$RUNTIME/audit"
+FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/rollback.tsv"
+RESULT_PROFILE=""
+mkdir -p "$ROOT/artifacts"
+printf 'status\tstr\tBLOCKED\nfailure.code\tstr\tDATABASE_HEALTH_FAILED\nreceipt.publication_failure_code\tstr\tRESULT_RECEIPT_PUBLICATION_FAILED\n' >"$STATE_FILE"
+{functions}
+cleanup_exact() {{ return 0; }}
+publish_result_receipt() {{ return 1; }}
+retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
+result_receipt_status() {{ printf 'BLOCKED\n'; }}
+cleanup_only
+"""
+            completed = self.run_bash(script)
+            state_path = Path(directory) / "artifacts" / ".state.tsv"
+            state_retained = state_path.is_file()
+            state_text = state_path.read_text(encoding="utf-8") if state_retained else ""
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("CLEANUP_EXACT_PASS", completed.stdout)
+        self.assertNotIn("RETIRED", completed.stdout)
+        self.assertTrue(state_retained)
+        self.assertIn("failure.code\tstr\tDATABASE_HEALTH_FAILED", state_text)
+        self.assertIn("receipt.recovery_attempted\tbool\ttrue", state_text)
+
+    def test_cleanup_writer_failure_preserves_blocked_receipt_and_removes_pass_receipt(self) -> None:
+        functions = self.runner_functions(
+            "record",
+            "current_failure_code",
+            "cleanup_only",
+        )
+
+        def execute(status: str, failure: dict[str, str] | None) -> tuple[subprocess.CompletedProcess[str], bool, str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root_path = Path(directory)
+                root = root_path.as_posix()
+                artifacts = root_path / "artifacts"
+                artifacts.mkdir()
+                result_path = artifacts / "result.json"
+                schema = (
+                    "fawxzzy.hosted-replay-harness.direct-port-result.v1"
+                    if status == "DIRECT_DOCKER_PORT_PATH_PASS"
+                    else "fawxzzy.hosted-replay-harness.result.v1"
+                )
+                result_path.write_text(
+                    json.dumps({"schema": schema, "status": status, "failure": failure}),
+                    encoding="utf-8",
+                )
+                script = f"""set -uo pipefail
+ROOT={shlex.quote(root)}
+RUNTIME="$ROOT/runtime"
+RAW="$RUNTIME/raw"
+RUNTIME_HOME="$RUNTIME/home"
+PROJECT_DIR="$RUNTIME/project"
+STATE_FILE="$ROOT/artifacts/.state.tsv"
+CLEANUP_STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
+RESULT_FILE="$ROOT/artifacts/result.json"
+RESULT_STAGE_FILE="$ROOT/artifacts/result.stage"
+AUDIT_FILE="$RUNTIME/audit"
+FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/rollback.tsv"
+RESULT_PROFILE=""
+EXISTING_STATUS={shlex.quote(status)}
+EXISTING_FAILURE={shlex.quote((failure or {}).get('code', ''))}
+{functions}
+cleanup_exact() {{ return 0; }}
+publish_result_receipt() {{ return 1; }}
+retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
+result_receipt_status() {{ printf '%s\n' "$EXISTING_STATUS"; }}
+result_receipt_failure_code() {{ printf '%s\n' "$EXISTING_FAILURE"; }}
+cleanup_only
+"""
+                completed = self.run_bash(script)
+                retained = result_path.is_file()
+                state_path = artifacts / ".cleanup-state.tsv"
+                state = state_path.read_text(encoding="utf-8") if state_path.is_file() else ""
+                return completed, retained, state
+
+        blocked, blocked_retained, blocked_state = execute(
+            "BLOCKED",
+            {"code": "DATABASE_HEALTH_FAILED", "detail": "sanitized"},
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertTrue(blocked_retained)
+        self.assertIn("failure.code\tstr\tDATABASE_HEALTH_FAILED", blocked_state)
+        self.assertIn("receipt.original_failure_code\tstr\tDATABASE_HEALTH_FAILED", blocked_state)
+        passed, pass_retained, pass_state = execute("DIRECT_DOCKER_PORT_PATH_PASS", None)
+        self.assertNotEqual(passed.returncode, 0)
+        self.assertFalse(pass_retained)
+        self.assertIn("failure.code\tstr\tRESULT_RECEIPT_PUBLICATION_FAILED", pass_state)
+        self.assertNotIn("CLEANUP_EXACT_PASS", passed.stdout)
+
+    def test_cleanup_without_prior_receipt_publishes_blocked_replace_even_when_cleanup_fails(self) -> None:
+        functions = self.runner_functions("record", "current_failure_code", "cleanup_only")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).as_posix()
+            script = f"""set -uo pipefail
+ROOT={shlex.quote(root)}
+RUNTIME="$ROOT/runtime"
+RAW="$RUNTIME/raw"
+RUNTIME_HOME="$RUNTIME/home"
+PROJECT_DIR="$RUNTIME/project"
+STATE_FILE="$ROOT/artifacts/.state.tsv"
+CLEANUP_STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
+RESULT_FILE="$ROOT/artifacts/result.json"
+RESULT_STAGE_FILE="$ROOT/artifacts/result.stage"
+AUDIT_FILE="$RUNTIME/audit"
+FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/rollback.tsv"
+RESULT_PROFILE=""
+{functions}
+cleanup_exact() {{ return 1; }}
+publish_result_receipt() {{ printf 'PUBLISH:%s:%s\n' "$1" "$2"; return 0; }}
+retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
+result_receipt_status() {{ return 1; }}
+cleanup_only
+"""
+            completed = self.run_bash(script)
+            state_path = Path(directory) / "artifacts" / ".cleanup-state.tsv"
+            state = state_path.read_text(encoding="utf-8") if state_path.is_file() else ""
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("PUBLISH:BLOCKED:replace", completed.stdout)
+        self.assertNotIn("CLEANUP_EXACT_PASS", completed.stdout)
+        self.assertNotIn("RETIRED", completed.stdout)
+        self.assertIn("failure.code\tstr\tCLEANUP_RESIDUE", state)
+
+    def test_result_receipt_publication_is_staged_validated_and_fail_closed(self) -> None:
+        publisher = self.runner_functions(
+            "validate_result_receipt",
+            "result_receipt_status",
+            "publish_result_receipt",
+        )
+        self.assertIn('RESULT_STAGE_FILE="$ROOT/artifacts/.containment-smoke.json.stage"', self.runner)
+        self.assertIn('validate_result_receipt "$RESULT_STAGE_FILE" "$expected_status"', publisher)
+        self.assertIn('mv -f -- "$RESULT_STAGE_FILE" "$RESULT_FILE"', publisher)
+        self.assertIn('validate_result_receipt "$RESULT_FILE" "$expected_status"', publisher)
+        self.assertIn('rm -f -- "$RESULT_FILE"', publisher)
+        finalize = self.runner_functions("finalize")
+        self.assertLess(
+            finalize.index('publish_result_receipt "$final_status" replace'),
+            finalize.index("printf '%s\\n' \"$final_status\""),
+        )
+        self.assertIn("RESULT_RECEIPT_PUBLICATION_FAILED", finalize)
+        self.assertIn('[[ "$receipt_failure" != "0" ]] || rm -f -- "$STATE_FILE"', finalize)
+
+    def test_result_receipt_validator_rejects_duplicate_ambiguous_or_contradictory_json(self) -> None:
+        start = self.runner.index("validate_result_receipt() {")
+        end = self.runner.index("\nresult_receipt_status() {", start)
+        validator = self.runner[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = {
+                "pass.json": {
+                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
+                    "status": "CONTAINMENT_SMOKE_PASS",
+                    "failure": None,
+                },
+                "direct.json": {
+                    "schema": "fawxzzy.hosted-replay-harness.direct-port-result.v1",
+                    "status": "DIRECT_DOCKER_PORT_PATH_PASS",
+                    "failure": None,
+                },
+                "blocked.json": {
+                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
+                    "status": "BLOCKED",
+                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
+                },
+                "contradictory.json": {
+                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
+                    "status": "CONTAINMENT_SMOKE_PASS",
+                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
+                },
+                "wrong-schema.json": {
+                    "schema": "unknown",
+                    "status": "BLOCKED",
+                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
+                },
+                "top-level.json": [],
+            }
+            for name, payload in fixtures.items():
+                (root / name).write_text(json.dumps(payload), encoding="utf-8")
+            (root / "duplicate.json").write_text(
+                '{"schema":"fawxzzy.hosted-replay-harness.result.v1",'
+                '"status":"BLOCKED","status":"BLOCKED",'
+                '"failure":{"code":"DATABASE_HEALTH_FAILED"}}',
+                encoding="utf-8",
+            )
+            q = shlex.quote
+            script = f"""set -Eeuo pipefail
+PYTHON={q(Path(sys.executable).as_posix())}
+python3() {{ "$PYTHON" "$@"; }}
+{validator}
+validate_result_receipt {q((root / 'pass.json').as_posix())} CONTAINMENT_SMOKE_PASS
+validate_result_receipt {q((root / 'direct.json').as_posix())} DIRECT_DOCKER_PORT_PATH_PASS
+validate_result_receipt {q((root / 'blocked.json').as_posix())} BLOCKED
+! validate_result_receipt {q((root / 'contradictory.json').as_posix())} CONTAINMENT_SMOKE_PASS
+! validate_result_receipt {q((root / 'wrong-schema.json').as_posix())} BLOCKED
+! validate_result_receipt {q((root / 'top-level.json').as_posix())} BLOCKED
+! validate_result_receipt {q((root / 'duplicate.json').as_posix())} BLOCKED
+! validate_result_receipt {q((root / 'pass.json').as_posix())} BLOCKED
+"""
+            completed = self.run_bash(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
 
     def test_loader_output_is_sanitized_classified_and_deleted(self) -> None:
         self.assertIn("umask 077", self.runner)
@@ -824,7 +1243,10 @@ validate_network_ipam_contract fixture-network after-create
         self.assertIn('[[ "$listener_count" == "0" ]] || return 1', self.runner)
         self.assertRegex(
             self.runner,
-            r'(?s)elif \[\[ ! -f "\$RESULT_FILE" \]\]; then\s+if \[\[ "\$RESULT_PROFILE" == "direct-docker-port-v1" \]\]; then\s+record result.profile str direct-docker-port-v1',
+            r'(?s)if \[\[ ! -f "\$RESULT_FILE" \]\]; then\s+publish_operation=replace.*?'
+            r'elif \[\[ "\$recovery_state" == "0" && "\$cleanup_rc" == "0" '
+            r'&& "\$RESULT_PROFILE" == "direct-docker-port-v1" \]\]; then\s+'
+            r'record result.profile str direct-docker-port-v1',
         )
 
 

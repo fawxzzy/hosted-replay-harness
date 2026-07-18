@@ -61,7 +61,14 @@ VOLUME_EVENTS_FILE="$RAW/docker-volume-events.jsonl"
 NETWORK_EVENTS_FILE="$RAW/docker-network-events.jsonl"
 STATE_FILE="$ROOT/artifacts/.state.tsv"
 RESULT_FILE="$ROOT/artifacts/containment-smoke.json"
+RESULT_STAGE_FILE="$ROOT/artifacts/.containment-smoke.json.stage"
+CLEANUP_STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
+CLEANUP_MODE_FILE="$ROOT/artifacts/.cleanup-mode.tsv"
+CLEANUP_MODE_STAGE_FILE="$ROOT/artifacts/.cleanup-mode.tsv.stage"
+CLEANUP_MODE_SCHEMA="fawxzzy.hosted-replay-harness.cleanup-mode.v1"
 FIREWALL_LEDGER="$ROOT/artifacts/.firewall-ledger.json"
+FIREWALL_COMPLETION="$FIREWALL_LEDGER.restoration-complete"
+FIREWALL_COMPLETION_STAGE="$ROOT/artifacts/.$(basename "$FIREWALL_COMPLETION").stage"
 FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/.firewall-rollback.tsv"
 FIREWALL_STATE_FILE="$RUNTIME/firewall-state.tsv"
 FIREWALL_PHASE_MANIFEST="$RUNTIME/firewall-phase-manifest.tsv"
@@ -87,6 +94,8 @@ LISTENER_COUNT_BIN="awk"
 LISTENER_HASH_BIN="sha256sum"
 SMOKE_PASSED=0
 FINALIZING=0
+CLEANUP_ORIGINAL_MODE=""
+CLEANUP_FIREWALL_REQUIRED=""
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
 EXPECTED_OUTPUT_DENIES=0
@@ -142,6 +151,238 @@ record() {
   value="${value//$'\r'/ }"
   value="${value//$'\n'/ }"
   printf '%s\t%s\t%s\n' "$key" "$kind" "$value" >>"$STATE_FILE"
+}
+
+cleanup_mode_firewall_required() {
+  case "$1" in
+    run|direct-port) printf 'false\n' ;;
+    firewall-rehearsal) printf 'true\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+cleanup_mode_payload() {
+  local mode="$1" firewall_required
+  firewall_required="$(cleanup_mode_firewall_required "$mode")" || return 1
+  printf 'schema\tstr\t%s\nmode\tstr\t%s\nfirewall_required\tbool\t%s\n' \
+    "$CLEANUP_MODE_SCHEMA" "$mode" "$firewall_required"
+}
+
+write_cleanup_mode_contract() {
+  local mode="$1" payload payload_sha
+  [[ ! -e "$CLEANUP_MODE_FILE" && ! -L "$CLEANUP_MODE_FILE" \
+    && ! -e "$CLEANUP_MODE_STAGE_FILE" && ! -L "$CLEANUP_MODE_STAGE_FILE" ]] || return 1
+  payload="$(cleanup_mode_payload "$mode")" || return 1
+  payload_sha="$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')" || return 1
+  [[ "$payload_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if ! {
+    printf '%s\n' "$payload"
+    printf 'payload_sha256\tstr\t%s\n' "$payload_sha"
+  } >"$CLEANUP_MODE_STAGE_FILE" || ! chmod 0600 "$CLEANUP_MODE_STAGE_FILE"; then
+    rm -f -- "$CLEANUP_MODE_STAGE_FILE"
+    return 1
+  fi
+  if ! ln -- "$CLEANUP_MODE_STAGE_FILE" "$CLEANUP_MODE_FILE"; then
+    rm -f -- "$CLEANUP_MODE_STAGE_FILE"
+    return 1
+  fi
+  rm -f -- "$CLEANUP_MODE_STAGE_FILE" || return 1
+}
+
+read_cleanup_mode_contract() {
+  local payload expected_sha observed_sha stored_mode stored_required expected_required
+  local -a lines=()
+  [[ ! -e "$CLEANUP_MODE_STAGE_FILE" && ! -L "$CLEANUP_MODE_STAGE_FILE" ]] || return 1
+  [[ -f "$CLEANUP_MODE_FILE" && ! -L "$CLEANUP_MODE_FILE" ]] || return 1
+  [[ "$(stat -c '%a' "$CLEANUP_MODE_FILE" 2>/dev/null)" == "600" ]] || return 1
+  mapfile -t lines <"$CLEANUP_MODE_FILE" || return 1
+  [[ "${#lines[@]}" == "4" ]] || return 1
+  [[ "${lines[0]}" == $'schema\tstr\t'"$CLEANUP_MODE_SCHEMA" ]] || return 1
+  [[ "${lines[1]}" =~ ^mode$'\t'str$'\t'(run|direct-port|firewall-rehearsal)$ ]] || return 1
+  [[ "${lines[2]}" =~ ^firewall_required$'\t'bool$'\t'(true|false)$ ]] || return 1
+  [[ "${lines[3]}" =~ ^payload_sha256$'\t'str$'\t'([0-9a-f]{64})$ ]] || return 1
+  stored_mode="${lines[1]##*$'\t'}"
+  stored_required="${lines[2]##*$'\t'}"
+  observed_sha="${lines[3]##*$'\t'}"
+  expected_required="$(cleanup_mode_firewall_required "$stored_mode")" || return 1
+  [[ "$stored_required" == "$expected_required" ]] || return 1
+  payload="$(printf '%s\n' "${lines[@]:0:3}")"
+  expected_sha="$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')" || return 1
+  [[ "$observed_sha" == "$expected_sha" ]] || return 1
+  CLEANUP_ORIGINAL_MODE="$stored_mode"
+  CLEANUP_FIREWALL_REQUIRED="$stored_required"
+}
+
+resolve_cleanup_mode_contract() {
+  local invocation_mode="$1"
+  CLEANUP_ORIGINAL_MODE=""
+  CLEANUP_FIREWALL_REQUIRED=""
+  read_cleanup_mode_contract || return 1
+  if [[ "$invocation_mode" != "cleanup-only" && "$invocation_mode" != "$CLEANUP_ORIGINAL_MODE" ]]; then
+    return 1
+  fi
+  record cleanup.mode.invocation str "$invocation_mode" || return 1
+  record cleanup.mode.original str "$CLEANUP_ORIGINAL_MODE" || return 1
+  record cleanup.mode.firewall_required bool "$CLEANUP_FIREWALL_REQUIRED" || return 1
+}
+
+retire_cleanup_mode_contract() {
+  [[ ! -e "$CLEANUP_MODE_STAGE_FILE" && ! -L "$CLEANUP_MODE_STAGE_FILE" ]] || return 1
+  [[ -f "$CLEANUP_MODE_FILE" && ! -L "$CLEANUP_MODE_FILE" ]] || return 1
+  rm -f -- "$CLEANUP_MODE_FILE" || return 1
+  [[ ! -e "$CLEANUP_MODE_FILE" && ! -L "$CLEANUP_MODE_FILE" ]] || return 1
+}
+
+validate_result_receipt() {
+  local path="$1" expected_status="$2"
+  python3 -B - "$path" "$expected_status" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+allowed = {
+    "BLOCKED",
+    "CONTAINMENT_SMOKE_PASS",
+    "DIRECT_DOCKER_PORT_PATH_PASS",
+    "FIREWALL_PUBLICATION_REHEARSAL_PASS",
+}
+if expected not in allowed or not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(result, dict) or result.get("status") != expected:
+    raise SystemExit(1)
+schema = result.get("schema")
+if schema not in {
+    "fawxzzy.hosted-replay-harness.result.v1",
+    "fawxzzy.hosted-replay-harness.direct-port-result.v1",
+}:
+    raise SystemExit(1)
+if expected == "DIRECT_DOCKER_PORT_PATH_PASS" and schema != "fawxzzy.hosted-replay-harness.direct-port-result.v1":
+    raise SystemExit(1)
+if expected in {"CONTAINMENT_SMOKE_PASS", "FIREWALL_PUBLICATION_REHEARSAL_PASS"} and schema != "fawxzzy.hosted-replay-harness.result.v1":
+    raise SystemExit(1)
+failure = result.get("failure")
+if expected == "BLOCKED":
+    if not isinstance(failure, dict) or not re.fullmatch(r"[A-Z0-9_]+", str(failure.get("code", ""))):
+        raise SystemExit(1)
+elif failure is not None:
+    raise SystemExit(1)
+PY
+}
+
+result_receipt_status() {
+  python3 -B - "$RESULT_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+allowed = {
+    "BLOCKED",
+    "CONTAINMENT_SMOKE_PASS",
+    "DIRECT_DOCKER_PORT_PATH_PASS",
+    "FIREWALL_PUBLICATION_REHEARSAL_PASS",
+}
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+    value = result.get("status")
+except (AttributeError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if value not in allowed:
+    raise SystemExit(1)
+schema = result.get("schema")
+if schema not in {
+    "fawxzzy.hosted-replay-harness.result.v1",
+    "fawxzzy.hosted-replay-harness.direct-port-result.v1",
+}:
+    raise SystemExit(1)
+if value == "DIRECT_DOCKER_PORT_PATH_PASS" and schema != "fawxzzy.hosted-replay-harness.direct-port-result.v1":
+    raise SystemExit(1)
+if value in {"CONTAINMENT_SMOKE_PASS", "FIREWALL_PUBLICATION_REHEARSAL_PASS"} and schema != "fawxzzy.hosted-replay-harness.result.v1":
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+result_receipt_failure_code() {
+  python3 -B - "$RESULT_FILE" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+except (AttributeError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+failure = result.get("failure")
+code = failure.get("code") if isinstance(failure, dict) else None
+if result.get("status") != "BLOCKED" or not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]+", code):
+    raise SystemExit(1)
+print(code)
+PY
+}
+
+publish_result_receipt() {
+  local expected_status="$1" operation="$2"
+  local -a writer_args=(
+    --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_STAGE_FILE"
+  )
+  rm -f -- "$RESULT_STAGE_FILE" || return 1
+  case "$operation" in
+    replace) ;;
+    merge)
+      validate_result_receipt "$RESULT_FILE" "$(result_receipt_status)" || return 1
+      cp -- "$RESULT_FILE" "$RESULT_STAGE_FILE" || return 1
+      writer_args+=(--merge-existing)
+      ;;
+    *) return 1 ;;
+  esac
+  if ! python3 "$ROOT/scripts/write_result.py" "${writer_args[@]}" \
+    >"$RAW/result-writer.log" 2>&1; then
+    rm -f -- "$RESULT_STAGE_FILE"
+    return 1
+  fi
+  validate_result_receipt "$RESULT_STAGE_FILE" "$expected_status" || {
+    rm -f -- "$RESULT_STAGE_FILE"
+    return 1
+  }
+  mv -f -- "$RESULT_STAGE_FILE" "$RESULT_FILE" || {
+    rm -f -- "$RESULT_STAGE_FILE"
+    return 1
+  }
+  validate_result_receipt "$RESULT_FILE" "$expected_status" || {
+    rm -f -- "$RESULT_FILE"
+    return 1
+  }
 }
 
 block() {
@@ -863,8 +1104,54 @@ stop_host_test_listener() {
   rm -f -- "$HOST_TEST_READY"
 }
 
+cleanup_firewall_boundary() {
+  local pre_firewall_container_count="$1" cleanup_mode_rc="$2" firewall_code
+  record cleanup.containers_before_firewall_remove int "$pre_firewall_container_count"
+  if [[ "$pre_firewall_container_count" != "0" ]]; then
+    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE
+    return 1
+  fi
+  if [[ "$cleanup_mode_rc" != "0" ]]; then
+    record cleanup.firewall.failure_code str CLEANUP_MODE_CONTRACT_INVALID
+    return 1
+  fi
+  if [[ "$CLEANUP_FIREWALL_REQUIRED" == "true" ]]; then
+    record cleanup.firewall.required bool true
+    if python3 -B "$ROOT/scripts/firewall_boundary.py" remove --ledger "$FIREWALL_LEDGER" \
+      >"$FIREWALL_STATE_FILE" 2>"$RAW/firewall-rollback.log"; then
+      sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE"
+      if [[ "$MODE" != "cleanup-only" ]]; then
+        sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >"$FIREWALL_ROLLBACK_RECEIPT"
+        chmod 0600 "$FIREWALL_ROLLBACK_RECEIPT"
+      elif [[ -f "$FIREWALL_ROLLBACK_RECEIPT" ]]; then
+        cat "$FIREWALL_ROLLBACK_RECEIPT" >>"$STATE_FILE"
+      fi
+      return 0
+    fi
+    sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE" 2>/dev/null || true
+    firewall_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$FIREWALL_STATE_FILE" 2>/dev/null || true)"
+    [[ "$firewall_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || firewall_code=FIREWALL_ROLLBACK_FAILED
+    record cleanup.firewall.failure_code str "$firewall_code"
+    return 1
+  fi
+  record cleanup.firewall.required bool false
+  if [[ -e "$FIREWALL_LEDGER" || -L "$FIREWALL_LEDGER" \
+    || -e "$FIREWALL_COMPLETION" || -L "$FIREWALL_COMPLETION" \
+    || -e "$FIREWALL_COMPLETION_STAGE" || -L "$FIREWALL_COMPLETION_STAGE" \
+    || -e "$FIREWALL_ROLLBACK_RECEIPT" || -L "$FIREWALL_ROLLBACK_RECEIPT" ]]; then
+    record cleanup.firewall.failure_code str CLEANUP_MODE_FIREWALL_STATE_MISMATCH
+    return 1
+  fi
+  record cleanup.firewall.skipped_mode str "$CLEANUP_ORIGINAL_MODE"
+}
+
 cleanup_exact() {
-  local id label project_label count listener_count container_count volume_count pre_firewall_container_count firewall_rc=0 firewall_code
+  local id label project_label count listener_count container_count volume_count pre_firewall_container_count
+  local cleanup_mode_rc=0 firewall_rc=0 firewall_code
+  if ! resolve_cleanup_mode_contract "$MODE"; then
+    cleanup_mode_rc=1
+    record cleanup.mode.failure_code str CLEANUP_MODE_CONTRACT_INVALID || true
+  fi
   stop_docker_api_observer || true
   stop_watcher
 
@@ -904,26 +1191,7 @@ cleanup_exact() {
 
   stop_host_test_listener
   pre_firewall_container_count="$({ docker ps -aq --filter "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${DIRECT_PACKET}" 2>/dev/null; docker ps -aq --filter "label=io.fawxzzy.packet=${FIREWALL_PACKET}" 2>/dev/null; docker ps -aq --filter "label=com.supabase.cli.project=${PROJECT}" 2>/dev/null; } | awk 'NF' | sort -u | wc -l)"
-  record cleanup.containers_before_firewall_remove int "$pre_firewall_container_count"
-  if [[ "$pre_firewall_container_count" != "0" ]]; then
-    firewall_rc=1
-    record cleanup.firewall.failure_code str FIREWALL_REMOVE_BLOCKED_BY_CONTAINER_RESIDUE
-  elif python3 -B "$ROOT/scripts/firewall_boundary.py" remove --ledger "$FIREWALL_LEDGER" \
-    >"$FIREWALL_STATE_FILE" 2>"$RAW/firewall-rollback.log"; then
-    sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE"
-    if [[ "$MODE" != "cleanup-only" ]]; then
-      sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >"$FIREWALL_ROLLBACK_RECEIPT"
-      chmod 0600 "$FIREWALL_ROLLBACK_RECEIPT"
-    elif [[ -f "$FIREWALL_ROLLBACK_RECEIPT" ]]; then
-      cat "$FIREWALL_ROLLBACK_RECEIPT" >>"$STATE_FILE"
-    fi
-  else
-    firewall_rc=1
-    sed 's/^firewall\./cleanup.firewall./' "$FIREWALL_STATE_FILE" >>"$STATE_FILE" 2>/dev/null || true
-    firewall_code="$(awk -F '\t' '$1=="firewall.failure_code"{print $3; exit}' "$FIREWALL_STATE_FILE" 2>/dev/null || true)"
-    [[ "$firewall_code" =~ ^FIREWALL_[A-Z0-9_]+$ ]] || firewall_code=FIREWALL_ROLLBACK_FAILED
-    record cleanup.firewall.failure_code str "$firewall_code"
-  fi
+  cleanup_firewall_boundary "$pre_firewall_container_count" "$cleanup_mode_rc" || firewall_rc=1
 
   mapfile -t network_ids < <(
     {
@@ -962,6 +1230,7 @@ cleanup_exact() {
   [[ "$container_count" == "0" ]] || return 1
   [[ "$volume_count" == "0" ]] || return 1
   [[ "$count" == "0" ]] || return 1
+  [[ "$cleanup_mode_rc" == "0" ]] || return 1
   [[ "$firewall_rc" == "0" && ! -e "$FIREWALL_LEDGER" ]] || return 1
   [[ "$listener_count" == "0" ]] || return 1
   timeout 2 bash -c "</dev/tcp/127.0.0.1/${DB_PORT}" >/dev/null 2>&1 && return 1
@@ -970,7 +1239,8 @@ cleanup_exact() {
 }
 
 finalize() {
-  local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1 primary_failure listener_phase
+  local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1
+  local primary_failure listener_phase receipt_failure=0
   [[ "$FINALIZING" == "0" ]] || return
   FINALIZING=1
   set +e
@@ -1032,18 +1302,30 @@ finalize() {
     fi
   fi
 
-  python3 "$ROOT/scripts/write_result.py" \
-    --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_FILE" \
-    >"$RAW/result-writer.log" 2>&1
-
-  if [[ "$final_status" == "BLOCKED" ]]; then
+  if ! publish_result_receipt "$final_status" replace; then
+    receipt_failure=1
+    primary_failure="$(current_failure_code)"
+    record receipt.authoritative bool false || true
+    record receipt.publication_failure_code str RESULT_RECEIPT_PUBLICATION_FAILED || true
+    if [[ "$final_status" != "BLOCKED" ]]; then
+      record status str BLOCKED || true
+      record failure.code str RESULT_RECEIPT_PUBLICATION_FAILED || true
+      record failure.detail str authoritative-result-publication-failed || true
+    else
+      record receipt.original_failure_code str "${primary_failure:-UNKNOWN}" || true
+    fi
+    rm -f -- "$RESULT_FILE" "$RESULT_STAGE_FILE"
+    final_status=BLOCKED
+    final_rc=1
+    printf 'BLOCKED: RESULT_RECEIPT_PUBLICATION_FAILED\n'
+  elif [[ "$final_status" == "BLOCKED" ]]; then
     failure_code="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("failure") or {}).get("code","UNKNOWN"))' "$RESULT_FILE" 2>/dev/null || printf UNKNOWN)"
     printf 'BLOCKED: %s\n' "$failure_code"
   else
     printf '%s\n' "$final_status"
   fi
 
-  rm -f -- "$STATE_FILE"
+  [[ "$receipt_failure" != "0" ]] || rm -f -- "$STATE_FILE"
   case "$RUNTIME" in
     "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
   esac
@@ -1052,32 +1334,116 @@ finalize() {
 }
 
 cleanup_only() {
-  local cleanup_rc=0
+  local cleanup_rc=0 recovery_state=0 expected_status=BLOCKED publish_operation=merge
+  local primary_failure existing_status="" existing_failure=""
   mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
-  STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
-  : >"$STATE_FILE"
+  if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
+    [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || {
+      printf 'BLOCKED: RESULT_RECEIPT_RECOVERY_STATE_INVALID\n'
+      exit 1
+    }
+    recovery_state=1
+    publish_operation=replace
+  elif [[ -e "$CLEANUP_STATE_FILE" || -L "$CLEANUP_STATE_FILE" ]]; then
+    [[ -f "$CLEANUP_STATE_FILE" && ! -L "$CLEANUP_STATE_FILE" ]] || {
+      printf 'BLOCKED: RESULT_RECEIPT_RECOVERY_STATE_INVALID\n'
+      exit 1
+    }
+    STATE_FILE="$CLEANUP_STATE_FILE"
+    recovery_state=1
+    publish_operation=replace
+  else
+    STATE_FILE="$CLEANUP_STATE_FILE"
+    : >"$STATE_FILE"
+  fi
+  if [[ "$recovery_state" == "1" ]]; then
+    record receipt.recovery_attempted bool true || cleanup_rc=1
+    record receipt.authoritative bool true || cleanup_rc=1
+  fi
   [[ -e "$AUDIT_FILE" ]] || : >"$AUDIT_FILE"
 
-  if ! cleanup_exact; then
-    record status str BLOCKED
-    record failure.code str CLEANUP_RESIDUE
-    record failure.detail str exact-packet-resource-remains
-    cleanup_rc=1
-  elif [[ ! -f "$RESULT_FILE" ]]; then
-    if [[ "$RESULT_PROFILE" == "direct-docker-port-v1" ]]; then
-      record result.profile str direct-docker-port-v1
+  if [[ -f "$RESULT_FILE" && ! -L "$RESULT_FILE" ]]; then
+    if ! existing_status="$(result_receipt_status)"; then
+      cleanup_rc=1
+      publish_operation=replace
+      record status str BLOCKED || true
+      record failure.code str RESULT_RECEIPT_VALIDATION_FAILED || true
+      record failure.detail str authoritative-result-invalid || true
+    elif [[ "$existing_status" == "BLOCKED" ]]; then
+      if ! existing_failure="$(result_receipt_failure_code)"; then
+        cleanup_rc=1
+        publish_operation=replace
+        record status str BLOCKED || true
+        record failure.code str RESULT_RECEIPT_VALIDATION_FAILED || true
+        record failure.detail str authoritative-result-invalid || true
+      else
+        record status str BLOCKED || cleanup_rc=1
+        record failure.code str "$existing_failure" || cleanup_rc=1
+        record failure.detail str prior-run-failure-preserved || cleanup_rc=1
+      fi
     fi
-    record status str BLOCKED
-    record failure.code str HARNESS_INTERRUPTED
-    record failure.detail str cleanup-step-recovered-interrupted-run
+  elif [[ -e "$RESULT_FILE" || -L "$RESULT_FILE" ]]; then
+    cleanup_rc=1
+    publish_operation=replace
+    record status str BLOCKED || true
+    record failure.code str RESULT_RECEIPT_VALIDATION_FAILED || true
+    record failure.detail str authoritative-result-invalid || true
   fi
 
-  python3 "$ROOT/scripts/write_result.py" \
-    --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_FILE" \
-    --merge-existing >"$RAW/cleanup-result-writer.log" 2>&1 || cleanup_rc=1
+  if ! cleanup_exact; then
+    record cleanup.failure_code str CLEANUP_RESIDUE
+    primary_failure="$(current_failure_code)"
+    record status str BLOCKED
+    if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+      record failure.code str CLEANUP_RESIDUE
+      record failure.detail str exact-packet-resource-remains
+    fi
+    cleanup_rc=1
+  fi
+  if [[ ! -f "$RESULT_FILE" ]]; then
+    publish_operation=replace
+    if [[ "$recovery_state" == "1" && "$cleanup_rc" == "0" ]]; then
+      record status str BLOCKED
+      record receipt.recovered_by_cleanup bool true
+    elif [[ "$recovery_state" == "0" && "$cleanup_rc" == "0" && "$RESULT_PROFILE" == "direct-docker-port-v1" ]]; then
+      record result.profile str direct-docker-port-v1
+      record status str BLOCKED
+      record failure.code str HARNESS_INTERRUPTED
+      record failure.detail str cleanup-step-recovered-interrupted-run
+    elif [[ "$recovery_state" == "0" && "$cleanup_rc" == "0" ]]; then
+      record status str BLOCKED
+      record failure.code str HARNESS_INTERRUPTED
+      record failure.detail str cleanup-step-recovered-interrupted-run
+    fi
+  fi
 
-  rm -f -- "$STATE_FILE"
-  rm -f -- "$FIREWALL_ROLLBACK_RECEIPT"
+  if [[ "$cleanup_rc" == "0" && -n "$existing_status" ]]; then
+    expected_status="$existing_status"
+  fi
+  [[ "$cleanup_rc" == "0" ]] || expected_status=BLOCKED
+  if ! publish_result_receipt "$expected_status" "$publish_operation"; then
+    cleanup_rc=1
+    primary_failure="$(current_failure_code)"
+    record receipt.authoritative bool false || true
+    record receipt.publication_failure_code str RESULT_RECEIPT_PUBLICATION_FAILED || true
+    if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+      record status str BLOCKED || true
+      record failure.code str RESULT_RECEIPT_PUBLICATION_FAILED || true
+      record failure.detail str cleanup-result-publication-failed || true
+    else
+      record receipt.original_failure_code str "$primary_failure" || true
+    fi
+    [[ "$existing_status" == "BLOCKED" ]] || rm -f -- "$RESULT_FILE"
+    rm -f -- "$RESULT_STAGE_FILE"
+  fi
+  if [[ "$cleanup_rc" == "0" ]]; then
+    retire_cleanup_mode_contract || cleanup_rc=1
+  fi
+
+  if [[ "$cleanup_rc" == "0" ]]; then
+    rm -f -- "$STATE_FILE" "$CLEANUP_STATE_FILE"
+    rm -f -- "$FIREWALL_ROLLBACK_RECEIPT"
+  fi
   case "$RUNTIME" in
     "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
   esac
@@ -2171,6 +2537,7 @@ mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
 : >"$AUDIT_FILE"
 : >"$VIOLATION_FILE"
 trap finalize EXIT
+write_cleanup_mode_contract "$MODE" || block CLEANUP_MODE_CONTRACT_PUBLICATION_FAILED
 
 record started_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 record status str BLOCKED
