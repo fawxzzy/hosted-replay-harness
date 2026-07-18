@@ -886,6 +886,7 @@ record docker_event_history.boundary_frozen bool true
 
 set +e
 timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
+  --debug \
   --workdir "$PROJECT_DIR" \
   --network-id "$NETWORK_NAME" \
   --yes \
@@ -898,11 +899,18 @@ kill -0 "$WATCH_PID" 2>/dev/null && watcher_alive=1
 stop_watcher
 if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
   --input "$RAW/supabase-db-start.log" \
-  --exit-code "$cli_rc" >"$DB_START_DIAGNOSTIC_FILE"; then
+  --exit-code "$cli_rc" \
+  --debug-enabled >"$DB_START_DIAGNOSTIC_FILE" 2>"$RAW/db-start-sanitizer.log"; then
+  rm -f -- "$RAW/supabase-db-start.log"
   block DB_START_LOG_SANITIZER_FAILED
 fi
 cat "$DB_START_DIAGNOSTIC_FILE" >>"$STATE_FILE"
 db_start_category="$(awk -F '\t' '$1=="supabase_cli.db_start_diagnostic.category"{print $3; exit}' "$DB_START_DIAGNOSTIC_FILE")"
+if ! rm -f -- "$RAW/supabase-db-start.log"; then
+  block DB_START_RAW_LOG_DELETE_FAILED
+fi
+[[ ! -e "$RAW/supabase-db-start.log" ]] || block DB_START_RAW_LOG_DELETE_FAILED
+record supabase_cli.db_start_diagnostic.raw_deleted bool true
 [[ "$db_start_category" =~ ^[A-Z0-9_]+$ ]] || block DB_START_LOG_SANITIZER_FAILED
 [[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
 if [[ "$watcher_alive" != "1" ]]; then
@@ -994,6 +1002,9 @@ esac
 if [[ "$cli_rc" != "0" ]]; then
   if [[ "$db_start_category" != "UNKNOWN_SANITIZED" ]]; then
     block "$db_start_category" "cli-exit-${cli_rc}"
+  fi
+  if [[ "$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" ]]; then
+    block OTHER_PRECONTAINER_FAILURE "cli-exit-${cli_rc}"
   fi
   block SUPABASE_DB_START_FAILED "cli-exit-${cli_rc}"
 fi

@@ -104,6 +104,11 @@ class WorkflowContractTests(unittest.TestCase):
             r"run-containment-smoke\.sh cleanup-only\s+- name: Upload sanitized receipt",
         )
 
+    def test_only_sanitized_result_is_uploaded(self) -> None:
+        upload_paths = re.findall(r"(?m)^\s+path:\s*(\S+)$", self.workflow)
+        self.assertEqual(upload_paths, ["artifacts/containment-smoke.json"])
+        self.assertNotIn("supabase-db-start.log", self.workflow)
+
     def test_manual_workflow_selects_only_fixed_cli_containment_mode(self) -> None:
         self.assertIn("Hosted replay containment smoke", self.workflow)
         self.assertEqual(self.workflow.count("./scripts/run-containment-smoke.sh\n"), 1)
@@ -244,7 +249,9 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_db_start_log_is_sanitized_before_failure_mapping(self) -> None:
         classifier = 'python3 -B "$ROOT/scripts/classify_db_start_log.py"'
         self.assertIn(classifier, self.runner)
-        self.assertNotIn("--debug", self.runner)
+        self.assertEqual(self.runner.count("  --debug \\"), 1)
+        self.assertEqual(self.runner.count("  --debug-enabled"), 1)
+        self.assertIn("umask 077", self.runner)
         self.assertLess(
             self.runner.index(classifier),
             self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
@@ -252,6 +259,19 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertLess(
             self.runner.index(classifier),
             self.runner.index('block SUPABASE_DB_START_FAILED'),
+        )
+        raw_delete = 'rm -f -- "$RAW/supabase-db-start.log"'
+        self.assertIn(raw_delete, self.runner)
+        self.assertIn("DB_START_RAW_LOG_DELETE_FAILED", self.runner)
+        self.assertIn("supabase_cli.db_start_diagnostic.raw_deleted", self.runner)
+        self.assertLess(self.runner.index(classifier), self.runner.index(raw_delete))
+        self.assertLess(
+            self.runner.index(raw_delete), self.runner.index('EVENT_UNTIL="$((')
+        )
+        self.assertNotIn('cat "$RAW/supabase-db-start.log"', self.runner)
+        self.assertRegex(
+            self.runner,
+            r'(?s)if \[\[ "\$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" \]\]; then\s+block OTHER_PRECONTAINER_FAILURE',
         )
 
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
@@ -733,10 +753,14 @@ class DbStartLogClassifierTests(unittest.TestCase):
         fixtures = {
             "CONFIG_VALIDATION_FAILED": b"failed to validate config\n",
             "CLI_USAGE_ERROR": b"unknown flag: --not-real\n",
+            "DOCKER_CLIENT_API_NEGOTIATION_FAILED": b"failed to initialize Docker client\n",
             "IMAGE_RESOLUTION_FAILED": b"manifest unknown\n",
-            "NETWORK_CONFIGURATION_REJECTED": b"failed to create docker network\n",
-            "VOLUME_PREPARATION_FAILED": b"failed to create volume\n",
-            "CONTAINER_CREATE_FAILED": b"failed to create docker container\n",
+            "NETWORK_REUSE_ATTACHMENT_REJECTED": b"failed to create docker network\n",
+            "NETWORK_CONFIGURATION_REJECTED": b"network pool is invalid\n",
+            "VOLUME_CREATE_REJECTED": b"failed to create volume\n",
+            "VOLUME_PREPARATION_FAILED": b"failed to parse docker volume\n",
+            "CONTAINER_CREATE_REJECTED": b"failed to create docker container\n",
+            "CONTAINER_CREATE_FAILED": b"failed to create the container\n",
             "CONTAINER_START_FAILED": b"failed to start docker container\n",
             "PORT_BIND_FAILED": b"port is already allocated\n",
             "DATABASE_HEALTH_FAILED": b"database is not healthy\n",
@@ -760,6 +784,9 @@ class DbStartLogClassifierTests(unittest.TestCase):
                     "raw_byte_count",
                     "raw_line_count",
                     "raw_sha256",
+                    "debug_enabled",
+                    "sensitive_shape_detected",
+                    "sensitive_shape_count",
                 }
                 if expected != "UNKNOWN_SANITIZED":
                     expected_keys.add("first_match_line")
@@ -767,13 +794,16 @@ class DbStartLogClassifierTests(unittest.TestCase):
                     self.assertEqual(result["match_count"], 1)
                 else:
                     self.assertEqual(result["match_count"], 0)
+                self.assertFalse(result["debug_enabled"])
+                self.assertFalse(result["sensitive_shape_detected"])
+                self.assertEqual(result["sensitive_shape_count"], 0)
                 self.assertEqual(set(result), expected_keys)
 
     def test_specific_network_rule_precedes_generic_daemon_rule(self) -> None:
         raw = b"Error response from daemon: failed to create docker network\n"
         self.assertEqual(
             db_start_log.classify(raw, 1)["category"],
-            "NETWORK_CONFIGURATION_REJECTED",
+            "NETWORK_REUSE_ATTACHMENT_REJECTED",
         )
 
     def test_empty_log_defaults_without_leaking_input(self) -> None:
@@ -783,13 +813,18 @@ class DbStartLogClassifierTests(unittest.TestCase):
         self.assertEqual(result["raw_byte_count"], 0)
         self.assertEqual(result["raw_line_count"], 0)
         rendered = db_start_log.format_state_lines(result)
-        self.assertEqual(len(rendered.splitlines()), 6)
+        self.assertEqual(len(rendered.splitlines()), 9)
 
     def test_exact_cli_source_wrappers_and_match_location(self) -> None:
         fixtures = {
+            b"failed to create Docker CLI: fixture\n": "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
+            b"failed to initialize Docker CLI: fixture\n": "DOCKER_CLIENT_API_NEGOTIATION_FAILED",
+            b"failed to inspect docker image: fixture\n": "IMAGE_RESOLUTION_FAILED",
+            b"failed to pull docker image from all registries: fixture\n": "IMAGE_RESOLUTION_FAILED",
+            b"failed to create docker network: fixture\n": "NETWORK_REUSE_ATTACHMENT_REJECTED",
             b"failed to parse docker volume: fixture\n": "VOLUME_PREPARATION_FAILED",
-            b"failed to create volume: fixture\n": "VOLUME_PREPARATION_FAILED",
-            b"failed to create docker container: fixture\n": "CONTAINER_CREATE_FAILED",
+            b"failed to create volume: fixture\n": "VOLUME_CREATE_REJECTED",
+            b"failed to create docker container: fixture\n": "CONTAINER_CREATE_REJECTED",
             b"failed to start docker container fixture: fixture\n": "CONTAINER_START_FAILED",
         }
         for raw, expected in fixtures.items():
@@ -798,6 +833,60 @@ class DbStartLogClassifierTests(unittest.TestCase):
                 self.assertEqual(result["category"], expected)
                 self.assertEqual(result["match_count"], 2)
                 self.assertEqual(result["first_match_line"], 2)
+
+    def test_mixed_input_uses_narrow_deterministic_priority(self) -> None:
+        raw = (
+            b"failed to create docker container: lower-priority\n"
+            b"failed to create volume: higher-priority\n"
+            b"failed to inspect docker image: highest-priority\n"
+        )
+        result = db_start_log.classify(raw, 1, debug_enabled=True)
+        self.assertEqual(result["category"], "IMAGE_RESOLUTION_FAILED")
+        self.assertEqual(result["match_count"], 1)
+        self.assertEqual(result["first_match_line"], 3)
+        self.assertTrue(result["debug_enabled"])
+
+    def test_secret_shaped_input_is_counted_but_never_emitted(self) -> None:
+        secrets = (
+            "postgresql://worker:opaque-password@database.invalid/postgres\n"
+            "Authorization: Bearer opaque-token-value\n"
+            "JWT_SECRET=opaque-secret-value\n"
+            "-----BEGIN PRIVATE KEY-----\n"
+        ).encode()
+        result = db_start_log.classify(secrets, 1, debug_enabled=True)
+        rendered = db_start_log.format_state_lines(result)
+        self.assertTrue(result["sensitive_shape_detected"])
+        self.assertEqual(result["sensitive_shape_count"], 4)
+        for forbidden in (
+            "opaque-password",
+            "opaque-token-value",
+            "opaque-secret-value",
+            "database.invalid",
+            "PRIVATE KEY",
+        ):
+            self.assertNotIn(forbidden, rendered)
+        with self.assertRaises(ValueError):
+            db_start_log.validate_state_lines(
+                rendered + "unclassified.raw\tstr\topaque\n",
+                has_first_match=False,
+            )
+
+    def test_prior_unknown_fingerprint_schema_remains_compatible(self) -> None:
+        prior = {
+            "category": "UNKNOWN_SANITIZED",
+            "exit_code": 1,
+            "match_count": 0,
+            "raw_byte_count": 1078,
+            "raw_line_count": 23,
+            "raw_sha256": "d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31",
+            "debug_enabled": False,
+            "sensitive_shape_detected": False,
+            "sensitive_shape_count": 0,
+        }
+        rendered = db_start_log.format_state_lines(prior)
+        self.assertIn(prior["raw_sha256"], rendered)
+        self.assertIn("UNKNOWN_SANITIZED", rendered)
+        self.assertNotIn("OTHER_PRECONTAINER_FAILURE", rendered)
 
     def test_executable_path_emits_only_sanitized_state(self) -> None:
         raw = b"failed to create docker network opaque-fixture-text\n"
@@ -813,13 +902,15 @@ class DbStartLogClassifierTests(unittest.TestCase):
                     str(path),
                     "--exit-code",
                     "1",
+                    "--debug-enabled",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-        self.assertEqual(len(completed.stdout.splitlines()), 7)
-        self.assertIn("NETWORK_CONFIGURATION_REJECTED", completed.stdout)
+        self.assertEqual(len(completed.stdout.splitlines()), 10)
+        self.assertIn("NETWORK_REUSE_ATTACHMENT_REJECTED", completed.stdout)
+        self.assertIn("debug_enabled\tbool\ttrue", completed.stdout)
         self.assertNotIn("opaque-fixture-text", completed.stdout)
         self.assertEqual(completed.stderr, "")
 
