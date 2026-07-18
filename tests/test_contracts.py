@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -9,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -63,6 +65,34 @@ class PinContractTests(unittest.TestCase):
         self.assertEqual(cli["version"], "2.109.1")
         self.assertEqual(cli["source_commit"], "6d4c19870ed213ba7f682f117d0345c8a40bfa94")
         self.assertEqual(cli["sha256"], "36d87b7fe6b4bcfe89ac47a4354e526cff22480224de426d7b370f6934556976")
+        self.assertEqual(
+            cli["member_manifest_sha256"],
+            "290ab75309cc2cd39140125f6f408ca2ef06c26ffc9b057aa87299a02041f140",
+        )
+        self.assertEqual(
+            cli["adjacency_sha256"],
+            "889c5d358daebdfd07db6d21bba8460ce002137f1f85b4280d472ead3f290f7d",
+        )
+        self.assertEqual(
+            [(member["name"], member["size"], member["sha256"]) for member in cli["members"]],
+            [
+                (
+                    "supabase",
+                    109918528,
+                    "e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20",
+                ),
+                (
+                    "supabase-go",
+                    100909240,
+                    "d10d8059b90d9fd68a69cb808b88dd3fe9f57ec458ffefc79a83083b3e810616",
+                ),
+            ],
+        )
+        for member in cli["members"]:
+            self.assertEqual(member["archive_mode"], "0755")
+            self.assertEqual(member["runtime_mode"], "0555")
+            self.assertEqual(member["platform"], "linux/amd64")
+            self.assertEqual(member["format"], "ELF64-little-x86-64")
 
     def test_exact_image_pins(self) -> None:
         images = self.pins["images"]
@@ -413,7 +443,27 @@ class RunnerStaticContractTests(unittest.TestCase):
             'CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"',
             self.runner,
         )
-        self.assertIn('[[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]]', self.runner)
+        self.assertIn('"$actual_cli_binary_sha" == "$CLI_BINARY_SHA"', self.runner)
+        self.assertIn(
+            'CLI_SIDECAR_SHA="d10d8059b90d9fd68a69cb808b88dd3fe9f57ec458ffefc79a83083b3e810616"',
+            self.runner,
+        )
+        self.assertIn('CLI_BINARY_SIZE="109918528"', self.runner)
+        self.assertIn('CLI_SIDECAR_SIZE="100909240"', self.runner)
+        self.assertIn('[[ ! -v SUPABASE_GO_BINARY ]]', self.runner)
+        self.assertNotRegex(self.runner, r"(?m)^\s*SUPABASE_GO_BINARY=")
+        self.assertIn("validate_extract_cli_archive", self.runner)
+        self.assertNotIn('tar -xzf "$RUNTIME/$CLI_ASSET"', self.runner)
+        self.assertIn("record supabase_cli.sidecar_sha256", self.runner)
+        self.assertIn("record supabase_cli.sidecar_size", self.runner)
+        self.assertIn("record supabase_cli.sidecar_adjacent bool true", self.runner)
+        validator_at = self.runner.index(
+            'validate_extract_cli_archive "$RUNTIME/$CLI_ASSET" "$RUNTIME/bin"'
+        )
+        first_docker_pull = self.runner.index("docker pull --platform linux/amd64")
+        first_prestart = self.runner.index("assert_frozen_network pre_cli_start")
+        self.assertLess(validator_at, first_docker_pull)
+        self.assertLess(validator_at, first_prestart)
         self.assertIn("record source_contract.command str supabase-db-start", self.runner)
         self.assertIn("record source_contract.root_persistent_prerun bool true", self.runner)
         self.assertIn("record source_contract.load_config bool true", self.runner)
@@ -490,6 +540,246 @@ class RunnerStaticContractTests(unittest.TestCase):
             self.runner,
             r'(?s)elif \[\[ ! -f "\$RESULT_FILE" \]\]; then\s+if \[\[ "\$RESULT_PROFILE" == "direct-docker-port-v1" \]\]; then\s+record result.profile str direct-docker-port-v1',
         )
+
+
+class CliArchiveValidatorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        match = re.search(
+            r"# BEGIN CLI_ARCHIVE_VALIDATOR_PYTHON\n(.*?)\n# END CLI_ARCHIVE_VALIDATOR_PYTHON",
+            runner,
+            re.DOTALL,
+        )
+        assert match
+        namespace = {"__name__": "cli_archive_validator_tests"}
+        exec(compile(match.group(1), "<cli-archive-validator>", "exec"), namespace)
+        cls.validate_archive = staticmethod(namespace["validate_archive"])
+        cls.contract_error = namespace["ArchiveContractError"]
+
+    @staticmethod
+    def elf_payload(marker: int) -> bytes:
+        payload = bytearray(96)
+        payload[:7] = b"\x7fELF\x02\x01\x01"
+        payload[7] = 0
+        struct.pack_into("<HHI", payload, 16, 2, 62, 1)
+        struct.pack_into("<H", payload, 52, 64)
+        payload[64:] = bytes((marker,)) * 32
+        return bytes(payload)
+
+    def expected(self) -> tuple[dict[str, object], ...]:
+        members = []
+        for index, (name, marker) in enumerate((("supabase", 65), ("supabase-go", 66)), start=1):
+            payload = self.elf_payload(marker)
+            members.append(
+                {
+                    "name": name,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "mode": 0o755,
+                    "uid": 1001,
+                    "gid": 1001,
+                    "uname": "runner",
+                    "gname": "runner",
+                    "mtime": index,
+                    "payload": payload,
+                }
+            )
+        return tuple(members)
+
+    @staticmethod
+    def octal(value: int, width: int) -> bytes:
+        return f"{value:0{width - 1}o}".encode("ascii") + b"\0"
+
+    def tar_header(
+        self,
+        member: dict[str, object],
+        *,
+        name: str | None = None,
+        typeflag: bytes = b"0",
+        mode: int | None = None,
+        payload: bytes | None = None,
+    ) -> tuple[bytes, bytes]:
+        body = member["payload"] if payload is None else payload
+        assert isinstance(body, bytes)
+        header = bytearray(512)
+        encoded_name = (name or str(member["name"])).encode("ascii")
+        header[: len(encoded_name)] = encoded_name
+        header[100:108] = self.octal(int(member["mode"] if mode is None else mode), 8)
+        header[108:116] = self.octal(int(member["uid"]), 8)
+        header[116:124] = self.octal(int(member["gid"]), 8)
+        header[124:136] = self.octal(len(body), 12)
+        header[136:148] = self.octal(int(member["mtime"]), 12)
+        header[148:156] = b" " * 8
+        header[156:157] = typeflag
+        header[257:263] = b"ustar "
+        header[263:265] = b" \0"
+        header[265:271] = b"runner"
+        header[297:303] = b"runner"
+        header[329:337] = self.octal(0, 8)
+        header[337:345] = self.octal(0, 8)
+        header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+        return bytes(header), body
+
+    def write_archive(
+        self,
+        directory: Path,
+        members: list[tuple[dict[str, object], dict[str, object]]],
+    ) -> Path:
+        tar_bytes = bytearray()
+        for member, overrides in members:
+            header, payload = self.tar_header(member, **overrides)
+            tar_bytes.extend(header)
+            tar_bytes.extend(payload)
+            tar_bytes.extend(b"\0" * ((-len(payload)) % 512))
+        tar_bytes.extend(b"\0" * 1024)
+        archive = directory / "cli.tar.gz"
+        archive.write_bytes(gzip.compress(bytes(tar_bytes), mtime=0))
+        return archive
+
+    def run_validator(
+        self,
+        directory: Path,
+        archive: Path,
+        expected: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], Path]:
+        destination = directory / "bin"
+        destination.mkdir()
+        result = self.validate_archive(
+            archive,
+            destination,
+            expected=expected,
+            expected_member_manifest_sha256=None,
+            expected_adjacency_sha256=None,
+        )
+        return result, destination
+
+    def test_exact_two_member_closure_extracts_adjacent_read_only_elf_files(self) -> None:
+        expected = self.expected()
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            archive = self.write_archive(directory, [(member, {}) for member in expected])
+            result, destination = self.run_validator(directory, archive, expected)
+            self.assertEqual(result["member_count"], 2)
+            extracted = sorted(destination.iterdir())
+            self.assertEqual([path.name for path in extracted], ["supabase", "supabase-go"])
+            self.assertEqual({path.parent for path in extracted}, {destination})
+            self.assertTrue(all(path.is_file() and not path.is_symlink() for path in extracted))
+
+    def test_rejects_missing_sidecar_and_removes_partial_extraction(self) -> None:
+        expected = self.expected()
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            archive = self.write_archive(directory, [(expected[0], {})])
+            destination = directory / "bin"
+            destination.mkdir()
+            with self.assertRaises(self.contract_error):
+                self.validate_archive(
+                    archive,
+                    destination,
+                    expected=expected,
+                    expected_member_manifest_sha256=None,
+                    expected_adjacency_sha256=None,
+                )
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_rejects_wrong_sidecar_hash_and_size(self) -> None:
+        expected = self.expected()
+        for label, payload in (
+            ("hash", self.elf_payload(67)),
+            ("size", self.elf_payload(66) + b"x"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                archive = self.write_archive(
+                    directory,
+                    [(expected[0], {}), (expected[1], {"payload": payload})],
+                )
+                destination = directory / "bin"
+                destination.mkdir()
+                with self.assertRaises(self.contract_error):
+                    self.validate_archive(
+                        archive,
+                        destination,
+                        expected=expected,
+                        expected_member_manifest_sha256=None,
+                        expected_adjacency_sha256=None,
+                    )
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_rejects_extra_nested_duplicate_and_non_adjacent_members(self) -> None:
+        expected = self.expected()
+        extra = dict(expected[1])
+        extra["name"] = "extra"
+        cases = {
+            "extra": [(expected[0], {}), (expected[1], {}), (extra, {})],
+            "nested": [(expected[0], {"name": "nested/supabase"}), (expected[1], {})],
+            "duplicate": [(expected[0], {}), (expected[1], {"name": "supabase"})],
+        }
+        for label, members in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                archive = self.write_archive(directory, members)
+                destination = directory / "bin"
+                destination.mkdir()
+                with self.assertRaises(self.contract_error):
+                    self.validate_archive(
+                        archive,
+                        destination,
+                        expected=expected,
+                        expected_member_manifest_sha256=None,
+                        expected_adjacency_sha256=None,
+                    )
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            archive = self.write_archive(directory, [(member, {}) for member in expected])
+            destination = directory / "bin"
+            destination.mkdir()
+            (destination / "nested").mkdir()
+            with self.assertRaises(self.contract_error):
+                self.validate_archive(
+                    archive,
+                    destination,
+                    expected=expected,
+                    expected_member_manifest_sha256=None,
+                    expected_adjacency_sha256=None,
+                )
+
+    def test_rejects_links_devices_pax_long_names_sparse_sockets_and_special_bits(self) -> None:
+        expected = self.expected()
+        for typeflag in (b"1", b"2", b"3", b"4", b"6", b"x", b"g", b"L", b"K", b"S", b"s"):
+            with self.subTest(typeflag=typeflag), tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                archive = self.write_archive(
+                    directory,
+                    [(expected[0], {"typeflag": typeflag}), (expected[1], {})],
+                )
+                destination = directory / "bin"
+                destination.mkdir()
+                with self.assertRaises(self.contract_error):
+                    self.validate_archive(
+                        archive,
+                        destination,
+                        expected=expected,
+                        expected_member_manifest_sha256=None,
+                        expected_adjacency_sha256=None,
+                    )
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            archive = self.write_archive(
+                directory,
+                [(expected[0], {"mode": 0o4755}), (expected[1], {})],
+            )
+            destination = directory / "bin"
+            destination.mkdir()
+            with self.assertRaises(self.contract_error):
+                self.validate_archive(
+                    archive,
+                    destination,
+                    expected=expected,
+                    expected_member_manifest_sha256=None,
+                    expected_adjacency_sha256=None,
+                )
 
 
 class LoadConfigClassifierTests(unittest.TestCase):

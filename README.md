@@ -9,6 +9,7 @@ The smoke does not log in to Supabase, contact a Supabase project, use applicati
 The pinned CLI source at commit `6d4c19870ed213ba7f682f117d0345c8a40bfa94` establishes the path used here:
 
 - `supabase db start` starts only the local database lifecycle.
+- The immutable Linux asset is a two-member executable closure: the Bun entrypoint `supabase` and its adjacent Go sidecar `supabase-go`. The loader validates the complete tar header denominator, exact sizes, hashes, ELF identities, and adjacency before Docker access; no `SUPABASE_GO_BINARY` override is used.
 - For PG17, enabled Auth contributes a short-lived job whose exact command is `gotrue migrate`.
 - Realtime, Storage, API, Studio, local SMTP, Edge Runtime, Analytics, pooling, application migrations, and seed loading are disabled in the committed profile.
 - The required image defaults in that source are Postgres `17.6.1.143` and GoTrue `v2.192.0`.

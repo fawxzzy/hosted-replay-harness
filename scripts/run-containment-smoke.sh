@@ -76,6 +76,11 @@ CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
 CLI_SHA="36d87b7fe6b4bcfe89ac47a4354e526cff22480224de426d7b370f6934556976"
 CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"
+CLI_BINARY_SIZE="109918528"
+CLI_SIDECAR_SHA="d10d8059b90d9fd68a69cb808b88dd3fe9f57ec458ffefc79a83083b3e810616"
+CLI_SIDECAR_SIZE="100909240"
+CLI_MEMBER_MANIFEST_SHA="290ab75309cc2cd39140125f6f408ca2ef06c26ffc9b057aa87299a02041f140"
+CLI_ADJACENCY_SHA="889c5d358daebdfd07db6d21bba8460ce002137f1f85b4280d472ead3f290f7d"
 CLI_ASSET="supabase_2.109.1_linux_amd64.tar.gz"
 CLI_URL="https://github.com/supabase/cli/releases/download/v2.109.1/${CLI_ASSET}"
 CONFIG_SHA="1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6"
@@ -108,6 +113,278 @@ block() {
 version_at_least() {
   local actual="$1" minimum="$2"
   [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
+}
+
+validate_extract_cli_archive() {
+  local archive="$1" destination="$2"
+  python3 -B - "$archive" "$destination" <<'PY'
+# BEGIN CLI_ARCHIVE_VALIDATOR_PYTHON
+from __future__ import annotations
+
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import struct
+import sys
+
+
+EXPECTED = (
+    {
+        "name": "supabase",
+        "size": 109918528,
+        "sha256": "e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20",
+        "mode": 0o755,
+        "uid": 1001,
+        "gid": 1001,
+        "uname": "runner",
+        "gname": "runner",
+        "mtime": 1783414360,
+    },
+    {
+        "name": "supabase-go",
+        "size": 100909240,
+        "sha256": "d10d8059b90d9fd68a69cb808b88dd3fe9f57ec458ffefc79a83083b3e810616",
+        "mode": 0o755,
+        "uid": 1001,
+        "gid": 1001,
+        "uname": "runner",
+        "gname": "runner",
+        "mtime": 1783414369,
+    },
+)
+EXPECTED_MEMBER_MANIFEST_SHA256 = "290ab75309cc2cd39140125f6f408ca2ef06c26ffc9b057aa87299a02041f140"
+EXPECTED_ADJACENCY_SHA256 = "889c5d358daebdfd07db6d21bba8460ce002137f1f85b4280d472ead3f290f7d"
+
+
+class ArchiveContractError(ValueError):
+    pass
+
+
+def parse_octal(field: bytes, label: str) -> int:
+    if field and field[0] & 0x80:
+        raise ArchiveContractError(f"{label}: base-256 is not admitted")
+    value = field.rstrip(b"\0 ").lstrip(b" ")
+    if value and any(byte not in b"01234567" for byte in value):
+        raise ArchiveContractError(f"{label}: invalid octal")
+    return int(value or b"0", 8)
+
+
+def parse_text(field: bytes, label: str) -> str:
+    try:
+        return field.split(b"\0", 1)[0].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ArchiveContractError(f"{label}: non-ASCII") from error
+
+
+def validate_elf(header: bytes, name: str) -> dict[str, int | str]:
+    if len(header) < 64 or header[:4] != b"\x7fELF" or header[:2] == b"#!":
+        raise ArchiveContractError(f"{name}: ELF magic mismatch")
+    if header[4:7] != bytes((2, 1, 1)):
+        raise ArchiveContractError(f"{name}: ELF class/data/version mismatch")
+    elf_type, machine, version = struct.unpack_from("<HHI", header, 16)
+    header_size = struct.unpack_from("<H", header, 52)[0]
+    if elf_type not in (2, 3) or machine != 62 or version != 1 or header_size != 64:
+        raise ArchiveContractError(f"{name}: ELF64 x86-64 header mismatch")
+    return {
+        "class": "ELF64",
+        "endian": "little",
+        "machine": "x86-64",
+        "machine_id": machine,
+        "elf_type": elf_type,
+        "osabi": header[7],
+    }
+
+
+def validate_archive(
+    archive: Path,
+    destination: Path,
+    *,
+    expected: tuple[dict[str, object], ...] = EXPECTED,
+    expected_member_manifest_sha256: str | None = EXPECTED_MEMBER_MANIFEST_SHA256,
+    expected_adjacency_sha256: str | None = EXPECTED_ADJACENCY_SHA256,
+) -> dict[str, object]:
+    archive_stat = archive.lstat()
+    destination_stat = destination.lstat()
+    if not stat.S_ISREG(archive_stat.st_mode) or stat.S_ISLNK(archive_stat.st_mode):
+        raise ArchiveContractError("archive must be a regular file")
+    if not stat.S_ISDIR(destination_stat.st_mode) or stat.S_ISLNK(destination_stat.st_mode):
+        raise ArchiveContractError("destination must be a regular directory")
+    if list(destination.iterdir()):
+        raise ArchiveContractError("destination must be empty")
+    if tuple(item["name"] for item in expected) != ("supabase", "supabase-go"):
+        raise ArchiveContractError("expected member denominator is invalid")
+
+    rows: list[dict[str, object]] = []
+    created: list[Path] = []
+    try:
+        with gzip.open(archive, "rb") as stream:
+            for expected_member in expected:
+                header = stream.read(512)
+                if len(header) != 512 or header == b"\0" * 512:
+                    raise ArchiveContractError("archive member is missing")
+                stored_checksum = parse_octal(header[148:156], "checksum")
+                calculated_checksum = sum(header[:148]) + sum(b" " * 8) + sum(header[156:])
+                if stored_checksum != calculated_checksum:
+                    raise ArchiveContractError("tar header checksum mismatch")
+
+                name = parse_text(header[:100], "name")
+                member_path = PurePosixPath(name)
+                size = parse_octal(header[124:136], "size")
+                mode = parse_octal(header[100:108], "mode")
+                uid = parse_octal(header[108:116], "uid")
+                gid = parse_octal(header[116:124], "gid")
+                mtime = parse_octal(header[136:148], "mtime")
+                uname = parse_text(header[265:297], "uname")
+                gname = parse_text(header[297:329], "gname")
+                if (
+                    member_path.is_absolute()
+                    or len(member_path.parts) != 1
+                    or name in ("", ".", "..")
+                    or "/" in name
+                    or "\\" in name
+                ):
+                    raise ArchiveContractError("member path is not a unique root basename")
+                if header[156:157] != b"0":
+                    raise ArchiveContractError("only regular-file tar entries are admitted")
+                if header[157:257].rstrip(b"\0") or header[345:500].rstrip(b"\0"):
+                    raise ArchiveContractError("links and prefixed paths are forbidden")
+                if header[257:263] != b"ustar " or header[263:265] != b" \0":
+                    raise ArchiveContractError("PAX and long-name formats are forbidden")
+                if mode & 0o7000 or mode != int(expected_member["mode"]):
+                    raise ArchiveContractError("member mode is not the exact executable mode")
+                observed_identity = (name, size, uid, gid, uname, gname, mtime)
+                expected_identity = (
+                    expected_member["name"],
+                    expected_member["size"],
+                    expected_member["uid"],
+                    expected_member["gid"],
+                    expected_member["uname"],
+                    expected_member["gname"],
+                    expected_member["mtime"],
+                )
+                if observed_identity != expected_identity:
+                    raise ArchiveContractError("member identity, size, owner, or order mismatch")
+
+                target = destination / name
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_BINARY", 0)
+                )
+                descriptor = os.open(target, flags, 0o555)
+                created.append(target)
+                digest = hashlib.sha256()
+                first = b""
+                remaining = size
+                try:
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ArchiveContractError("member body is truncated")
+                        if len(first) < 64:
+                            first = (first + chunk)[:64]
+                        digest.update(chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(descriptor, view)
+                            if written <= 0:
+                                raise ArchiveContractError("member extraction write failed")
+                            view = view[written:]
+                        remaining -= len(chunk)
+                finally:
+                    os.close(descriptor)
+                padding = (-size) % 512
+                if padding and stream.read(padding) != b"\0" * padding:
+                    raise ArchiveContractError("member padding is not zero")
+                os.chmod(target, 0o555)
+                actual_sha256 = digest.hexdigest()
+                if actual_sha256 != expected_member["sha256"] or target.stat().st_size != size:
+                    raise ArchiveContractError("member size or digest mismatch")
+                rows.append(
+                    {
+                        "name": name,
+                        "size": size,
+                        "sha256": actual_sha256,
+                        "mode": "0755",
+                        "archive_uid": uid,
+                        "archive_gid": gid,
+                        "archive_uname": uname,
+                        "archive_gname": gname,
+                        "mtime": mtime,
+                        **validate_elf(first, name),
+                    }
+                )
+
+            if stream.read(512) != b"\0" * 512 or stream.read(512) != b"\0" * 512:
+                raise ArchiveContractError("archive has an additional or malformed member")
+            if any(stream.read()):
+                raise ArchiveContractError("archive trailing bytes are not zero")
+
+        if sorted(path.name for path in destination.iterdir()) != ["supabase", "supabase-go"]:
+            raise ArchiveContractError("extracted adjacency denominator mismatch")
+        for path in destination.iterdir():
+            path_stat = path.lstat()
+            observed_mode = stat.S_IMODE(path_stat.st_mode)
+            runtime_mode_valid = observed_mode == 0o555
+            if os.name == "nt":
+                runtime_mode_valid = observed_mode in (0o444, 0o555)
+            if not stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode) or not runtime_mode_valid:
+                raise ArchiveContractError("extracted member is not an adjacent read-only executable")
+
+        member_manifest = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        member_manifest_sha256 = hashlib.sha256(member_manifest).hexdigest()
+        adjacency_manifest = "".join(
+            f"{row['name']}|{row['sha256']}|{row['size']}\n" for row in rows
+        ).encode()
+        adjacency_sha256 = hashlib.sha256(adjacency_manifest).hexdigest()
+        if (
+            expected_member_manifest_sha256 is not None
+            and member_manifest_sha256 != expected_member_manifest_sha256
+        ):
+            raise ArchiveContractError("member manifest digest mismatch")
+        if expected_adjacency_sha256 is not None and adjacency_sha256 != expected_adjacency_sha256:
+            raise ArchiveContractError("adjacency digest mismatch")
+        return {
+            "member_count": len(rows),
+            "member_manifest_sha256": member_manifest_sha256,
+            "adjacency_sha256": adjacency_sha256,
+            "members": rows,
+        }
+    except Exception:
+        for path in created:
+            try:
+                os.chmod(path, 0o700)
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def main() -> None:
+    result = validate_archive(Path(sys.argv[1]), Path(sys.argv[2]))
+    members = {member["name"]: member for member in result["members"]}
+    fields = (
+        ("archive_member_count", "int", result["member_count"]),
+        ("member_manifest_sha256", "str", result["member_manifest_sha256"]),
+        ("adjacency_sha256", "str", result["adjacency_sha256"]),
+        ("binary_size", "int", members["supabase"]["size"]),
+        ("binary_sha256", "str", members["supabase"]["sha256"]),
+        ("sidecar_size", "int", members["supabase-go"]["size"]),
+        ("sidecar_sha256", "str", members["supabase-go"]["sha256"]),
+    )
+    for key, kind, value in fields:
+        print(f"{key}\t{kind}\t{value}")
+
+
+if __name__ == "__main__":
+    main()
+# END CLI_ARCHIVE_VALIDATOR_PYTHON
+PY
 }
 
 hash_identifier() {
@@ -1069,6 +1346,7 @@ record runner.free_disk_bytes int "$disk_bytes"
 (( disk_bytes >= 10737418240 )) || block RUNNER_DISK_BELOW_10_GIB
 
 if [[ "$MODE" == "run" ]]; then
+  [[ ! -v SUPABASE_GO_BINARY ]] || block CLI_SIDECAR_OVERRIDE_FORBIDDEN
   curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
     --output "$RUNTIME/$CLI_ASSET" "$CLI_URL" >"$RAW/cli-download.log" 2>&1 || block CLI_DOWNLOAD_FAILED
   actual_cli_sha="$(sha256sum "$RUNTIME/$CLI_ASSET" | awk '{print $1}')"
@@ -1077,11 +1355,42 @@ if [[ "$MODE" == "run" ]]; then
   record supabase_cli.asset_sha256 str "$actual_cli_sha"
   [[ "$actual_cli_sha" == "$CLI_SHA" ]] || block CLI_ASSET_DIGEST_MISMATCH
   mkdir -p "$RUNTIME/bin"
-  tar -xzf "$RUNTIME/$CLI_ASSET" -C "$RUNTIME/bin" supabase >"$RAW/cli-extract.log" 2>&1 || block CLI_EXTRACTION_FAILED
-  chmod 0555 "$RUNTIME/bin/supabase"
+  CLI_ARCHIVE_STATE_FILE="$RUNTIME/cli-archive-contract.tsv"
+  validate_extract_cli_archive "$RUNTIME/$CLI_ASSET" "$RUNTIME/bin" \
+    >"$CLI_ARCHIVE_STATE_FILE" 2>"$RAW/cli-extract.log" || block CLI_ARCHIVE_CONTRACT_MISMATCH
+  [[ "$(wc -l <"$CLI_ARCHIVE_STATE_FILE" | tr -d ' ')" == "7" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  archive_member_count="$(awk -F '\t' '$1=="archive_member_count" && $2=="int" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  member_manifest_sha="$(awk -F '\t' '$1=="member_manifest_sha256" && $2=="str" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  adjacency_sha="$(awk -F '\t' '$1=="adjacency_sha256" && $2=="str" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  receipt_binary_size="$(awk -F '\t' '$1=="binary_size" && $2=="int" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  receipt_binary_sha="$(awk -F '\t' '$1=="binary_sha256" && $2=="str" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  receipt_sidecar_size="$(awk -F '\t' '$1=="sidecar_size" && $2=="int" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  receipt_sidecar_sha="$(awk -F '\t' '$1=="sidecar_sha256" && $2=="str" {print $3; exit}' "$CLI_ARCHIVE_STATE_FILE")"
+  [[ "$archive_member_count" == "2" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  [[ "$member_manifest_sha" == "$CLI_MEMBER_MANIFEST_SHA" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  [[ "$adjacency_sha" == "$CLI_ADJACENCY_SHA" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  [[ "$receipt_binary_size" == "$CLI_BINARY_SIZE" && "$receipt_binary_sha" == "$CLI_BINARY_SHA" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  [[ "$receipt_sidecar_size" == "$CLI_SIDECAR_SIZE" && "$receipt_sidecar_sha" == "$CLI_SIDECAR_SHA" ]] || block CLI_ARCHIVE_RECEIPT_INVALID
+  [[ -f "$RUNTIME/bin/supabase" && ! -L "$RUNTIME/bin/supabase" ]] || block CLI_BINARY_IDENTITY_MISMATCH
+  [[ -f "$RUNTIME/bin/supabase-go" && ! -L "$RUNTIME/bin/supabase-go" ]] || block CLI_SIDECAR_IDENTITY_MISMATCH
+  [[ "$(stat -c '%a' "$RUNTIME/bin/supabase")" == "555" ]] || block CLI_BINARY_MODE_MISMATCH
+  [[ "$(stat -c '%a' "$RUNTIME/bin/supabase-go")" == "555" ]] || block CLI_SIDECAR_MODE_MISMATCH
+  [[ "$(find "$RUNTIME/bin" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" == "2" ]] || block CLI_ARCHIVE_DENOMINATOR_MISMATCH
   actual_cli_binary_sha="$(sha256sum "$RUNTIME/bin/supabase" | awk '{print $1}')"
+  actual_cli_binary_size="$(wc -c <"$RUNTIME/bin/supabase" | tr -d ' ')"
+  actual_cli_sidecar_sha="$(sha256sum "$RUNTIME/bin/supabase-go" | awk '{print $1}')"
+  actual_cli_sidecar_size="$(wc -c <"$RUNTIME/bin/supabase-go" | tr -d ' ')"
   record supabase_cli.binary_sha256 str "$actual_cli_binary_sha"
-  [[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]] || block CLI_BINARY_DIGEST_MISMATCH
+  record supabase_cli.binary_size int "$actual_cli_binary_size"
+  record supabase_cli.sidecar_sha256 str "$actual_cli_sidecar_sha"
+  record supabase_cli.sidecar_size int "$actual_cli_sidecar_size"
+  record supabase_cli.archive_member_count int "$archive_member_count"
+  record supabase_cli.member_manifest_sha256 str "$member_manifest_sha"
+  record supabase_cli.adjacency_sha256 str "$adjacency_sha"
+  record supabase_cli.sidecar_adjacent bool true
+  record supabase_cli.sidecar_override_env_present bool false
+  [[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" && "$actual_cli_binary_size" == "$CLI_BINARY_SIZE" ]] || block CLI_BINARY_DIGEST_MISMATCH
+  [[ "$actual_cli_sidecar_sha" == "$CLI_SIDECAR_SHA" && "$actual_cli_sidecar_size" == "$CLI_SIDECAR_SIZE" ]] || block CLI_SIDECAR_DIGEST_MISMATCH
 fi
 
 docker pull --platform linux/amd64 "$POSTGRES_PULL" >"$RAW/postgres-pull.log" 2>&1 || block POSTGRES_PULL_FAILED
