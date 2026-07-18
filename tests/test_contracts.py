@@ -4380,6 +4380,7 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
 
     def test_precanary_phase_receipt_is_closed_and_never_resets_counters(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        contract = (ROOT / "docs/CONTAINMENT_CONTRACT.md").read_text(encoding="utf-8")
         functions = self._phase_contract_functions()
         for field in (
             "input_absolute",
@@ -4404,6 +4405,20 @@ printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
             self.assertNotIn(forbidden, functions)
         self.assertIn("cleanup_exact", runner)
         self.assertIn('firewall_boundary.py" remove', runner)
+        for signed_field in (
+            "input_delta",
+            "forward_delta",
+            "output_delta",
+            "first_hit_input_delta",
+            "first_hit_forward_delta",
+            "first_hit_output_delta",
+            "gateway_input_deny_delta",
+            "gateway_forward_deny_delta",
+            "gateway_output_deny_delta",
+        ):
+            self.assertIn(f"`{signed_field}`", contract)
+        self.assertIn("Those fields alone admit signed base-10 integers", contract)
+        self.assertIn("every other integer remain nonnegative", contract)
 
     def test_gateway_canary_records_complete_sanitized_evidence_before_classification(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
