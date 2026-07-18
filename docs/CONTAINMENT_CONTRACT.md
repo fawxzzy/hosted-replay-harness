@@ -6,38 +6,37 @@
 
 No application repository, application migration, source data, Auth row, provider API, Supabase remote command, production environment, secret, or inherited workflow environment is in scope.
 
-## Current root-initialization diagnostic
+## Current clean-environment loader diagnostic
 
-The manual workflow's fixed default mode is `root-init-split-v1`. It invokes exactly `supabase telemetry status` from the pinned v2.109.1 binary. It never invokes local `status`, `start`, `stop`, `db start`, `db reset`, login/link, remote flags, migrations, SQL, GoTrue, an application path, image acquisition, or Docker lifecycle mutation. The workflow-selected `run` path terminates before the preserved inactive image/network/direct-diagnostic code.
+The manual workflow's fixed default mode is `loadconfig-services-v1`. It invokes exactly `supabase --workdir <packet-project> --network-id <frozen-name> --output json services` once from the pinned v2.109.1 binary. It never invokes `status`, `start`, `stop`, `db start`, `db reset`, login/link, remote flags, migrations, SQL, GoTrue, an application path, image acquisition, or Docker lifecycle mutation. The workflow-selected `run` path terminates before the preserved inactive image/network/direct-diagnostic code.
 
 The immutable source contract is finite:
 
-- `apps/cli-go/cmd/root.go` defines the root `PersistentPreRunE` that loads the profile, resolves the current project working directory, parses database-related flags when present, prepares local telemetry context, and initializes Sentry.
-- `apps/cli-go/cmd/telemetry.go` defines the `telemetry status` leaf with `RunE`; neither that file nor `internal/telemetry` calls `flags.LoadConfig` or Docker.
-- `apps/cli-go/go.mod` pins Cobra v1.10.2. Cobra executes the first inherited `PersistentPreRunE` before a runnable leaf's `RunE`, so this leaf provably crosses root persistent initialization. Help and version shortcuts are not used.
-- `DO_NOT_TRACK=1` and `SUPABASE_TELEMETRY_DISABLED=1` prevent telemetry capture. `SUPABASE_HOME` is packet-local. A fresh packet-local `supabase/.temp/cli-latest` is pre-seeded with the pinned version so the post-command upgrade check reads locally instead of contacting GitHub.
+- `apps/cli-go/cmd/root.go` runs root `PersistentPreRunE`, including the packet workdir and global flag processing.
+- `apps/cli-go/cmd/services.go` dispatches only to `internal/services.Run`.
+- `internal/services.Run` attempts local project-ref loading, calls `flags.LoadConfig`, then renders the ten configured service-image identities. A provider call is reachable only when linked state and a valid access token are both present.
+- The packet proves project-ref and access-token files absent, uses a fresh HOME and XDG roots, and rebuilds the child environment with `env -i`; no inherited `SUPABASE_*`, credential-store session, or linked state crosses the boundary.
+- `DO_NOT_TRACK=1` disables telemetry delivery. A fresh packet-local `supabase/.temp/cli-latest` is pre-seeded with the pinned version so the post-command upgrade check reads locally instead of contacting GitHub.
 
-Only the root-init child receives packet-local `HOME`, `SUPABASE_HOME`, all four XDG roots, `TMPDIR`, and `DOCKER_HOST`; its environment is rebuilt with `env -i`. The Docker observer permits `GET` and `HEAD` only, but this command must produce zero connections and requests. Any request, write method, forwarding/parser error, packet object, or listener delta is `BLOCKED_UNKNOWN` or a narrower fail-closed boundary code.
+The public committed config is copied into fresh packet scratch and must match SHA-256 `1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6`, be readable and LF-only, and coexist with zero `.env*`, migration, seed, project-ref, or access-token files. The CLI child receives only fixed `PATH`, packet-local `HOME`, all four XDG roots, `TMPDIR`, `DO_NOT_TRACK=1`, and child-only `DOCKER_HOST`. The observer permits `GET` and `HEAD`, but this command must produce zero connections and requests.
 
-Raw CLI output is created under umask `077`, reduced to exit code, byte/line counts, SHA-256, and two exact fingerprint-match booleans, then deleted. The child starts inside a packet-local project-root sentinel so root initialization does not emit a machine-specific workdir path. Scratch files are reduced to the closed classes `PROJECT_ROOT_SENTINEL`, `CLI_UPDATE_CACHE`, and `TELEMETRY_STATE`, per-class counts, and a canonical digest. Any other file class is `ROOT_INIT_STATE_ESCAPE`. All scratch is deleted before the terminal classification.
+Stdout and stderr are created separately under umask `077`, reduced to exit code, byte/line counts, and SHA-256, then deleted. Success additionally requires a closed ten-item JSON schema with only `name`, `local`, and empty `remote` strings. Scratch files are reduced to `PROJECT_CONFIG`, `CLI_UPDATE_CACHE`, and optional `TELEMETRY_STATE`, with only counts and a canonical digest retained. Any other file is `ROOT_INIT_STATE_ESCAPE`.
 
-## Ordered root-init gates
+## Ordered loader gates
 
 1. Verify Ubuntu 24.04, x86_64, Docker client/server `>=28`, at least 8 GiB actual RAM, and more than 10 GiB free disk.
 2. Download the one pinned CLI asset, verify its SHA-256, extract it, and verify the frozen binary SHA-256. The CLI `--version` shortcut is not executed because the pinned source makes it perform an external upgrade lookup.
 3. Require zero packet-labelled/project-labelled containers, volumes, and networks; no listener on 56422; and frozen count/digest fingerprints for native listeners 5432 and 5433.
-4. Create only permissions-restricted packet scratch and pre-seed only the local upgrade-cache class.
-5. Start the read-only Docker API observer, then invoke exactly one root-only child with all supported mutable locations redirected and telemetry endpoint delivery disabled.
+4. Copy and verify the exact public config, prove all linked/provider/application prerequisites absent, and pre-seed only the local upgrade-cache class.
+5. Start the read-only Docker API observer, then invoke exactly one `services` child under the closed clean environment.
 6. Stop the observer deterministically. Require zero connections, requests, responses, write attempts, forwarding errors, and parser errors.
-7. Sanitize and delete raw output, audit the closed scratch classes, and delete all root-init scratch.
+7. Classify and delete both raw streams, audit the closed scratch classes, and delete all loader scratch.
 8. Re-prove zero packet objects, no 56422 listener, and unchanged native listener fingerprints.
 9. The explicit `if: always()` cleanup step proves zero correlated containers, volumes, networks, listeners, bytecode, and runtime scratch before the sanitized artifact is retained.
 
 ## Terminal split
 
-- Exit `0` with the exact source-derived `Telemetry is enabled.` fingerprint and zero Docker API traffic records `diagnostic.classification=ROOT_INIT_PASS` and terminates with `LOAD_CONFIG_BLOCKER`. Root persistent initialization passed; the remaining shared failure boundary is `flags.LoadConfig`.
-- Exit `1` with the exact prior `1,078`-byte, `23`-line, `d3a19bac...` fingerprint and zero Docker API traffic terminates `ROOT_PERSISTENT_INIT_BLOCKER`.
-- Any other output, command exit, Docker request, state escape, object/listener drift, observer failure, or cleanup ambiguity terminates `BLOCKED_UNKNOWN` or its narrower stable prerequisite code.
+The only loader classifications are `CONFIG_LOAD_PASS_UNDER_CLEAN_ENV`, `CONFIG_ENV_TRAVERSAL_FAILED`, `CONFIG_FILE_READ_FAILED`, `CONFIG_FILE_MERGE_FAILED`, `CONFIG_DECODE_FAILED`, `CONFIG_VALIDATION_PROJECT_FAILED`, `CONFIG_VALIDATION_DB_FAILED`, `CONFIG_VALIDATION_AUTH_FAILED`, `CONFIG_KEY_GENERATION_FAILED`, and `CONFIG_UNKNOWN_SANITIZED`. Any nonempty remote service value, Docker request/write/error, linked/provider prerequisite, secret-shaped output, state escape, object/listener drift, observer failure, or cleanup ambiguity terminates `UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY` or `CONFIG_UNKNOWN_SANITIZED` without retaining the raw value.
 
 These are diagnostic classifications only. None admits containment, database startup, GoTrue migration, or application replay.
 

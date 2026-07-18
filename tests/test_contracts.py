@@ -149,11 +149,11 @@ class RunnerStaticContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
 
-    def test_legacy_direct_path_keeps_exact_pulls_but_root_init_acquires_no_image(self) -> None:
+    def test_legacy_direct_path_keeps_exact_pulls_but_loader_split_acquires_no_image(self) -> None:
         pulls = re.findall(r"(?m)^\s*docker pull --platform linux/amd64 ", self.runner)
         self.assertEqual(len(pulls), 2)
         self.assertNotRegex(self.runner, r"(?m)^\s*docker (build|compose pull|image pull)\b")
-        root_init = self.runner.index("run_root_init_split\n  exit 1")
+        root_init = self.runner.index("run_loadconfig_services_split\n  exit 1")
         first_pull = self.runner.index('docker pull --platform linux/amd64 "$POSTGRES_PULL"')
         self.assertLess(root_init, first_pull)
 
@@ -189,7 +189,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_contract_tests_do_not_leave_bytecode(self) -> None:
         self.assertIn('python3 -B -m unittest discover', self.runner)
 
-    def test_legacy_network_contract_is_preserved_but_not_reached_by_root_init(self) -> None:
+    def test_legacy_network_contract_is_preserved_but_not_reached_by_loader_split(self) -> None:
         for fragment in (
             "--internal",
             "--ipv6=false",
@@ -198,7 +198,7 @@ class RunnerStaticContractTests(unittest.TestCase):
             '--network-id "$NETWORK_NAME"',
         ):
             self.assertIn(fragment, self.runner)
-        self.assertEqual(self.runner.count('--network-id "$NETWORK_NAME"'), 1)
+        self.assertEqual(self.runner.count('--network-id "$NETWORK_NAME"'), 2)
         self.assertIn("record network.ipam_gateway", self.runner)
         self.assertIn("16) block PACKET_GATEWAY_REACHABLE", self.runner)
         self.assertIn("assert_frozen_network after_create empty", self.runner)
@@ -208,7 +208,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn("record network.pre_cleanup_exact_id bool true", self.runner)
         self.assertIn("SECOND_PACKET_NETWORK_DETECTED", self.runner)
         self.assertLess(
-            self.runner.index('run_root_init_split\n  exit 1'),
+            self.runner.index('run_loadconfig_services_split\n  exit 1'),
             self.runner.index('docker pull --platform linux/amd64 "$POSTGRES_PULL"'),
         )
 
@@ -224,19 +224,23 @@ class RunnerStaticContractTests(unittest.TestCase):
         ):
             self.assertIn(fragment, self.runner)
 
-    def test_root_init_split_has_three_exact_terminal_classes(self) -> None:
-        load_config = self.runner.index('block LOAD_CONFIG_BLOCKER root-persistent-init-passed')
-        persistent = self.runner.index(
-            'block ROOT_PERSISTENT_INIT_BLOCKER exact-prior-fingerprint'
+    def test_loader_split_has_exact_closed_terminal_classes(self) -> None:
+        classes = (
+            "CONFIG_LOAD_PASS_UNDER_CLEAN_ENV",
+            "CONFIG_ENV_TRAVERSAL_FAILED",
+            "CONFIG_FILE_READ_FAILED",
+            "CONFIG_FILE_MERGE_FAILED",
+            "CONFIG_DECODE_FAILED",
+            "CONFIG_VALIDATION_PROJECT_FAILED",
+            "CONFIG_VALIDATION_DB_FAILED",
+            "CONFIG_VALIDATION_AUTH_FAILED",
+            "CONFIG_KEY_GENERATION_FAILED",
+            "CONFIG_UNKNOWN_SANITIZED",
+            "UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY",
         )
-        unknown = self.runner.index('block BLOCKED_UNKNOWN "root-init-exit-${cli_rc}"')
-        self.assertLess(load_config, persistent)
-        self.assertLess(persistent, unknown)
-        self.assertIn('record diagnostic.classification str ROOT_INIT_PASS', self.runner)
-        self.assertIn(
-            'record diagnostic.classification str ROOT_PERSISTENT_INIT_BLOCKER',
-            self.runner,
-        )
+        for value in classes:
+            self.assertIn(value, self.runner)
+        self.assertIn('record diagnostic.classification str "$loader_classification"', self.runner)
     def test_pre_cleanup_network_failure_cannot_be_overwritten_by_pass(self) -> None:
         self.assertIn("network_contract_ok=1", self.runner)
         self.assertIn("network_contract_ok=0", self.runner)
@@ -253,38 +257,35 @@ class RunnerStaticContractTests(unittest.TestCase):
             2,
         )
 
-    def test_root_init_output_is_sanitized_classified_and_deleted(self) -> None:
+    def test_loader_output_is_sanitized_classified_and_deleted(self) -> None:
         self.assertIn("umask 077", self.runner)
-        command = 'telemetry status\n  ) >"$RAW/supabase-root-init.log" 2>&1'
+        command = 'services\n  ) >"$RAW/supabase-services.stdout" 2>"$RAW/supabase-services.stderr"'
         self.assertEqual(self.runner.count(command), 1)
-        raw_delete = 'rm -f -- "$RAW/supabase-root-init.log"'
+        raw_delete = 'rm -f -- "$RAW/supabase-services.stdout" "$RAW/supabase-services.stderr"'
         self.assertIn(raw_delete, self.runner)
-        self.assertIn("ROOT_INIT_RAW_LOG_DELETE_FAILED", self.runner)
-        self.assertIn("supabase_cli.root_init.raw_deleted", self.runner)
-        self.assertIn("supabase_cli.root_init.raw_byte_count", self.runner)
-        self.assertIn("supabase_cli.root_init.raw_line_count", self.runner)
-        self.assertIn("supabase_cli.root_init.raw_sha256", self.runner)
-        self.assertIn("supabase_cli.root_init.expected_output_match", self.runner)
-        self.assertIn("supabase_cli.root_init.prior_fingerprint_match", self.runner)
+        self.assertIn("supabase_cli.loadconfig.raw_deleted", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stdout_raw_byte_count", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stdout_raw_line_count", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stdout_raw_sha256", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stderr_raw_byte_count", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stderr_raw_line_count", self.runner)
+        self.assertIn("supabase_cli.loadconfig.stderr_raw_sha256", self.runner)
         self.assertLess(self.runner.index(command), self.runner.index(raw_delete))
-        self.assertNotIn('cat "$RAW/supabase-root-init.log"', self.runner)
-        self.assertIn(
-            'PRIOR_SHARED_FAILURE_SHA="d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31"',
-            self.runner,
-        )
+        self.assertNotIn('cat "$RAW/supabase-services.stdout"', self.runner)
+        self.assertNotIn('cat "$RAW/supabase-services.stderr"', self.runner)
 
     def test_docker_api_observer_is_scoped_to_the_cli_child(self) -> None:
         child_env = 'DOCKER_HOST="unix://$DOCKER_API_SOCKET" \\'
         self.assertGreaterEqual(self.runner.count(child_env), 1)
         self.assertNotIn("export DOCKER_HOST", self.runner)
-        root_init = self.runner.index("run_root_init_split() {")
+        root_init = self.runner.index("run_loadconfig_services_split() {")
         root_init_end = self.runner.index("\n}\n\nif [[ \"$MODE\" == \"cleanup-only\" ]]", root_init)
         root_init_source = self.runner[root_init:root_init_end]
         observer_start = root_init_source.index(
             'python3 -B "$ROOT/scripts/docker_api_boundary.py"'
         )
         cli_start = root_init_source.index(
-            'telemetry status\n  ) >"$RAW/supabase-root-init.log"'
+            'services\n  ) >"$RAW/supabase-services.stdout"'
         )
         observer_stop = root_init_source.index("stop_docker_api_observer", cli_start)
         self.assertLess(observer_start, cli_start)
@@ -311,7 +312,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
         freeze = "freeze_precli_objects_and_listeners"
         boundary = 'EVENT_SINCE="$(date -u +%s)"'
-        cli_start = 'telemetry status\n  ) >"$RAW/supabase-root-init.log"'
+        cli_start = 'services\n  ) >"$RAW/supabase-services.stdout"'
         self.assertIn(freeze, self.runner)
         self.assertIn('"$LISTENER_QUERY_BIN" -H -ltn "sport = :${port}"', self.runner)
         self.assertIn("pre_cli.packet_db_container_count", self.runner)
@@ -356,10 +357,9 @@ class RunnerStaticContractTests(unittest.TestCase):
             r'local stage="\$1" port="\$2" snapshot=',
         )
 
-    def test_root_init_scratch_is_fully_redirected_allowlisted_and_deleted(self) -> None:
+    def test_loader_scratch_is_fully_redirected_allowlisted_and_deleted(self) -> None:
         for variable in (
             "HOME",
-            "SUPABASE_HOME",
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "XDG_DATA_HOME",
@@ -368,13 +368,18 @@ class RunnerStaticContractTests(unittest.TestCase):
         ):
             self.assertRegex(self.runner, rf'(?m)^\s+{variable}="\$ROOT_INIT_[A-Z_]+" \\$')
         self.assertIn("DO_NOT_TRACK=1", self.runner)
-        self.assertIn("SUPABASE_TELEMETRY_DISABLED=1", self.runner)
+        loader_start = self.runner.index("run_loadconfig_services_split() {")
+        loader_end = self.runner.index('\n}\n\nif [[ "$MODE" == "cleanup-only" ]]', loader_start)
+        loader = self.runner[loader_start:loader_end]
+        self.assertNotIn("SUPABASE_HOME=", loader)
+        self.assertNotIn("SUPABASE_TELEMETRY_DISABLED=", loader)
+        self.assertNotIn("CI=", loader)
         self.assertIn("CLI_UPDATE_CACHE", self.runner)
         self.assertIn("TELEMETRY_STATE", self.runner)
-        self.assertIn("PROJECT_ROOT_SENTINEL", self.runner)
+        self.assertIn("PROJECT_CONFIG", self.runner)
         self.assertIn('*) block ROOT_INIT_STATE_ESCAPE "unexpected-scratch-class"', self.runner)
-        self.assertIn("root_init.scratch.class_digest_sha256", self.runner)
-        self.assertIn("root_init.scratch.deleted bool true", self.runner)
+        self.assertIn("loader.scratch.class_digest_sha256", self.runner)
+        self.assertIn("loader.scratch.deleted bool true", self.runner)
         self.assertRegex(
             self.runner,
             r'(?s)case "\$ROOT_INIT_DIR" in\s+"\$RUNTIME"/root-init\) rm -rf -- "\$ROOT_INIT_DIR"',
@@ -392,26 +397,35 @@ class RunnerStaticContractTests(unittest.TestCase):
         ):
             self.assertIn(code, self.runner)
 
-    def test_exact_root_only_source_contract_and_binary_hash(self) -> None:
+    def test_exact_loader_source_contract_and_binary_hash(self) -> None:
         self.assertIn('CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"', self.runner)
         self.assertIn(
             'CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"',
             self.runner,
         )
         self.assertIn('[[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]]', self.runner)
-        self.assertIn("record source_contract.command str supabase-telemetry-status", self.runner)
+        self.assertIn("record source_contract.command str supabase-services", self.runner)
         self.assertIn("record source_contract.root_persistent_prerun bool true", self.runner)
-        self.assertIn("record source_contract.load_config bool false", self.runner)
+        self.assertIn("record source_contract.load_config bool true", self.runner)
         self.assertIn("record source_contract.docker_access_expected bool false", self.runner)
         self.assertIn("record source_contract.provider_access_enabled bool false", self.runner)
         self.assertEqual(
-            self.runner.count('telemetry status\n  ) >"$RAW/supabase-root-init.log"'), 1
+            self.runner.count('services\n  ) >"$RAW/supabase-services.stdout"'), 1
         )
 
-    def test_root_init_execution_path_prohibits_mutating_or_remote_commands(self) -> None:
-        start = self.runner.index("run_root_init_split() {")
+    def test_loader_execution_path_is_exact_and_prohibits_mutating_or_remote_commands(self) -> None:
+        start = self.runner.index("run_loadconfig_services_split() {")
         end = self.runner.index("\n}\n\nif [[ \"$MODE\" == \"cleanup-only\" ]]", start)
         root_init = self.runner[start:end]
+        exact = (
+            '"$RUNTIME/bin/supabase" \\\n'
+            '      --workdir "$ROOT_INIT_WORKDIR" \\\n'
+            '      --network-id "$NETWORK_NAME" \\\n'
+            '      --output json \\\n'
+            '      services'
+        )
+        self.assertIn(exact, root_init)
+        self.assertEqual(root_init.count("\n      services\n"), 1)
         prohibited = (
             r"\bstatus\s+--ignore-health-check\b",
             r"\b(login|link|pull|push|dump)\b",
@@ -428,8 +442,27 @@ class RunnerStaticContractTests(unittest.TestCase):
                 'docker pull --platform linux/amd64 "$POSTGRES_PULL"'
             )
         ]
-        self.assertIn("run_root_init_split", workflow_entry)
+        self.assertIn("run_loadconfig_services_split", workflow_entry)
         self.assertIn("exit 1", workflow_entry)
+
+    def test_loader_preflight_proves_config_and_provider_state_absence(self) -> None:
+        self.assertIn(
+            'CONFIG_SHA="1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6"',
+            self.runner,
+        )
+        for fragment in (
+            "loader.config.public_sha256",
+            "loader.config.readable",
+            "loader.config.lf_only",
+            "loader.config.env_file_count",
+            "loader.provider.linked_state_absent",
+            "loader.provider.access_token_absent",
+            "loader.provider.inherited_supabase_environment",
+            "loader.application.migrations_absent",
+            "loader.application.seed_absent",
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertIn("env -i", self.runner)
 
     def test_cleanup_is_exactly_correlated(self) -> None:
         self.assertIn('label=com.supabase.cli.project=${PROJECT}', self.runner)
@@ -448,64 +481,78 @@ class RunnerStaticContractTests(unittest.TestCase):
         )
 
 
-class RootInitClassifierTests(unittest.TestCase):
+class LoadConfigClassifierTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
-        start = runner.index("# BEGIN ROOT_INIT_CLASSIFIER_FUNCTION")
-        end = runner.index("# END ROOT_INIT_CLASSIFIER_FUNCTION")
+        start = runner.index("# BEGIN LOADCONFIG_CLASSIFIER_FUNCTION")
+        end = runner.index("# END LOADCONFIG_CLASSIFIER_FUNCTION")
         cls.function = runner[start:end].split("\n", 1)[1]
 
-    def classify(self, exit_code: int, byte_count: int, line_count: int, digest: str) -> str:
+    def classify(
+        self,
+        stderr: str,
+        *,
+        exit_code: int = 1,
+        schema_valid: bool = False,
+        secret_shape: bool = False,
+    ) -> str:
         script = f"""
 set -Eeuo pipefail
-ROOT_INIT_EXPECTED_BYTES=22
-ROOT_INIT_EXPECTED_LINES=1
-ROOT_INIT_EXPECTED_SHA=5a73be3c00c7ce7af784eb10f0b9c48e80db0c7ed02ff12bff98734f5bcbc968
-PRIOR_SHARED_FAILURE_BYTES=1078
-PRIOR_SHARED_FAILURE_LINES=23
-PRIOR_SHARED_FAILURE_SHA=d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31
 {self.function}
-classify_root_init_result "$1" "$2" "$3" "$4"
+classify_loadconfig_result "$1" "$2" "$3" "$4"
 """
-        result = subprocess.run(
-            [BASH, "-c", script, "bash", str(exit_code), str(byte_count), str(line_count), digest],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
+        with tempfile.TemporaryDirectory() as directory:
+            error_file = Path(directory) / "stderr"
+            error_file.write_text(stderr, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    BASH,
+                    "-c",
+                    script,
+                    "bash",
+                    str(exit_code),
+                    str(error_file),
+                    str(schema_valid).lower(),
+                    str(secret_shape).lower(),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
 
-    def test_exact_success_prior_and_unknown_classes(self) -> None:
+    def test_every_source_class_has_a_narrow_fixture(self) -> None:
         fixtures = (
-            (
-                0,
-                22,
-                1,
-                "5a73be3c00c7ce7af784eb10f0b9c48e80db0c7ed02ff12bff98734f5bcbc968",
-                "LOAD_CONFIG_BLOCKER",
-            ),
-            (
-                1,
-                1078,
-                23,
-                "d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31",
-                "ROOT_PERSISTENT_INIT_BLOCKER",
-            ),
-            (1, 22, 1, "0" * 64, "BLOCKED_UNKNOWN"),
-            (
-                0,
-                1078,
-                23,
-                "d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31",
-                "BLOCKED_UNKNOWN",
-            ),
+            ("failed to get repo directory", "CONFIG_ENV_TRAVERSAL_FAILED"),
+            ("failed to read file config", "CONFIG_FILE_READ_FAILED"),
+            ("failed to merge file config", "CONFIG_FILE_MERGE_FAILED"),
+            ("failed to parse config", "CONFIG_DECODE_FAILED"),
+            ("Missing required field in config: project_id", "CONFIG_VALIDATION_PROJECT_FAILED"),
+            ("Missing required field in config: db.port", "CONFIG_VALIDATION_DB_FAILED"),
+            ("Missing required field in config: auth.site_url", "CONFIG_VALIDATION_AUTH_FAILED"),
+            ("failed to generate JWT", "CONFIG_KEY_GENERATION_FAILED"),
         )
-        for exit_code, byte_count, line_count, digest, expected in fixtures:
+        for stderr, expected in fixtures:
             with self.subTest(expected=expected):
-                self.assertEqual(
-                    self.classify(exit_code, byte_count, line_count, digest), expected
-                )
+                self.assertEqual(self.classify(stderr), expected)
+
+    def test_pass_unknown_and_secret_shape_are_closed(self) -> None:
+        self.assertEqual(
+            self.classify("", exit_code=0, schema_valid=True),
+            "CONFIG_LOAD_PASS_UNDER_CLEAN_ENV",
+        )
+        self.assertEqual(self.classify("opaque failure"), "CONFIG_UNKNOWN_SANITIZED")
+        self.assertEqual(
+            self.classify("failed to read file config", secret_shape=True),
+            "CONFIG_UNKNOWN_SANITIZED",
+        )
+
+    def test_classifier_never_emits_raw_input(self) -> None:
+        marker = "opaque synthetic marker"
+        observed = self.classify(marker)
+        self.assertNotIn(marker, observed)
+        self.assertRegex(observed, r"^[A-Z0-9_]+$")
 
 
 class ListenerDiagnosticTests(unittest.TestCase):
@@ -873,18 +920,18 @@ class ResultWriterTests(unittest.TestCase):
             self.assertEqual(observed, diagnostic)
             self.assertNotIn("opaque diagnostic fixture", output.read_text(encoding="utf-8"))
 
-    def test_root_init_profile_replaces_historical_db_start_source_contract(self) -> None:
+    def test_loader_profile_replaces_root_init_source_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             state = temp / "state.tsv"
             audit = temp / "audit.jsonl"
             output = temp / "result.json"
             state.write_text(
-                "result.profile\tstr\troot-init-split-v1\n"
-                "diagnostic.profile\tstr\troot-init-split-v1\n"
-                "source_contract.command\tstr\tsupabase-telemetry-status\n"
+                "result.profile\tstr\tloadconfig-services-v1\n"
+                "diagnostic.profile\tstr\tloadconfig-services-v1\n"
+                "source_contract.command\tstr\tsupabase-services\n"
                 "source_contract.root_persistent_prerun\tbool\ttrue\n"
-                "source_contract.load_config\tbool\tfalse\n"
+                "source_contract.load_config\tbool\ttrue\n"
                 "source_contract.docker_access_expected\tbool\tfalse\n"
                 "source_contract.provider_access_enabled\tbool\tfalse\n"
                 "source_contract.telemetry_endpoint_enabled\tbool\tfalse\n"
@@ -914,14 +961,14 @@ class ResultWriterTests(unittest.TestCase):
             result = json.loads(output.read_text(encoding="utf-8"))
             self.assertNotIn("result", result)
             self.assertEqual(
-                result["diagnostic"]["profile"], "root-init-split-v1"
+                result["diagnostic"]["profile"], "loadconfig-services-v1"
             )
             self.assertEqual(
                 result["source_contract"]["command"],
-                "supabase-telemetry-status",
+                "supabase-services",
             )
             self.assertTrue(result["source_contract"]["root_persistent_prerun"])
-            self.assertFalse(result["source_contract"]["load_config"])
+            self.assertTrue(result["source_contract"]["load_config"])
             self.assertFalse(result["source_contract"]["gotrue_enabled"])
             self.assertNotEqual(
                 result["source_contract"]["command"], "supabase db start"

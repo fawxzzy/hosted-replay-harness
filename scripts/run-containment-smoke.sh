@@ -33,7 +33,6 @@ PROJECT_DIR="$RUNTIME/project"
 ROOT_INIT_DIR="$RUNTIME/root-init"
 ROOT_INIT_WORKDIR="$ROOT_INIT_DIR/workdir"
 ROOT_INIT_HOME="$ROOT_INIT_DIR/home"
-ROOT_INIT_SUPABASE_HOME="$ROOT_INIT_DIR/supabase-home"
 ROOT_INIT_XDG_CONFIG="$ROOT_INIT_DIR/xdg-config"
 ROOT_INIT_XDG_CACHE="$ROOT_INIT_DIR/xdg-cache"
 ROOT_INIT_XDG_DATA="$ROOT_INIT_DIR/xdg-data"
@@ -78,12 +77,7 @@ CLI_SHA="36d87b7fe6b4bcfe89ac47a4354e526cff22480224de426d7b370f6934556976"
 CLI_BINARY_SHA="e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20"
 CLI_ASSET="supabase_2.109.1_linux_amd64.tar.gz"
 CLI_URL="https://github.com/supabase/cli/releases/download/v2.109.1/${CLI_ASSET}"
-ROOT_INIT_EXPECTED_BYTES="22"
-ROOT_INIT_EXPECTED_LINES="1"
-ROOT_INIT_EXPECTED_SHA="5a73be3c00c7ce7af784eb10f0b9c48e80db0c7ed02ff12bff98734f5bcbc968"
-PRIOR_SHARED_FAILURE_BYTES="1078"
-PRIOR_SHARED_FAILURE_LINES="23"
-PRIOR_SHARED_FAILURE_SHA="d3a19bac055dc3fad0bca48c92d3cbe3d1d59ec9ac43d90829b5dd0c41545d31"
+CONFIG_SHA="1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6"
 POSTGRES_TAG="supabase/postgres:17.6.1.143"
 POSTGRES_DIGEST="sha256:b021e96054128399f84f24e39d29c21ee7c7169515e5d9e4e99ff15d5043d1d8"
 POSTGRES_PULL="supabase/postgres@${POSTGRES_DIGEST}"
@@ -730,23 +724,52 @@ prepare_root_init_scratch() {
   install -d -m 0700 \
     "$ROOT_INIT_WORKDIR/supabase/.temp" \
     "$ROOT_INIT_HOME" \
-    "$ROOT_INIT_SUPABASE_HOME" \
     "$ROOT_INIT_XDG_CONFIG" \
     "$ROOT_INIT_XDG_CACHE" \
     "$ROOT_INIT_XDG_DATA" \
     "$ROOT_INIT_XDG_STATE" \
     "$ROOT_INIT_TMP"
-  : >"$ROOT_INIT_WORKDIR/supabase/config.toml"
+  cp -- "$ROOT/supabase/config.toml" "$ROOT_INIT_WORKDIR/supabase/config.toml" \
+    || block CONFIG_FILE_READ_FAILED
   printf 'v%s' "$CLI_VERSION" >"$ROOT_INIT_WORKDIR/supabase/.temp/cli-latest"
   chmod 0600 "$ROOT_INIT_WORKDIR/supabase/config.toml"
   chmod 0600 "$ROOT_INIT_WORKDIR/supabase/.temp/cli-latest"
-  record root_init.scratch.redirected_location_count int 8
+  record loader.scratch.redirected_location_count int 6
   record root_init.scratch.upgrade_cache_preseeded bool true
+
+  local config_sha config_bytes env_file_count
+  config_sha="$(sha256sum "$ROOT_INIT_WORKDIR/supabase/config.toml" | awk '{print $1}')"
+  config_bytes="$(wc -c <"$ROOT_INIT_WORKDIR/supabase/config.toml" | tr -d ' ')"
+  [[ "$config_sha" == "$CONFIG_SHA" ]] || block CONFIG_FILE_MERGE_FAILED config-digest-mismatch
+  [[ -r "$ROOT_INIT_WORKDIR/supabase/config.toml" ]] || block CONFIG_FILE_READ_FAILED
+  if LC_ALL=C grep -q $'\r' "$ROOT_INIT_WORKDIR/supabase/config.toml"; then
+    block CONFIG_FILE_MERGE_FAILED config-not-lf
+  fi
+  env_file_count="$(find "$ROOT_INIT_WORKDIR" -xdev -type f -name '.env*' -print | wc -l)"
+  [[ "$env_file_count" == "0" ]] || block CONFIG_ENV_TRAVERSAL_FAILED unexpected-env-file
+  [[ ! -e "$ROOT_INIT_WORKDIR/supabase/.temp/project-ref" ]] \
+    || block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY linked-state-present
+  [[ ! -e "$ROOT_INIT_HOME/.supabase/access-token" ]] \
+    || block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY access-token-present
+  [[ ! -e "$ROOT_INIT_WORKDIR/supabase/migrations" ]] \
+    || block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY migrations-present
+  [[ ! -e "$ROOT_INIT_WORKDIR/supabase/seed.sql" ]] \
+    || block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY seed-present
+  record loader.config.public_sha256 str "$config_sha"
+  record loader.config.byte_count int "$config_bytes"
+  record loader.config.readable bool true
+  record loader.config.lf_only bool true
+  record loader.config.env_file_count int 0
+  record loader.provider.linked_state_absent bool true
+  record loader.provider.access_token_absent bool true
+  record loader.provider.inherited_supabase_environment bool false
+  record loader.application.migrations_absent bool true
+  record loader.application.seed_absent bool true
 }
 
 audit_root_init_scratch() {
   local manifest="$RAW/root-init-scratch-manifest.tsv"
-  local file relative class digest update_count=0 telemetry_count=0 sentinel_count=0 file_count=0
+  local file relative class digest update_count=0 telemetry_count=0 config_count=0 file_count=0
   : >"$manifest"
   while IFS= read -r -d '' file; do
     relative="${file#"$ROOT_INIT_DIR"/}"
@@ -755,13 +778,13 @@ audit_root_init_scratch() {
         class=CLI_UPDATE_CACHE
         update_count="$((update_count + 1))"
         ;;
-      supabase-home/telemetry.json)
+      home/.supabase/telemetry.json)
         class=TELEMETRY_STATE
         telemetry_count="$((telemetry_count + 1))"
         ;;
       workdir/supabase/config.toml)
-        class=PROJECT_ROOT_SENTINEL
-        sentinel_count="$((sentinel_count + 1))"
+        class=PROJECT_CONFIG
+        config_count="$((config_count + 1))"
         ;;
       *) block ROOT_INIT_STATE_ESCAPE "unexpected-scratch-class" ;;
     esac
@@ -771,41 +794,50 @@ audit_root_init_scratch() {
     file_count="$((file_count + 1))"
   done < <(find "$ROOT_INIT_DIR" -xdev -type f -print0)
   LC_ALL=C sort -o "$manifest" "$manifest"
-  record root_init.scratch.file_count int "$file_count"
-  record root_init.scratch.class_counts.cli_update_cache int "$update_count"
-  record root_init.scratch.class_counts.telemetry_state int "$telemetry_count"
-  record root_init.scratch.class_counts.project_root_sentinel int "$sentinel_count"
-  record root_init.scratch.class_digest_sha256 str "$(sha256sum "$manifest" | awk '{print $1}')"
+  record loader.scratch.file_count int "$file_count"
+  record loader.scratch.class_counts.cli_update_cache int "$update_count"
+  record loader.scratch.class_counts.telemetry_state int "$telemetry_count"
+  record loader.scratch.class_counts.project_config int "$config_count"
+  record loader.scratch.class_digest_sha256 str "$(sha256sum "$manifest" | awk '{print $1}')"
   [[ "$update_count" == "1" ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
-  [[ "$sentinel_count" == "1" ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
+  [[ "$config_count" == "1" ]] || block ROOT_INIT_SCRATCH_AUDIT_FAILED
   (( telemetry_count <= 1 )) || block ROOT_INIT_SCRATCH_AUDIT_FAILED
 }
 
-# BEGIN ROOT_INIT_CLASSIFIER_FUNCTION
-classify_root_init_result() {
-  local cli_rc="$1" raw_bytes="$2" raw_lines="$3" raw_sha="$4"
-  if [[ "$cli_rc" == "0" \
-    && "$raw_bytes" == "$ROOT_INIT_EXPECTED_BYTES" \
-    && "$raw_lines" == "$ROOT_INIT_EXPECTED_LINES" \
-    && "$raw_sha" == "$ROOT_INIT_EXPECTED_SHA" ]]; then
-    printf 'LOAD_CONFIG_BLOCKER\n'
-    return 0
+# BEGIN LOADCONFIG_CLASSIFIER_FUNCTION
+classify_loadconfig_result() {
+  local cli_rc="$1" stderr_file="$2" stdout_schema_valid="$3" secret_shape="$4"
+  if [[ "$secret_shape" == "true" ]]; then
+    printf 'CONFIG_UNKNOWN_SANITIZED\n'
+  elif grep -Eqi 'failed to (get repo directory|change directory|restore directory|parse environment file|load \.env)' "$stderr_file"; then
+    printf 'CONFIG_ENV_TRAVERSAL_FAILED\n'
+  elif grep -Eqi 'failed to read file config' "$stderr_file"; then
+    printf 'CONFIG_FILE_READ_FAILED\n'
+  elif grep -Eqi 'failed to (merge default values|merge file config|merge remote config)|duplicate project_id' "$stderr_file"; then
+    printf 'CONFIG_FILE_MERGE_FAILED\n'
+  elif grep -Eqi 'failed to parse config' "$stderr_file"; then
+    printf 'CONFIG_DECODE_FAILED\n'
+  elif grep -Eqi 'failed to (generate JWT|convert JWK|sign JWT)|Invalid config for auth\.jwt_secret' "$stderr_file"; then
+    printf 'CONFIG_KEY_GENERATION_FAILED\n'
+  elif grep -Eqi 'Missing required field in config: project_id|Invalid config for remotes\.' "$stderr_file"; then
+    printf 'CONFIG_VALIDATION_PROJECT_FAILED\n'
+  elif grep -Eqi 'Missing required field in config: db\.|Failed reading config: Invalid db\.|Postgres version 12\.x is unsupported' "$stderr_file"; then
+    printf 'CONFIG_VALIDATION_DB_FAILED\n'
+  elif grep -Eqi 'Missing required (field in config|config section): auth\.|Invalid config for auth\.|failed to (read|decode) signing keys' "$stderr_file"; then
+    printf 'CONFIG_VALIDATION_AUTH_FAILED\n'
+  elif [[ "$cli_rc" == "0" && ! -s "$stderr_file" && "$stdout_schema_valid" == "true" ]]; then
+    printf 'CONFIG_LOAD_PASS_UNDER_CLEAN_ENV\n'
+  else
+    printf 'CONFIG_UNKNOWN_SANITIZED\n'
   fi
-  if [[ "$cli_rc" == "1" \
-    && "$raw_bytes" == "$PRIOR_SHARED_FAILURE_BYTES" \
-    && "$raw_lines" == "$PRIOR_SHARED_FAILURE_LINES" \
-    && "$raw_sha" == "$PRIOR_SHARED_FAILURE_SHA" ]]; then
-    printf 'ROOT_PERSISTENT_INIT_BLOCKER\n'
-    return 0
-  fi
-  printf 'BLOCKED_UNKNOWN\n'
 }
-# END ROOT_INIT_CLASSIFIER_FUNCTION
+# END LOADCONFIG_CLASSIFIER_FUNCTION
 
-run_root_init_split() {
+run_loadconfig_services_split() {
   local cli_rc observer_rc=0 observer_state_present=true observer_classification
-  local raw_bytes raw_lines raw_sha request_count response_count write_count forwarding_errors parser_errors
-  local expected_output=false prior_output=false root_init_classification
+  local stdout_bytes stdout_lines stdout_sha stderr_bytes stderr_lines stderr_sha
+  local request_count response_count write_count forwarding_errors parser_errors
+  local stdout_schema_valid=false stdout_schema_rc=0 secret_shape=false loader_classification
 
   prepare_root_init_scratch
   packet_object_counts pre_cli || block ROOT_INIT_PREEXISTING_OBJECT
@@ -837,19 +869,19 @@ run_root_init_split() {
     env -i \
       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       HOME="$ROOT_INIT_HOME" \
-      SUPABASE_HOME="$ROOT_INIT_SUPABASE_HOME" \
       XDG_CONFIG_HOME="$ROOT_INIT_XDG_CONFIG" \
       XDG_CACHE_HOME="$ROOT_INIT_XDG_CACHE" \
       XDG_DATA_HOME="$ROOT_INIT_XDG_DATA" \
       XDG_STATE_HOME="$ROOT_INIT_XDG_STATE" \
       TMPDIR="$ROOT_INIT_TMP" \
       DO_NOT_TRACK=1 \
-      SUPABASE_TELEMETRY_DISABLED=1 \
-      CI=1 \
       DOCKER_HOST="unix://$DOCKER_API_SOCKET" \
       timeout --signal=TERM --kill-after=10s 120s "$RUNTIME/bin/supabase" \
-      telemetry status
-  ) >"$RAW/supabase-root-init.log" 2>&1
+      --workdir "$ROOT_INIT_WORKDIR" \
+      --network-id "$NETWORK_NAME" \
+      --output json \
+      services
+  ) >"$RAW/supabase-services.stdout" 2>"$RAW/supabase-services.stderr"
   cli_rc="$?"
   set -e
 
@@ -865,26 +897,65 @@ run_root_init_split() {
   record docker_api_boundary.observer_exit_code int "$observer_rc"
   record docker_api_boundary.state_present bool "$observer_state_present"
 
-  raw_bytes="$(wc -c <"$RAW/supabase-root-init.log" | tr -d ' ')"
-  raw_lines="$(wc -l <"$RAW/supabase-root-init.log" | tr -d ' ')"
-  raw_sha="$(sha256sum "$RAW/supabase-root-init.log" | awk '{print $1}')"
-  [[ "$raw_bytes" =~ ^[0-9]+$ && "$raw_lines" =~ ^[0-9]+$ && "$raw_sha" =~ ^[0-9a-f]{64}$ ]] \
-    || block ROOT_INIT_OUTPUT_SANITIZER_FAILED
-  [[ "$raw_bytes" == "$ROOT_INIT_EXPECTED_BYTES" \
-    && "$raw_lines" == "$ROOT_INIT_EXPECTED_LINES" \
-    && "$raw_sha" == "$ROOT_INIT_EXPECTED_SHA" ]] && expected_output=true
-  [[ "$raw_bytes" == "$PRIOR_SHARED_FAILURE_BYTES" \
-    && "$raw_lines" == "$PRIOR_SHARED_FAILURE_LINES" \
-    && "$raw_sha" == "$PRIOR_SHARED_FAILURE_SHA" ]] && prior_output=true
-  record supabase_cli.root_init.exit_code int "$cli_rc"
-  record supabase_cli.root_init.raw_byte_count int "$raw_bytes"
-  record supabase_cli.root_init.raw_line_count int "$raw_lines"
-  record supabase_cli.root_init.raw_sha256 str "$raw_sha"
-  record supabase_cli.root_init.expected_output_match bool "$expected_output"
-  record supabase_cli.root_init.prior_fingerprint_match bool "$prior_output"
-  rm -f -- "$RAW/supabase-root-init.log" || block ROOT_INIT_RAW_LOG_DELETE_FAILED
-  [[ ! -e "$RAW/supabase-root-init.log" ]] || block ROOT_INIT_RAW_LOG_DELETE_FAILED
-  record supabase_cli.root_init.raw_deleted bool true
+  stdout_bytes="$(wc -c <"$RAW/supabase-services.stdout" | tr -d ' ')"
+  stdout_lines="$(wc -l <"$RAW/supabase-services.stdout" | tr -d ' ')"
+  stdout_sha="$(sha256sum "$RAW/supabase-services.stdout" | awk '{print $1}')"
+  stderr_bytes="$(wc -c <"$RAW/supabase-services.stderr" | tr -d ' ')"
+  stderr_lines="$(wc -l <"$RAW/supabase-services.stderr" | tr -d ' ')"
+  stderr_sha="$(sha256sum "$RAW/supabase-services.stderr" | awk '{print $1}')"
+  for value in "$stdout_bytes" "$stdout_lines" "$stderr_bytes" "$stderr_lines"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || block CONFIG_UNKNOWN_SANITIZED output-count-invalid
+  done
+  [[ "$stdout_sha" =~ ^[0-9a-f]{64}$ && "$stderr_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || block CONFIG_UNKNOWN_SANITIZED output-digest-invalid
+
+  set +e
+  python3 -B - "$RAW/supabase-services.stdout" <<'PY'
+import json
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(10)
+if not isinstance(value, list) or len(value) != 10:
+    raise SystemExit(10)
+for item in value:
+    if not isinstance(item, dict) or set(item) != {"name", "local", "remote"}:
+        raise SystemExit(10)
+    if not all(isinstance(item[key], str) for key in ("name", "local", "remote")):
+        raise SystemExit(10)
+    if not item["name"] or not item["local"]:
+        raise SystemExit(10)
+    if item["remote"]:
+        raise SystemExit(11)
+PY
+  stdout_schema_rc="$?"
+  set -e
+  case "$stdout_schema_rc" in
+    0) stdout_schema_valid=true ;;
+    11) block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY remote-service-version-observed ;;
+    *) stdout_schema_valid=false ;;
+  esac
+
+  if grep -Eqi 'authorization:[[:space:]]*bearer|postgres(ql)?://|-----BEGIN [A-Z ]*PRIVATE KEY-----|sbp_(oauth_)?[0-9a-f]{40}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|("?(password|secret|token|api[_-]?key)"?[[:space:]]*[:=][[:space:]]*"[^"[:space:]]+)' \
+    "$RAW/supabase-services.stdout" "$RAW/supabase-services.stderr"; then
+    secret_shape=true
+  fi
+  loader_classification="$(classify_loadconfig_result "$cli_rc" "$RAW/supabase-services.stderr" "$stdout_schema_valid" "$secret_shape")"
+  record supabase_cli.loadconfig.exit_code int "$cli_rc"
+  record supabase_cli.loadconfig.stdout_raw_byte_count int "$stdout_bytes"
+  record supabase_cli.loadconfig.stdout_raw_line_count int "$stdout_lines"
+  record supabase_cli.loadconfig.stdout_raw_sha256 str "$stdout_sha"
+  record supabase_cli.loadconfig.stderr_raw_byte_count int "$stderr_bytes"
+  record supabase_cli.loadconfig.stderr_raw_line_count int "$stderr_lines"
+  record supabase_cli.loadconfig.stderr_raw_sha256 str "$stderr_sha"
+  record diagnostic.classification str "$loader_classification"
+  rm -f -- "$RAW/supabase-services.stdout" "$RAW/supabase-services.stderr" \
+    || block CONFIG_UNKNOWN_SANITIZED raw-output-delete-failed
+  [[ ! -e "$RAW/supabase-services.stdout" && ! -e "$RAW/supabase-services.stderr" ]] \
+    || block CONFIG_UNKNOWN_SANITIZED raw-output-delete-failed
+  record supabase_cli.loadconfig.raw_deleted bool true
 
   audit_root_init_scratch
   case "$ROOT_INIT_DIR" in
@@ -892,13 +963,13 @@ run_root_init_split() {
     *) block ROOT_INIT_SCRATCH_DELETE_FAILED invalid-root-init-path ;;
   esac
   [[ ! -e "$ROOT_INIT_DIR" ]] || block ROOT_INIT_SCRATCH_DELETE_FAILED
-  record root_init.scratch.deleted bool true
+  record loader.scratch.deleted bool true
 
   [[ "$observer_state_present" == "true" ]] || block DOCKER_API_OBSERVER_STATE_MISSING
   [[ "$observer_classification" =~ ^[A-Z0-9_]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
   [[ "$observer_rc" == "0" || "$observer_rc" == "2" ]] \
     || block DOCKER_API_OBSERVER_FAILED "observer-exit-${observer_rc}"
-  [[ "$cli_rc" != "124" ]] || block ROOT_INIT_COMMAND_TIMEOUT
+  [[ "$cli_rc" != "124" ]] || block CONFIG_UNKNOWN_SANITIZED command-timeout
 
   request_count="$(awk -F '\t' '$1=="docker_api_boundary.request_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
   response_count="$(awk -F '\t' '$1=="docker_api_boundary.response_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
@@ -913,7 +984,7 @@ run_root_init_split() {
     && "$response_count" == "0" \
     && "$write_count" == "0" \
     && "$forwarding_errors" == "0" \
-    && "$parser_errors" == "0" ]] || block BLOCKED_UNKNOWN "unexpected-docker-api-boundary"
+    && "$parser_errors" == "0" ]] || block UNEXPECTED_DOCKER_OR_PROVIDER_BOUNDARY docker-api-observed
 
   packet_object_counts post_cli || block ROOT_INIT_DOCKER_OBJECT_DRIFT
   capture_listener_snapshot post_cli "$DB_PORT" \
@@ -922,20 +993,11 @@ run_root_init_split() {
   native_listener_contract post_cli \
     || block "${LISTENER_FAILURE_CODE:-NATIVE_LISTENER_DRIFT}" "${LISTENER_LAST_PHASE:-POST_CLI_LISTENER_UNKNOWN}"
 
-  root_init_classification="$(classify_root_init_result "$cli_rc" "$raw_bytes" "$raw_lines" "$raw_sha")"
-  case "$root_init_classification" in
-    LOAD_CONFIG_BLOCKER)
-      record diagnostic.classification str ROOT_INIT_PASS
-      block LOAD_CONFIG_BLOCKER root-persistent-init-passed
+  case "$loader_classification" in
+    CONFIG_LOAD_PASS_UNDER_CLEAN_ENV|CONFIG_ENV_TRAVERSAL_FAILED|CONFIG_FILE_READ_FAILED|CONFIG_FILE_MERGE_FAILED|CONFIG_DECODE_FAILED|CONFIG_VALIDATION_PROJECT_FAILED|CONFIG_VALIDATION_DB_FAILED|CONFIG_VALIDATION_AUTH_FAILED|CONFIG_KEY_GENERATION_FAILED|CONFIG_UNKNOWN_SANITIZED)
+      block "$loader_classification" loader-only-diagnostic-terminal
       ;;
-    ROOT_PERSISTENT_INIT_BLOCKER)
-      record diagnostic.classification str ROOT_PERSISTENT_INIT_BLOCKER
-      block ROOT_PERSISTENT_INIT_BLOCKER exact-prior-fingerprint
-      ;;
-    *)
-      record diagnostic.classification str BLOCKED_UNKNOWN
-      block BLOCKED_UNKNOWN "root-init-exit-${cli_rc}"
-      ;;
+    *) block CONFIG_UNKNOWN_SANITIZED classifier-schema-rejected ;;
   esac
 }
 
@@ -956,11 +1018,11 @@ record failure.detail str preterminal-state
 if [[ "$MODE" == "direct-port" ]]; then
   record result.profile str direct-docker-port-v1
 else
-  record result.profile str root-init-split-v1
-  record diagnostic.profile str root-init-split-v1
-  record source_contract.command str supabase-telemetry-status
+  record result.profile str loadconfig-services-v1
+  record diagnostic.profile str loadconfig-services-v1
+  record source_contract.command str supabase-services
   record source_contract.root_persistent_prerun bool true
-  record source_contract.load_config bool false
+  record source_contract.load_config bool true
   record source_contract.docker_access_expected bool false
   record source_contract.provider_access_enabled bool false
   record source_contract.telemetry_endpoint_enabled bool false
@@ -1016,7 +1078,7 @@ if [[ "$MODE" == "run" ]]; then
   actual_cli_binary_sha="$(sha256sum "$RUNTIME/bin/supabase" | awk '{print $1}')"
   record supabase_cli.binary_sha256 str "$actual_cli_binary_sha"
   [[ "$actual_cli_binary_sha" == "$CLI_BINARY_SHA" ]] || block CLI_BINARY_DIGEST_MISMATCH
-  run_root_init_split
+  run_loadconfig_services_split
   exit 1
 fi
 
