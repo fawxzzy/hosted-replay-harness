@@ -704,6 +704,15 @@ record failure.code str HARNESS_INTERRUPTED
 record failure.detail str preterminal-state
 if [[ "$MODE" == "direct-port" ]]; then
   record result.profile str direct-docker-port-v1
+else
+  record result.profile str status-phase-split-v1
+  record diagnostic.profile str status-phase-split-v1
+  record source_contract.command str supabase-status-ignore-health-check
+  record source_contract.status_only bool true
+  record source_contract.database_only bool true
+  record source_contract.application_migrations_enabled bool false
+  record source_contract.seed_enabled bool false
+  record source_contract.gotrue_enabled bool false
 fi
 
 python3 -B -m unittest discover -s "$ROOT/tests" -v >"$RAW/unit-tests.log" 2>&1 || block CONTRACT_TEST_FAILED
@@ -932,11 +941,9 @@ done
 set +e
 env DOCKER_HOST="unix://$DOCKER_API_SOCKET" \
   timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase" \
-  --debug \
   --workdir "$PROJECT_DIR" \
   --network-id "$NETWORK_NAME" \
-  --yes \
-  db start >"$RAW/supabase-db-start.log" 2>&1
+  status --ignore-health-check >"$RAW/supabase-status.log" 2>&1
 cli_rc="$?"
 set -e
 sleep 1
@@ -955,25 +962,26 @@ else
 fi
 record docker_api_boundary.observer_exit_code int "$docker_api_observer_rc"
 record docker_api_boundary.state_present bool "$docker_api_boundary_state_present"
-if ! python3 -B "$ROOT/scripts/classify_db_start_log.py" \
-  --input "$RAW/supabase-db-start.log" \
-  --exit-code "$cli_rc" \
-  --debug-enabled >"$DB_START_DIAGNOSTIC_FILE" 2>"$RAW/db-start-sanitizer.log"; then
-  rm -f -- "$RAW/supabase-db-start.log"
-  block DB_START_LOG_SANITIZER_FAILED
+status_raw_byte_count="$(wc -c <"$RAW/supabase-status.log" | tr -d ' ')"
+status_raw_line_count="$(wc -l <"$RAW/supabase-status.log" | tr -d ' ')"
+status_raw_sha256="$(sha256sum "$RAW/supabase-status.log" | awk '{print $1}')"
+[[ "$status_raw_byte_count" =~ ^[0-9]+$ ]] || block STATUS_LOG_SANITIZER_FAILED
+[[ "$status_raw_line_count" =~ ^[0-9]+$ ]] || block STATUS_LOG_SANITIZER_FAILED
+[[ "$status_raw_sha256" =~ ^[0-9a-f]{64}$ ]] || block STATUS_LOG_SANITIZER_FAILED
+record supabase_cli.status_diagnostic.exit_code int "$cli_rc"
+record supabase_cli.status_diagnostic.raw_byte_count int "$status_raw_byte_count"
+record supabase_cli.status_diagnostic.raw_line_count int "$status_raw_line_count"
+record supabase_cli.status_diagnostic.raw_sha256 str "$status_raw_sha256"
+if ! rm -f -- "$RAW/supabase-status.log"; then
+  block STATUS_RAW_LOG_DELETE_FAILED
 fi
-cat "$DB_START_DIAGNOSTIC_FILE" >>"$STATE_FILE"
-db_start_category="$(awk -F '\t' '$1=="supabase_cli.db_start_diagnostic.category"{print $3; exit}' "$DB_START_DIAGNOSTIC_FILE")"
-if ! rm -f -- "$RAW/supabase-db-start.log"; then
-  block DB_START_RAW_LOG_DELETE_FAILED
-fi
-[[ ! -e "$RAW/supabase-db-start.log" ]] || block DB_START_RAW_LOG_DELETE_FAILED
-record supabase_cli.db_start_diagnostic.raw_deleted bool true
-[[ "$db_start_category" =~ ^[A-Z0-9_]+$ ]] || block DB_START_LOG_SANITIZER_FAILED
+[[ ! -e "$RAW/supabase-status.log" ]] || block STATUS_RAW_LOG_DELETE_FAILED
+record supabase_cli.status_diagnostic.raw_deleted bool true
 [[ "$docker_api_boundary_state_present" == "true" ]] || block DOCKER_API_OBSERVER_STATE_MISSING
-[[ "$docker_api_observer_rc" == "0" ]] || block DOCKER_API_OBSERVER_FAILED "observer-exit-${docker_api_observer_rc}"
 [[ "$docker_api_classification" =~ ^[A-Z0-9_]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
-[[ "$cli_rc" != "124" ]] || block SUPABASE_DB_START_TIMEOUT
+[[ "$docker_api_observer_rc" == "0" || "$docker_api_observer_rc" == "2" ]] \
+  || block DOCKER_API_OBSERVER_FAILED "observer-exit-${docker_api_observer_rc}"
+[[ "$cli_rc" != "124" ]] || block STATUS_COMMAND_TIMEOUT
 if [[ "$watcher_alive" != "1" ]]; then
   if [[ -s "$VIOLATION_FILE" ]]; then
     block "$(first_observer_violation)"
@@ -1045,6 +1053,25 @@ record container_lifecycle.database.start_count int "$database_start_observation
 record container_lifecycle.gotrue_migration.create_count int "$gotrue_create_observations"
 record container_lifecycle.gotrue_migration.start_count int "$gotrue_start_observations"
 record container_lifecycle.network_id_correlated bool true
+docker_api_request_count="$(awk -F '\t' '$1=="docker_api_boundary.request_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_response_count="$(awk -F '\t' '$1=="docker_api_boundary.response_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_write_attempt_count="$(awk -F '\t' '$1=="docker_api_boundary.write_attempt_count"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_negotiation_count="$(awk -F '\t' '$1=="docker_api_boundary.phase_counts.API_NEGOTIATION"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_container_list_count="$(awk -F '\t' '$1=="docker_api_boundary.phase_counts.CONTAINER_LIST"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_unknown_phase_count="$(awk -F '\t' '$1=="docker_api_boundary.phase_counts.UNKNOWN_API_PHASE"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_read_method_count="$(awk -F '\t' '$1=="docker_api_boundary.method_class_counts.READ"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+docker_api_2xx_count="$(awk -F '\t' '$1=="docker_api_boundary.status_class_counts.2XX"{print $3; exit}' "$DOCKER_API_BOUNDARY_STATE_FILE")"
+for count in \
+  "$docker_api_request_count" \
+  "$docker_api_response_count" \
+  "$docker_api_write_attempt_count" \
+  "$docker_api_negotiation_count" \
+  "$docker_api_container_list_count" \
+  "$docker_api_unknown_phase_count" \
+  "$docker_api_read_method_count" \
+  "$docker_api_2xx_count"; do
+  [[ "$count" =~ ^[0-9]+$ ]] || block DOCKER_API_OBSERVER_STATE_INVALID
+done
 case "$event_classification" in
   OBSERVER_COVERAGE_GAP|CONTAINER_CREATE_FAILED|DATABASE_HEALTH_FAILED|GOTRUE_MIGRATION_FAILED)
     block "$event_classification" "cli-exit-${cli_rc}"
@@ -1063,9 +1090,38 @@ esac
 case "$docker_api_classification" in
   NO_DOCKER_API_REQUEST_OBSERVED|DOCKER_API_REQUESTS_OBSERVED|DOCKER_API_ERROR_RESPONSE_OBSERVED) ;;
   DOCKER_API_RESPONSE_INCOMPLETE) block DOCKER_API_OBSERVER_INCOMPLETE ;;
+  DOCKER_API_WRITE_ATTEMPT_OBSERVED) ;;
   OBSERVER_FORWARDING_FAILED) block DOCKER_API_OBSERVER_FAILED ;;
   *) block DOCKER_API_OBSERVER_STATE_INVALID ;;
 esac
+[[ "$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" ]] \
+  || block STATUS_DOCKER_MUTATION_OBSERVED
+[[ "$database_create_observations" == "0" && "$database_start_observations" == "0" ]] \
+  || block STATUS_CONTAINER_LIFECYCLE_OBSERVED
+[[ "$gotrue_create_observations" == "0" && "$gotrue_start_observations" == "0" ]] \
+  || block STATUS_CONTAINER_LIFECYCLE_OBSERVED
+if [[ "$docker_api_write_attempt_count" != "0" || "$docker_api_observer_rc" == "2" ]]; then
+  block DOCKER_API_WRITE_ATTEMPT_OBSERVED "status-exit-${cli_rc}"
+fi
+allowed_status_phase_count="$((docker_api_negotiation_count + docker_api_container_list_count))"
+[[ "$docker_api_unknown_phase_count" == "0" ]] || block STATUS_READ_ONLY_PHASE_UNEXPECTED
+[[ "$docker_api_read_method_count" == "$docker_api_request_count" ]] \
+  || block STATUS_READ_ONLY_METHOD_MISMATCH
+[[ "$allowed_status_phase_count" == "$docker_api_request_count" ]] \
+  || block STATUS_READ_ONLY_PHASE_UNEXPECTED
+if [[ "$docker_api_request_count" == "0" ]]; then
+  [[ "$docker_api_response_count" == "0" && "$docker_api_container_list_count" == "0" ]] \
+    || block STATUS_PHASE_SPLIT_UNKNOWN
+  block SHARED_INIT_BLOCKED_BEFORE_DOCKER_API "status-exit-${cli_rc}"
+fi
+if [[ "$docker_api_container_list_count" -ge 1 \
+  && "$docker_api_response_count" == "$docker_api_request_count" \
+  && "$docker_api_2xx_count" == "$docker_api_response_count" \
+  && "$docker_api_classification" == "DOCKER_API_REQUESTS_OBSERVED" ]]; then
+  block DB_START_SPECIFIC_PRE_API_BLOCKER "status-exit-${cli_rc}"
+fi
+block STATUS_PHASE_SPLIT_UNKNOWN "status-exit-${cli_rc}"
+
 if [[ "$cli_rc" != "0" ]]; then
   if [[ "$db_start_category" != "UNKNOWN_SANITIZED" ]]; then
     block "$db_start_category" "cli-exit-${cli_rc}"

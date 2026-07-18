@@ -159,7 +159,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertRegex(self.runner, r'(?s)if \[\[ "\$MODE" == "direct-port" \]\]; then\s+run_direct_port_probe\s+exit 0\s+fi')
         self.assertLess(
             self.runner.index('run_direct_port_probe\n  exit 0'),
-            self.runner.index('db start >"$RAW/supabase-db-start.log"'),
+            self.runner.index('status --ignore-health-check >"$RAW/supabase-status.log"'),
         )
         direct_function = self.runner[
             self.runner.index("run_direct_port_probe() {") : self.runner.index(
@@ -212,30 +212,52 @@ class RunnerStaticContractTests(unittest.TestCase):
             'timeout --signal=TERM --kill-after=10s 300s "$RUNTIME/bin/supabase"',
             self.runner,
         )
-        self.assertIn('block SUPABASE_DB_START_TIMEOUT', self.runner)
+        self.assertIn('block STATUS_COMMAND_TIMEOUT', self.runner)
         self.assertLess(
-            self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
+            self.runner.index('block STATUS_COMMAND_TIMEOUT'),
             self.runner.index('assert_frozen_network post_cli active'),
         )
 
-    def test_lifecycle_requires_create_and_start_for_both_roles(self) -> None:
+    def test_status_phase_split_requires_zero_lifecycle_events(self) -> None:
         for fragment in (
             'container_lifecycle.database.create_count',
             'container_lifecycle.database.start_count',
             'container_lifecycle.gotrue_migration.create_count',
             'container_lifecycle.gotrue_migration.start_count',
-            'block CONTAINER_CREATED_NOT_STARTED',
+            'block STATUS_CONTAINER_LIFECYCLE_OBSERVED',
         ):
             self.assertIn(fragment, self.runner)
         self.assertIn(
-            '"$database_create_observations" == "1" && "$database_start_observations" == "1"',
+            '"$database_create_observations" == "0" && "$database_start_observations" == "0"',
             self.runner,
         )
         self.assertIn(
-            '"$gotrue_create_observations" == "1" && "$gotrue_start_observations" == "1"',
+            '"$gotrue_create_observations" == "0" && "$gotrue_start_observations" == "0"',
             self.runner,
         )
 
+    def test_status_phase_split_has_two_exact_terminal_classes(self) -> None:
+        zero_request = self.runner.index(
+            'if [[ "$docker_api_request_count" == "0" ]]'
+        )
+        shared_init = self.runner.index(
+            'block SHARED_INIT_BLOCKED_BEFORE_DOCKER_API', zero_request
+        )
+        container_list = self.runner.index(
+            'if [[ "$docker_api_container_list_count" -ge 1', shared_init
+        )
+        db_specific = self.runner.index(
+            'block DB_START_SPECIFIC_PRE_API_BLOCKER', container_list
+        )
+        unknown = self.runner.index('block STATUS_PHASE_SPLIT_UNKNOWN', db_specific)
+        self.assertLess(zero_request, shared_init)
+        self.assertLess(shared_init, container_list)
+        self.assertLess(container_list, db_specific)
+        self.assertLess(db_specific, unknown)
+        self.assertIn(
+            '"$docker_api_2xx_count" == "$docker_api_response_count"',
+            self.runner,
+        )
     def test_pre_cleanup_network_failure_cannot_be_overwritten_by_pass(self) -> None:
         self.assertIn("network_contract_ok=1", self.runner)
         self.assertIn("network_contract_ok=0", self.runner)
@@ -252,42 +274,34 @@ class RunnerStaticContractTests(unittest.TestCase):
             2,
         )
 
-    def test_db_start_log_is_sanitized_before_failure_mapping(self) -> None:
-        classifier = 'python3 -B "$ROOT/scripts/classify_db_start_log.py"'
-        self.assertIn(classifier, self.runner)
-        self.assertEqual(self.runner.count("  --debug \\"), 1)
-        self.assertEqual(self.runner.count("  --debug-enabled"), 1)
+    def test_status_only_output_is_sanitized_and_deleted(self) -> None:
         self.assertIn("umask 077", self.runner)
-        self.assertLess(
-            self.runner.index(classifier),
-            self.runner.index('block SUPABASE_DB_START_TIMEOUT'),
-        )
-        self.assertLess(
-            self.runner.index(classifier),
-            self.runner.index('block SUPABASE_DB_START_FAILED'),
-        )
-        raw_delete = 'rm -f -- "$RAW/supabase-db-start.log"'
+        command = 'status --ignore-health-check >"$RAW/supabase-status.log" 2>&1'
+        self.assertEqual(self.runner.count(command), 1)
+        self.assertNotIn("db start", self.runner)
+        self.assertNotIn("db reset", self.runner)
+        self.assertNotIn('  --debug \\', self.runner)
+        raw_delete = 'rm -f -- "$RAW/supabase-status.log"'
         self.assertIn(raw_delete, self.runner)
-        self.assertIn("DB_START_RAW_LOG_DELETE_FAILED", self.runner)
-        self.assertIn("supabase_cli.db_start_diagnostic.raw_deleted", self.runner)
-        self.assertLess(self.runner.index(classifier), self.runner.index(raw_delete))
+        self.assertIn("STATUS_RAW_LOG_DELETE_FAILED", self.runner)
+        self.assertIn("supabase_cli.status_diagnostic.raw_deleted", self.runner)
+        self.assertIn("supabase_cli.status_diagnostic.raw_byte_count", self.runner)
+        self.assertIn("supabase_cli.status_diagnostic.raw_line_count", self.runner)
+        self.assertIn("supabase_cli.status_diagnostic.raw_sha256", self.runner)
+        self.assertLess(self.runner.index(command), self.runner.index(raw_delete))
         self.assertLess(
             self.runner.index(raw_delete), self.runner.index('EVENT_UNTIL="$((')
         )
-        self.assertNotIn('cat "$RAW/supabase-db-start.log"', self.runner)
+        self.assertNotIn('cat "$RAW/supabase-status.log"', self.runner)
         for code in (
-            "NO_DOCKER_API_REQUEST_OBSERVED",
-            "DOCKER_API_ERROR_RESPONSE_OBSERVED",
-            "DOCKER_API_BOUNDARY_OBSERVED",
-            "OTHER_PRECONTAINER_FAILURE",
+            "SHARED_INIT_BLOCKED_BEFORE_DOCKER_API",
+            "DB_START_SPECIFIC_PRE_API_BLOCKER",
+            "STATUS_PHASE_SPLIT_UNKNOWN",
         ):
             self.assertIn(f"block {code}", self.runner)
-        no_mutation = self.runner.index(
-            'if [[ "$event_classification" == "NO_DOCKER_MUTATION_OBSERVED" ]]'
-        )
         self.assertLess(
-            self.runner.index("case \"$docker_api_classification\" in", no_mutation),
-            self.runner.index("block OTHER_PRECONTAINER_FAILURE", no_mutation),
+            self.runner.index("block SHARED_INIT_BLOCKED_BEFORE_DOCKER_API"),
+            self.runner.index('if [[ "$cli_rc" != "0" ]]'),
         )
 
     def test_docker_api_observer_is_scoped_to_the_cli_child(self) -> None:
@@ -297,7 +311,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         observer_start = self.runner.index(
             'python3 -B "$ROOT/scripts/docker_api_boundary.py"'
         )
-        cli_start = self.runner.index('db start >"$RAW/supabase-db-start.log"')
+        cli_start = self.runner.index('status --ignore-health-check >"$RAW/supabase-status.log"')
         observer_stop = self.runner.index("stop_docker_api_observer", cli_start)
         self.assertLess(observer_start, cli_start)
         self.assertLess(cli_start, observer_stop)
@@ -314,6 +328,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn("DOCKER_API_OBSERVER_STATE_MISSING", self.runner)
         self.assertIn("DOCKER_API_OBSERVER_FAILED", self.runner)
         self.assertIn("DOCKER_API_RESPONSE_INCOMPLETE", self.runner)
+        self.assertIn("DOCKER_API_WRITE_ATTEMPT_OBSERVED", self.runner)
         self.assertIn("OBSERVER_FORWARDING_FAILED", self.runner)
         self.assertNotIn('cat "$RAW/docker-api-observer.log"', self.runner)
         self.assertIn('cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"', self.runner)
@@ -322,7 +337,7 @@ class RunnerStaticContractTests(unittest.TestCase):
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
         freeze = "freeze_precli_objects_and_listeners"
         boundary = 'EVENT_SINCE="$(date -u +%s)"'
-        cli_start = 'db start >"$RAW/supabase-db-start.log"'
+        cli_start = 'status --ignore-health-check >"$RAW/supabase-status.log"'
         self.assertIn(freeze, self.runner)
         self.assertIn('"$LISTENER_QUERY_BIN" -H -ltn "sport = :${port}"', self.runner)
         self.assertIn("pre_cli.packet_db_container_count", self.runner)
@@ -383,7 +398,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertNotIn('cat "$NETWORK_EVENTS_FILE" >>"$STATE_FILE"', self.runner)
         self.assertLess(
             self.runner.index(classifier),
-            self.runner.index('block SUPABASE_DB_START_FAILED'),
+            self.runner.index('block SHARED_INIT_BLOCKED_BEFORE_DOCKER_API'),
         )
 
     def test_event_classification_routes_fail_closed(self) -> None:
@@ -403,6 +418,7 @@ class RunnerStaticContractTests(unittest.TestCase):
             r"docker\s+(system|container|volume|network|image)\s+prune",
             r"docker\s+stop\s+--all",
             r"supabase\s+(login|link|pull|push|dump)\b",
+            r"\bdb\s+(start|reset)\b",
             r"--linked\b",
             r"--db-url\b",
             r"secrets:inherit",
@@ -792,6 +808,55 @@ class ResultWriterTests(unittest.TestCase):
             self.assertEqual(observed, diagnostic)
             self.assertNotIn("opaque diagnostic fixture", output.read_text(encoding="utf-8"))
 
+    def test_status_profile_replaces_historical_db_start_source_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            output = temp / "result.json"
+            state.write_text(
+                "result.profile\tstr\tstatus-phase-split-v1\n"
+                "diagnostic.profile\tstr\tstatus-phase-split-v1\n"
+                "source_contract.command\tstr\tsupabase-status-ignore-health-check\n"
+                "source_contract.status_only\tbool\ttrue\n"
+                "source_contract.database_only\tbool\ttrue\n"
+                "source_contract.application_migrations_enabled\tbool\tfalse\n"
+                "source_contract.seed_enabled\tbool\tfalse\n"
+                "source_contract.gotrue_enabled\tbool\tfalse\n",
+                encoding="utf-8",
+            )
+            audit.write_text("", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "scripts/write_result.py"),
+                    "--root",
+                    str(ROOT),
+                    "--state",
+                    str(state),
+                    "--audit",
+                    str(audit),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("result", result)
+            self.assertEqual(
+                result["diagnostic"]["profile"], "status-phase-split-v1"
+            )
+            self.assertEqual(
+                result["source_contract"]["command"],
+                "supabase-status-ignore-health-check",
+            )
+            self.assertTrue(result["source_contract"]["status_only"])
+            self.assertFalse(result["source_contract"]["gotrue_enabled"])
+            self.assertNotEqual(
+                result["source_contract"]["command"], "supabase db start"
+            )
+
 
 class DockerApiBoundaryTests(unittest.TestCase):
     class FakeReader:
@@ -860,15 +925,13 @@ class DockerApiBoundaryTests(unittest.TestCase):
         requests = docker_api_boundary.RequestParser(receipt, pending)
         responses = docker_api_boundary.ResponseParser(receipt, pending)
         request_bytes = (
-            b"POST /v1.47/volumes/create HTTP/1.1\r\n"
-            b"Transfer-Encoding: chunked\r\n\r\n"
-            b"4\r\nDATA\r\n0\r\n\r\n"
-            b"GET /v1.47/images/opaque/json HTTP/1.1\r\n\r\n"
+            b"GET /v1.47/containers/json HTTP/1.1\r\n\r\n"
+            b"HEAD /v1.47/_ping HTTP/1.1\r\n\r\n"
         )
         response_bytes = (
-            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}"
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-            b"2\r\n{}\r\n0\r\n\r\n"
+            b"2\r\n[]\r\n0\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n"
         )
         for offset in range(0, len(request_bytes), 3):
             requests.feed(request_bytes[offset : offset + 3])
@@ -877,18 +940,19 @@ class DockerApiBoundaryTests(unittest.TestCase):
         result = receipt.sanitized()
         self.assertEqual(result["request_count"], 2)
         self.assertEqual(result["response_count"], 2)
-        self.assertEqual(result["phase_counts"]["VOLUME_CREATE"], 1)
-        self.assertEqual(result["phase_counts"]["IMAGE_INSPECT"], 1)
-        self.assertEqual(result["status_code_counts"]["CODE_201"], 1)
+        self.assertEqual(result["phase_counts"]["CONTAINER_LIST"], 1)
+        self.assertEqual(result["phase_counts"]["API_NEGOTIATION"], 1)
+        self.assertEqual(result["status_code_counts"]["CODE_200"], 2)
+        self.assertEqual(result["write_attempt_count"], 0)
         self.assertEqual(result["classification"], "DOCKER_API_REQUESTS_OBSERVED")
 
-    def test_error_response_records_only_allowlisted_status(self) -> None:
+    def test_read_error_response_records_only_allowlisted_status(self) -> None:
         receipt = docker_api_boundary.Receipt()
-        receipt.request("CONTAINER_CREATE", "WRITE")
-        receipt.response("CONTAINER_CREATE", 500)
+        receipt.request("CONTAINER_LIST", "READ")
+        receipt.response("CONTAINER_LIST", 500)
         result = receipt.sanitized()
         self.assertEqual(result["classification"], "DOCKER_API_ERROR_RESPONSE_OBSERVED")
-        self.assertEqual(result["first_error_phase"], "CONTAINER_CREATE")
+        self.assertEqual(result["first_error_phase"], "CONTAINER_LIST")
         self.assertEqual(result["first_error_status_code"], 500)
         self.assertEqual(result["status_code_counts"]["CODE_500"], 1)
 
@@ -897,7 +961,7 @@ class DockerApiBoundaryTests(unittest.TestCase):
         pending: deque[tuple[str, bytes]] = deque()
         parser = docker_api_boundary.RequestParser(receipt, pending)
         sensitive = (
-            b"POST /v1.47/containers/create?token=do-not-retain HTTP/1.1\r\n"
+            b"GET /v1.47/containers/json?token=do-not-retain HTTP/1.1\r\n"
             b"Authorization: Bearer fake.jwt.value\r\n"
             b"Content-Length: 32\r\n\r\n"
             b'{"password":"do-not-retain-now"}'
@@ -914,6 +978,54 @@ class DockerApiBoundaryTests(unittest.TestCase):
             "fake.jwt.value",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_every_non_read_method_is_rejected(self) -> None:
+        cases = {
+            b"POST": "WRITE",
+            b"PUT": "WRITE",
+            b"PATCH": "WRITE",
+            b"DELETE": "DELETE",
+            b"OPTIONS": "OTHER",
+        }
+        for method, method_kind in cases.items():
+            with self.subTest(method=method):
+                receipt = docker_api_boundary.Receipt()
+                parser = docker_api_boundary.RequestParser(receipt, deque())
+                with self.assertRaises(docker_api_boundary.WriteAttemptError):
+                    parser.feed(
+                        method + b" /v1.47/containers/json HTTP/1.1\r\n\r\n"
+                    )
+                result = receipt.sanitized()
+                self.assertEqual(
+                    result["classification"],
+                    "DOCKER_API_WRITE_ATTEMPT_OBSERVED",
+                )
+                self.assertEqual(result["write_attempt_count"], 1)
+                self.assertEqual(result["method_class_counts"][method_kind], 1)
+
+    def test_write_attempt_is_not_forwarded(self) -> None:
+        async def exercise() -> tuple[bytes, object]:
+            receipt = docker_api_boundary.Receipt()
+            server = docker_api_boundary.BoundaryServer(
+                Path("packet.sock"), Path("docker.sock"), receipt
+            )
+            writer = self.FakeWriter()
+            parser = docker_api_boundary.RequestParser(receipt, deque())
+            await server.relay(
+                self.FakeReader(
+                    [b"POST /v1.47/containers/create HTTP/1.1\r\n\r\n"]
+                ),
+                writer,
+                parser,
+            )
+            return bytes(writer.data), receipt.sanitized()
+
+        forwarded, result = asyncio.run(exercise())
+        self.assertEqual(forwarded, b"")
+        self.assertEqual(result["write_attempt_count"], 1)
+        self.assertEqual(
+            result["classification"], "DOCKER_API_WRITE_ATTEMPT_OBSERVED"
+        )
 
     def test_schema_rejects_unknown_keys_types_and_values(self) -> None:
         valid = docker_api_boundary.Receipt().sanitized()

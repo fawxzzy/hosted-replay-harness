@@ -38,10 +38,15 @@ CLASSIFICATIONS: Final = (
     "DOCKER_API_REQUESTS_OBSERVED",
     "DOCKER_API_ERROR_RESPONSE_OBSERVED",
     "DOCKER_API_RESPONSE_INCOMPLETE",
+    "DOCKER_API_WRITE_ATTEMPT_OBSERVED",
     "OBSERVER_FORWARDING_FAILED",
 )
 API_PREFIX = re.compile(br"^/v[0-9]+(?:\.[0-9]+)?(?=/|$)")
 MAX_LINE: Final = 16384
+
+
+class WriteAttemptError(Exception):
+    """Stop a prohibited non-read-only request before it reaches Docker."""
 
 
 def method_class(method: bytes) -> str:
@@ -92,6 +97,7 @@ class Receipt:
         self.request_count = 0
         self.response_count = 0
         self.error_response_count = 0
+        self.write_attempt_count = 0
         self.forwarding_error_count = 0
         self.parser_error_count = 0
         self.phase_counts: Counter[str] = Counter()
@@ -126,6 +132,9 @@ class Receipt:
                 self.first_error_phase = phase
                 self.first_error_status_code = code if code in STATUS_CODES else 0
 
+    def write_attempt(self) -> None:
+        self.write_attempt_count += 1
+
     def forwarding_error(self) -> None:
         self.forwarding_error_count += 1
 
@@ -133,6 +142,8 @@ class Receipt:
         self.parser_error_count += 1
 
     def classification(self) -> str:
+        if self.write_attempt_count:
+            return "DOCKER_API_WRITE_ATTEMPT_OBSERVED"
         if self.forwarding_error_count or self.parser_error_count:
             return "OBSERVER_FORWARDING_FAILED"
         if self.request_count == 0:
@@ -151,6 +162,7 @@ class Receipt:
             "request_count": self.request_count,
             "response_count": self.response_count,
             "error_response_count": self.error_response_count,
+            "write_attempt_count": self.write_attempt_count,
             "forwarding_error_count": self.forwarding_error_count,
             "parser_error_count": self.parser_error_count,
             "first_phase": self.first_phase,
@@ -282,8 +294,12 @@ class RequestParser(HTTPFramingParser):
                     raise ValueError("invalid HTTP request line")
                 method, target = parts[0], parts[1]
                 phase = classify_path(method, target)
+                method_kind = method_class(method)
+                self.receipt.request(phase, method_kind)
+                if method_kind != "READ":
+                    self.receipt.write_attempt()
+                    raise WriteAttemptError
                 self.pending.append((phase, method))
-                self.receipt.request(phase, method_class(method))
                 self.state = "headers"
             elif self.state == "headers":
                 if line:
@@ -358,6 +374,7 @@ def validate_result(result: dict[str, object]) -> None:
         "request_count",
         "response_count",
         "error_response_count",
+        "write_attempt_count",
         "forwarding_error_count",
         "parser_error_count",
         "first_phase",
@@ -379,6 +396,7 @@ def validate_result(result: dict[str, object]) -> None:
         "request_count",
         "response_count",
         "error_response_count",
+        "write_attempt_count",
         "forwarding_error_count",
         "parser_error_count",
         "first_error_status_code",
@@ -422,6 +440,7 @@ def format_state_lines(result: dict[str, object]) -> str:
         "request_count",
         "response_count",
         "error_response_count",
+        "write_attempt_count",
         "forwarding_error_count",
         "parser_error_count",
         "first_phase",
@@ -459,6 +478,10 @@ class BoundaryServer:
                 return
             try:
                 parser.feed(data)
+            except WriteAttemptError:
+                writer.close()
+                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+                return
             except ValueError:
                 self.receipt.parser_error()
             writer.write(data)
@@ -541,6 +564,8 @@ async def async_main(args: argparse.Namespace) -> int:
             except FileNotFoundError:
                 pass
         write_state(args.state, receipt.sanitized())
+    if receipt.write_attempt_count:
+        return 2
     return 1 if receipt.forwarding_error_count or receipt.parser_error_count else 0
 
 
