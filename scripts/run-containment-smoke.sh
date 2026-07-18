@@ -64,6 +64,7 @@ RESULT_FILE="$ROOT/artifacts/containment-smoke.json"
 FIREWALL_LEDGER="$ROOT/artifacts/.firewall-ledger.json"
 FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/.firewall-rollback.tsv"
 FIREWALL_STATE_FILE="$RUNTIME/firewall-state.tsv"
+FIREWALL_PHASE_MANIFEST="$RUNTIME/firewall-phase-manifest.tsv"
 HOST_TEST_READY="$RUNTIME/host-test-listener.ready"
 WATCH_PID=""
 DOCKER_API_OBSERVER_PID=""
@@ -84,10 +85,20 @@ LISTENER_SORT_BIN="sort"
 LISTENER_COUNT_BIN="awk"
 LISTENER_HASH_BIN="sha256sum"
 SMOKE_PASSED=0
+PRECANARY_PHASE_DIAGNOSTIC_PASSED=0
 FINALIZING=0
 EXPECTED_INPUT_DENIES=0
 EXPECTED_FORWARD_DENIES=0
 EXPECTED_OUTPUT_DENIES=0
+FIREWALL_PHASE_SNAPSHOT_COUNT=0
+FIREWALL_PHASE_PREV_INPUT=0
+FIREWALL_PHASE_PREV_FORWARD=0
+FIREWALL_PHASE_PREV_OUTPUT=0
+FIREWALL_PHASE_SUM_INPUT=0
+FIREWALL_PHASE_SUM_FORWARD=0
+FIREWALL_PHASE_SUM_OUTPUT=0
+FIREWALL_FIRST_HIT_FROZEN=0
+FIREWALL_FIRST_HIT_CLASS=""
 
 CLI_VERSION="2.109.1"
 CLI_COMMIT="6d4c19870ed213ba7f682f117d0345c8a40bfa94"
@@ -990,6 +1001,10 @@ finalize() {
     if [[ "$MODE" == "direct-port" ]]; then
       record status str DIRECT_DOCKER_PORT_PATH_PASS
       final_status=DIRECT_DOCKER_PORT_PATH_PASS
+    elif [[ "$MODE" == "firewall-rehearsal" && "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" == "1" ]]; then
+      record status str PRECANARY_PHASE_DIAGNOSTIC_PASS
+      record failure json null
+      final_status=PRECANARY_PHASE_DIAGNOSTIC_PASS
     elif [[ "$MODE" == "firewall-rehearsal" ]]; then
       record status str FIREWALL_PUBLICATION_REHEARSAL_PASS
       record failure json null
@@ -1132,6 +1147,128 @@ firewall_counter_value() {
   value="$(awk -F '\t' -v key="firewall.counters.${counter}" '$1==key && $2=="int"{print $3; exit}' "$counter_file")"
   [[ "$value" =~ ^[0-9]+$ ]] || block FIREWALL_COUNTER_INVALID
   printf '%s\n' "$value"
+}
+
+firewall_phase_finish() {
+  local terminal_class="$1" manifest_count manifest_sha accounting_matches=true
+  manifest_count="$(wc -l <"$FIREWALL_PHASE_MANIFEST" | tr -d ' ')"
+  [[ "$manifest_count" =~ ^[0-9]+$ && "$manifest_count" == "$FIREWALL_PHASE_SNAPSHOT_COUNT" ]] \
+    || block FIREWALL_PHASE_MANIFEST_INVALID
+  manifest_sha="$(sha256sum <"$FIREWALL_PHASE_MANIFEST" | awk '{print $1}')"
+  [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || block FIREWALL_PHASE_MANIFEST_INVALID
+  record diagnostic.precanary.phase_manifest_count int "$manifest_count"
+  record diagnostic.precanary.phase_manifest_sha256 str "$manifest_sha"
+  record diagnostic.precanary.final_input_count int "$FIREWALL_PHASE_PREV_INPUT"
+  record diagnostic.precanary.final_forward_count int "$FIREWALL_PHASE_PREV_FORWARD"
+  record diagnostic.precanary.final_output_count int "$FIREWALL_PHASE_PREV_OUTPUT"
+  if [[ "$FIREWALL_PHASE_SUM_INPUT" != "$FIREWALL_PHASE_PREV_INPUT" \
+    || "$FIREWALL_PHASE_SUM_FORWARD" != "$FIREWALL_PHASE_PREV_FORWARD" \
+    || "$FIREWALL_PHASE_SUM_OUTPUT" != "$FIREWALL_PHASE_PREV_OUTPUT" ]]; then
+    accounting_matches=false
+  fi
+  record diagnostic.precanary.delta_sum_matches_final bool "$accounting_matches"
+  record diagnostic.precanary.terminal_class str "$terminal_class"
+  [[ "$accounting_matches" == "true" ]] || block FIREWALL_PHASE_ACCOUNTING_FAILED
+  if [[ "$terminal_class" == "PRECANARY_HIT_NOT_REPRODUCED" ]]; then
+    [[ "$manifest_count" == "10" ]] || block FIREWALL_PHASE_MANIFEST_INVALID
+    record diagnostic.precanary.complete bool true
+    PRECANARY_PHASE_DIAGNOSTIC_PASSED=1
+    SMOKE_PASSED=1
+    return 0
+  fi
+  block "$terminal_class"
+}
+
+firewall_phase_snapshot() {
+  local phase="$1" input_absolute forward_absolute output_absolute
+  local input_delta forward_delta output_delta monotonic=true chain terminal_class expected_phase
+  case "$phase" in
+    post_install|host_listener_ready|foreign_container_started|published_service_started|packet_client_started|shape_network_health_validated|publication_probes_complete|client_tool_preflight_complete|quiescence_first|quiescence_second) ;;
+    *) block FIREWALL_PHASE_ENUM_INVALID ;;
+  esac
+  case "$(( FIREWALL_PHASE_SNAPSHOT_COUNT + 1 ))" in
+    1) expected_phase=post_install ;;
+    2) expected_phase=host_listener_ready ;;
+    3) expected_phase=foreign_container_started ;;
+    4) expected_phase=published_service_started ;;
+    5) expected_phase=packet_client_started ;;
+    6) expected_phase=shape_network_health_validated ;;
+    7) expected_phase=publication_probes_complete ;;
+    8) expected_phase=client_tool_preflight_complete ;;
+    9) expected_phase=quiescence_first ;;
+    10) expected_phase=quiescence_second ;;
+    *) block FIREWALL_PHASE_ORDER_INVALID ;;
+  esac
+  [[ "$phase" == "$expected_phase" ]] || block FIREWALL_PHASE_ORDER_INVALID
+  if [[ "$FIREWALL_PHASE_SNAPSHOT_COUNT" == "0" ]]; then
+    [[ ! -e "$FIREWALL_PHASE_MANIFEST" ]] || block FIREWALL_PHASE_MANIFEST_COLLISION
+    : >"$FIREWALL_PHASE_MANIFEST"
+  fi
+  input_absolute="$(firewall_counter_value input_deny)"
+  forward_absolute="$(firewall_counter_value forward_deny)"
+  output_absolute="$(firewall_counter_value output_deny)"
+  input_delta="$(( input_absolute - FIREWALL_PHASE_PREV_INPUT ))"
+  forward_delta="$(( forward_absolute - FIREWALL_PHASE_PREV_FORWARD ))"
+  output_delta="$(( output_absolute - FIREWALL_PHASE_PREV_OUTPUT ))"
+  if (( input_delta < 0 || forward_delta < 0 || output_delta < 0 )); then
+    monotonic=false
+  fi
+  FIREWALL_PHASE_SNAPSHOT_COUNT="$(( FIREWALL_PHASE_SNAPSHOT_COUNT + 1 ))"
+  FIREWALL_PHASE_SUM_INPUT="$(( FIREWALL_PHASE_SUM_INPUT + input_delta ))"
+  FIREWALL_PHASE_SUM_FORWARD="$(( FIREWALL_PHASE_SUM_FORWARD + forward_delta ))"
+  FIREWALL_PHASE_SUM_OUTPUT="$(( FIREWALL_PHASE_SUM_OUTPUT + output_delta ))"
+  printf '%02d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$FIREWALL_PHASE_SNAPSHOT_COUNT" "$phase" \
+    "$input_absolute" "$forward_absolute" "$output_absolute" \
+    "$input_delta" "$forward_delta" "$output_delta" "$monotonic" \
+    >>"$FIREWALL_PHASE_MANIFEST"
+  record "diagnostic.precanary.phases.${phase}.index" int "$FIREWALL_PHASE_SNAPSHOT_COUNT"
+  record "diagnostic.precanary.phases.${phase}.input_absolute" int "$input_absolute"
+  record "diagnostic.precanary.phases.${phase}.forward_absolute" int "$forward_absolute"
+  record "diagnostic.precanary.phases.${phase}.output_absolute" int "$output_absolute"
+  record "diagnostic.precanary.phases.${phase}.input_delta" int "$input_delta"
+  record "diagnostic.precanary.phases.${phase}.forward_delta" int "$forward_delta"
+  record "diagnostic.precanary.phases.${phase}.output_delta" int "$output_delta"
+  record "diagnostic.precanary.phases.${phase}.monotonic" bool "$monotonic"
+  FIREWALL_PHASE_PREV_INPUT="$input_absolute"
+  FIREWALL_PHASE_PREV_FORWARD="$forward_absolute"
+  FIREWALL_PHASE_PREV_OUTPUT="$output_absolute"
+
+  if [[ "$monotonic" != "true" ]]; then
+    firewall_phase_finish FIREWALL_COUNTER_NONMONOTONIC
+    return $?
+  fi
+  if [[ "$FIREWALL_FIRST_HIT_FROZEN" == "0" ]] \
+    && (( input_delta > 0 || forward_delta > 0 || output_delta > 0 )); then
+    if (( (input_delta > 0) + (forward_delta > 0) + (output_delta > 0) > 1 )); then
+      chain=MULTIPLE
+      terminal_class=MULTICHAIN_SETUP_HIT
+    elif (( output_delta > 0 )); then
+      chain=OUTPUT
+      terminal_class=ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT
+    elif (( input_delta > 0 )); then
+      chain=INPUT
+      terminal_class=PACKET_INPUT_SETUP_HIT
+    else
+      chain=FORWARD
+      terminal_class=PACKET_FORWARD_SETUP_HIT
+    fi
+    if [[ "$phase" == "post_install" ]]; then
+      terminal_class=INSTALL_WINDOW_HIT
+    elif [[ "$phase" == "quiescence_first" || "$phase" == "quiescence_second" ]]; then
+      terminal_class=QUIESCENCE_HIT
+    fi
+    FIREWALL_FIRST_HIT_FROZEN=1
+    FIREWALL_FIRST_HIT_CLASS="$terminal_class"
+    record diagnostic.precanary.first_hit_phase str "$phase"
+    record diagnostic.precanary.first_hit_chain str "$chain"
+    record diagnostic.precanary.first_hit_input_delta int "$input_delta"
+    record diagnostic.precanary.first_hit_forward_delta int "$forward_delta"
+    record diagnostic.precanary.first_hit_output_delta int "$output_delta"
+    record diagnostic.precanary.first_hit_monotonic bool true
+    firewall_phase_finish "$terminal_class"
+    return $?
+  fi
 }
 
 expect_firewall_block() {
@@ -1311,6 +1448,7 @@ run_firewall_publication_rehearsal() {
     }
   cat "$firewall_install_state" >>"$STATE_FILE"
   record firewall.active_before_first_container bool true
+  firewall_phase_snapshot post_install
 
   python3 -B -c '
 import pathlib, socket, sys
@@ -1335,6 +1473,7 @@ while True:
     sleep 0.1
   done
   [[ -f "$HOST_TEST_READY" ]] || block HOST_TEST_LISTENER_UNAVAILABLE
+  firewall_phase_snapshot host_listener_ready
 
   db_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" \
     || block DIRECT_CREDENTIAL_GENERATION_FAILED
@@ -1361,6 +1500,7 @@ while True:
     --env POSTGRES_PASSWORD \
     "$POSTGRES_PULL" 2>"$RAW/foreign-container-create.log")" \
     || block FOREIGN_CANARY_CONTAINER_CREATE_FAILED
+  firewall_phase_snapshot foreign_container_started
 
   service_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
     --pull=never \
@@ -1382,6 +1522,7 @@ while True:
     --env POSTGRES_PASSWORD \
     "$POSTGRES_PULL" 2>"$RAW/firewall-container-create.log")" \
     || block FIREWALL_SERVICE_CONTAINER_CREATE_FAILED
+  firewall_phase_snapshot published_service_started
   unset POSTGRES_PASSWORD db_password
 
   client_id="$(timeout --signal=TERM --kill-after=5s 30s docker run -d \
@@ -1396,6 +1537,7 @@ while True:
     --tmpfs "/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=64m" \
     "$POSTGRES_PULL" sleep 300 2>"$RAW/firewall-client-create.log")" \
     || block FIREWALL_CLIENT_CONTAINER_CREATE_FAILED
+  firewall_phase_snapshot packet_client_started
 
   validate_unpublished_container "$client_id" "$NETWORK_ID" 64m FIREWALL_CLIENT
   validate_unpublished_container "$foreign_id" bridge 1g FOREIGN_CANARY
@@ -1403,6 +1545,7 @@ while True:
   wait_healthy_container "$foreign_id" FOREIGN_CANARY_NOT_HEALTHY
   wait_healthy_container "$service_id" FIREWALL_SERVICE_NOT_HEALTHY
   assert_frozen_network rehearsal_active active
+  firewall_phase_snapshot shape_network_health_validated
 
   set +e
   python3 -B "$ROOT/scripts/direct_port_probe.py" \
@@ -1424,6 +1567,7 @@ while True:
     [[ "$failure_code" =~ ^[A-Z0-9_]+$ ]] || failure_code=FIREWALL_PORT_PROBE_FAILED
     block "$failure_code"
   fi
+  firewall_phase_snapshot publication_probes_complete
 
   docker exec "$client_id" bash -ceu '
     command -v ip >/dev/null
@@ -1434,12 +1578,13 @@ while True:
     test -n "$(ip -4 route show default)"
   ' >"$RAW/firewall-client-preflight.log" 2>&1 || block FIREWALL_CLIENT_TOOLING_MISMATCH
   record network.default_route_present bool true
+  firewall_phase_snapshot client_tool_preflight_complete
+  firewall_phase_snapshot quiescence_first
+  sleep 2
+  firewall_phase_snapshot quiescence_second
+  firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED
+  return 0
 
-  input_before="$(firewall_counter_value input_deny)"
-  forward_before="$(firewall_counter_value forward_deny)"
-  output_before="$(firewall_counter_value output_deny)"
-  [[ "$input_before" == "0" && "$forward_before" == "0" && "$output_before" == "0" ]] \
-    || block FIREWALL_UNEXPECTED_PRECANARY_HIT
   docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME" \
     >"$RAW/same-network-resolution.log" 2>&1 || block SAME_NETWORK_SERVICE_DISCOVERY_FAILED
   input_after="$(firewall_counter_value input_deny)"

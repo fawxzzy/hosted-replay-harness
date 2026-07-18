@@ -4032,6 +4032,71 @@ def owned_firewall_entries() -> list[dict]:
 
 
 class FirewallBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _phase_contract_functions() -> str:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        start = runner.index("firewall_phase_finish() {")
+        end = runner.index("\nexpect_firewall_block() {", start)
+        return runner[start:end]
+
+    def _run_phase_contract(
+        self,
+        snapshots: list[tuple[str, int, int, int]],
+        *,
+        complete: bool = False,
+        defer_finish: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            calls = "\n".join(
+                f"CURRENT_INPUT={input_count}; CURRENT_FORWARD={forward_count}; "
+                f"CURRENT_OUTPUT={output_count}; firewall_phase_snapshot {shlex.quote(phase)}"
+                for phase, input_count, forward_count, output_count in snapshots
+            )
+            override = ""
+            if defer_finish:
+                override = "firewall_phase_finish() { printf 'FINISH:%s\\n' \"$1\"; }"
+            finish = "firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED" if complete else ""
+            script = f"""set -Eeuo pipefail
+FIREWALL_PHASE_MANIFEST={shlex.quote(str(Path(directory) / 'manifest.tsv'))}
+FIREWALL_PHASE_SNAPSHOT_COUNT=0
+FIREWALL_PHASE_PREV_INPUT=0
+FIREWALL_PHASE_PREV_FORWARD=0
+FIREWALL_PHASE_PREV_OUTPUT=0
+FIREWALL_PHASE_SUM_INPUT=0
+FIREWALL_PHASE_SUM_FORWARD=0
+FIREWALL_PHASE_SUM_OUTPUT=0
+FIREWALL_FIRST_HIT_FROZEN=0
+FIREWALL_FIRST_HIT_CLASS=""
+PRECANARY_PHASE_DIAGNOSTIC_PASSED=0
+SMOKE_PASSED=0
+CURRENT_INPUT=0
+CURRENT_FORWARD=0
+CURRENT_OUTPUT=0
+firewall_counter_value() {{
+  case "$1" in
+    input_deny) printf '%s\\n' "$CURRENT_INPUT" ;;
+    forward_deny) printf '%s\\n' "$CURRENT_FORWARD" ;;
+    output_deny) printf '%s\\n' "$CURRENT_OUTPUT" ;;
+  esac
+}}
+record() {{ printf 'RECORD:%s:%s:%s\\n' "$1" "$2" "$3"; }}
+block() {{ printf 'BLOCK:%s\\n' "$1"; exit 91; }}
+{self._phase_contract_functions()}
+{override}
+{calls}
+{finish}
+printf 'FIRST:%s:%s\\n' "$FIREWALL_FIRST_HIT_CLASS" "$FIREWALL_FIRST_HIT_FROZEN"
+printf 'PASS:%s:%s\\n' "$PRECANARY_PHASE_DIAGNOSTIC_PASSED" "$SMOKE_PASSED"
+"""
+            return subprocess.run(
+                [bash_executable()],
+                input=script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+
     def test_rule_batch_is_packet_scoped_ordered_and_never_broad(self) -> None:
         batch = firewall_boundary.build_batch(
             firewall_boundary.TABLE, "br-fpro001", "172.31.253.0/24"
@@ -4156,10 +4221,189 @@ class FirewallBoundaryTests(unittest.TestCase):
         )
         self.assertIn('docker exec "$client_id" getent ahostsv4 "$FIREWALL_DB_NAME"', runner)
         self.assertIn("record canaries.firewall.same_network_resolution bool true", runner)
-        self.assertIn('output_before="$(firewall_counter_value output_deny)"', runner)
+        self.assertIn('output_absolute="$(firewall_counter_value output_deny)"', runner)
+        self.assertIn(
+            'before_output="$(firewall_counter_value output_deny)"', runner
+        )
         self.assertIn('record firewall.final_output_deny_count int "$output_after"', runner)
         self.assertNotIn('expect_firewall_block external_dns forward_deny', runner)
         self.assertNotIn('cat "$RAW/canary-', runner)
+
+    def test_precanary_phase_order_is_complete_and_stops_before_canaries(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        rehearsal = runner[
+            runner.index("run_firewall_publication_rehearsal() {") : runner.index(
+                "packet_object_counts() {"
+            )
+        ]
+        phases = (
+            "post_install",
+            "host_listener_ready",
+            "foreign_container_started",
+            "published_service_started",
+            "packet_client_started",
+            "shape_network_health_validated",
+            "publication_probes_complete",
+            "client_tool_preflight_complete",
+            "quiescence_first",
+            "quiescence_second",
+        )
+        positions = [rehearsal.index(f"firewall_phase_snapshot {phase}") for phase in phases]
+        self.assertEqual(positions, sorted(positions))
+        finish = rehearsal.index("firewall_phase_finish PRECANARY_HIT_NOT_REPRODUCED")
+        stop = rehearsal.index("return 0", finish)
+        same_network = rehearsal.index('docker exec "$client_id" getent ahostsv4')
+        self.assertLess(positions[-1], finish)
+        self.assertLess(finish, stop)
+        self.assertLess(stop, same_network)
+        self.assertIn("sleep 2\n  firewall_phase_snapshot quiescence_second", rehearsal)
+        self.assertIn("PRECANARY_PHASE_DIAGNOSTIC_PASS", runner)
+        self.assertNotIn("FIREWALL_PHASE_DIAGNOSTIC_MODE=", runner)
+
+    def test_precanary_phase_classifier_covers_every_phase_and_chain(self) -> None:
+        phases = (
+            "post_install",
+            "host_listener_ready",
+            "foreign_container_started",
+            "published_service_started",
+            "packet_client_started",
+            "shape_network_health_validated",
+            "publication_probes_complete",
+            "client_tool_preflight_complete",
+            "quiescence_first",
+            "quiescence_second",
+        )
+        chain_counts = {
+            "INPUT": (1, 0, 0),
+            "FORWARD": (0, 1, 0),
+            "OUTPUT": (0, 0, 1),
+            "MULTIPLE": (1, 1, 0),
+        }
+        for phase_index, phase in enumerate(phases):
+            for chain, counts in chain_counts.items():
+                with self.subTest(phase=phase, chain=chain):
+                    snapshots = [(name, 0, 0, 0) for name in phases[:phase_index]]
+                    snapshots.append((phase, *counts))
+                    result = self._run_phase_contract(snapshots)
+                    self.assertEqual(result.returncode, 91, result.stderr)
+                    expected = {
+                        "post_install": "INSTALL_WINDOW_HIT",
+                        "quiescence_first": "QUIESCENCE_HIT",
+                        "quiescence_second": "QUIESCENCE_HIT",
+                    }.get(
+                        phase,
+                        {
+                            "INPUT": "PACKET_INPUT_SETUP_HIT",
+                            "FORWARD": "PACKET_FORWARD_SETUP_HIT",
+                            "OUTPUT": "ROOT_DNS_OUTPUT_SETUP_OR_AMBIENT_HIT",
+                            "MULTIPLE": "MULTICHAIN_SETUP_HIT",
+                        }[chain],
+                    )
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(lines[-1], f"BLOCK:{expected}")
+                    self.assertIn(
+                        f"RECORD:diagnostic.precanary.first_hit_phase:str:{phase}", lines
+                    )
+                    self.assertIn(
+                        f"RECORD:diagnostic.precanary.first_hit_chain:str:{chain}", lines
+                    )
+                    terminal_index = lines.index(
+                        f"RECORD:diagnostic.precanary.terminal_class:str:{expected}"
+                    )
+                    self.assertLess(terminal_index, len(lines) - 1)
+                    self.assertTrue(
+                        any(
+                            line.startswith(
+                                "RECORD:diagnostic.precanary.phase_manifest_sha256:str:"
+                            )
+                            for line in lines[:terminal_index]
+                        )
+                    )
+
+    def test_precanary_phase_classifier_rejects_negative_delta_and_freezes_first_hit(self) -> None:
+        snapshots = [
+            ("post_install", 0, 0, 0),
+            ("host_listener_ready", 1, 0, 0),
+            ("foreign_container_started", 1, 0, 1),
+            ("published_service_started", 0, 0, 1),
+        ]
+        result = self._run_phase_contract(snapshots, defer_finish=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.count(
+                "RECORD:diagnostic.precanary.first_hit_phase:str:host_listener_ready"
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "RECORD:diagnostic.precanary.first_hit_phase:str:foreign_container_started",
+            result.stdout,
+        )
+        self.assertIn("FINISH:FIREWALL_COUNTER_NONMONOTONIC", result.stdout)
+        self.assertIn("FIRST:PACKET_INPUT_SETUP_HIT:1", result.stdout)
+
+    def test_precanary_phase_classifier_accepts_only_complete_stable_zero_manifest(self) -> None:
+        phases = (
+            "post_install",
+            "host_listener_ready",
+            "foreign_container_started",
+            "published_service_started",
+            "packet_client_started",
+            "shape_network_health_validated",
+            "publication_probes_complete",
+            "client_tool_preflight_complete",
+            "quiescence_first",
+            "quiescence_second",
+        )
+        snapshots = [(phase, 0, 0, 0) for phase in phases]
+        first = self._run_phase_contract(snapshots, complete=True)
+        second = self._run_phase_contract(snapshots, complete=True)
+        for result in (first, second):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "RECORD:diagnostic.precanary.terminal_class:str:PRECANARY_HIT_NOT_REPRODUCED",
+                result.stdout,
+            )
+            self.assertIn("RECORD:diagnostic.precanary.phase_manifest_count:int:10", result.stdout)
+            self.assertIn("RECORD:diagnostic.precanary.delta_sum_matches_final:bool:true", result.stdout)
+            self.assertIn("PASS:1:1", result.stdout)
+        digest_pattern = re.compile(
+            r"RECORD:diagnostic\.precanary\.phase_manifest_sha256:str:([0-9a-f]{64})"
+        )
+        self.assertEqual(
+            digest_pattern.search(first.stdout).group(1),
+            digest_pattern.search(second.stdout).group(1),
+        )
+        missing = self._run_phase_contract(snapshots[:-1], complete=True)
+        self.assertEqual(missing.returncode, 91, missing.stderr)
+        self.assertIn("BLOCK:FIREWALL_PHASE_MANIFEST_INVALID", missing.stdout)
+
+    def test_precanary_phase_receipt_is_closed_and_never_resets_counters(self) -> None:
+        runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
+        functions = self._phase_contract_functions()
+        for field in (
+            "input_absolute",
+            "forward_absolute",
+            "output_absolute",
+            "input_delta",
+            "forward_delta",
+            "output_delta",
+            "monotonic",
+        ):
+            self.assertIn(f".${{phase}}.{field}", functions)
+        self.assertNotIn("reset counters", functions.lower())
+        self.assertNotIn("nft reset", functions.lower())
+        self.assertNotIn("cat \"$RAW", functions)
+        for forbidden in (
+            "POSTGRES_PASSWORD",
+            "docker inspect",
+            "nft-rule",
+            "environment",
+            "connection string",
+        ):
+            self.assertNotIn(forbidden, functions)
+        self.assertIn("cleanup_exact", runner)
+        self.assertIn('firewall_boundary.py" remove', runner)
 
     def test_gateway_canary_records_complete_sanitized_evidence_before_classification(self) -> None:
         runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(encoding="utf-8")
