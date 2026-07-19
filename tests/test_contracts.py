@@ -5171,6 +5171,211 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                         probe.verify_container_contract()
                 self.assertEqual(raised.exception.code, "PRIVATE_CONTAINER_CONTRACT_INVALID")
 
+    def probe_fixture(self, runtime: Path | None = None) -> object:
+        args = mock.Mock(
+            runtime=runtime or Path("/packet/private-netns"),
+            workspace_root=Path("/packet"),
+            packet="FP-TEST-PACKET",
+            listen_port=59422,
+        )
+        probe = private_netns_probe.Probe(args)
+        probe.service_id = "a" * 64
+        probe.client_id = "b" * 64
+        return probe
+
+    def test_network_denial_requires_exact_attempt_and_denied_result(self) -> None:
+        probe = self.probe_fixture()
+        denied = subprocess.CompletedProcess(
+            [], 0, b"FP_CANARY_ATTEMPTED\nFP_CANARY_RESULT:1\n", b""
+        )
+        with mock.patch.object(private_netns_probe, "run_command", return_value=denied):
+            probe.exec_network_denial("fixed-command", frozenset({1, 124}), "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+        reachable = subprocess.CompletedProcess(
+            [], 0, b"FP_CANARY_ATTEMPTED\nFP_CANARY_RESULT:0\n", b""
+        )
+        with mock.patch.object(private_netns_probe, "run_command", return_value=reachable):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.exec_network_denial("fixed-command", frozenset({1, 124}), "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+        self.assertEqual(raised.exception.code, "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+
+    def test_network_denial_rejects_missing_tool_runtime_timeout_and_malformed_evidence(self) -> None:
+        probe = self.probe_fixture()
+        missing = subprocess.CompletedProcess([], 127, b"", b"")
+        with mock.patch.object(private_netns_probe, "run_command", return_value=missing):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.preflight_canary_tools()
+        self.assertEqual(raised.exception.code, "PRIVATE_CANARY_TOOL_MISSING")
+
+        cases = (
+            (
+                "runtime",
+                subprocess.CompletedProcess([], 125, b"", b""),
+                "PRIVATE_CANARY_RUNTIME_FAILED",
+            ),
+            (
+                "unexpected-result",
+                subprocess.CompletedProcess([], 0, b"FP_CANARY_ATTEMPTED\nFP_CANARY_RESULT:125\n", b""),
+                "PRIVATE_CANARY_RUNTIME_FAILED",
+            ),
+            (
+                "malformed",
+                subprocess.CompletedProcess([], 0, b"FP_CANARY_RESULT:1\n", b""),
+                "PRIVATE_CANARY_EVIDENCE_INVALID",
+            ),
+        )
+        for name, result, expected in cases:
+            with self.subTest(name=name):
+                with mock.patch.object(private_netns_probe, "run_command", return_value=result):
+                    with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                        probe.exec_network_denial("fixed-command", frozenset({1, 124}), "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+                self.assertEqual(raised.exception.code, expected)
+        with mock.patch.object(
+            private_netns_probe,
+            "run_command",
+            side_effect=subprocess.TimeoutExpired(["docker", "exec"], 10),
+        ):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.exec_network_denial("fixed-command", frozenset({1, 124}), "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+        self.assertEqual(raised.exception.code, "PRIVATE_CANARY_RUNTIME_FAILED")
+
+    def test_canary_preflight_proves_the_same_internal_dns_tcp_timeout_and_ping_paths(self) -> None:
+        probe = self.probe_fixture()
+        success = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(
+            private_netns_probe, "run_command", side_effect=[success, success]
+        ) as runner:
+            probe.preflight_canary_tools()
+        rendered = "\n".join(" ".join(call.args[0]) for call in runner.call_args_list)
+        for fragment in ("command -v", "getent hosts", "/dev/tcp/", "timeout 3", "ping -c 1"):
+            self.assertIn(fragment, rendered)
+        failed_resolution = subprocess.CompletedProcess([], 2, b"", b"")
+        with mock.patch.object(
+            private_netns_probe,
+            "run_command",
+            side_effect=[success, failed_resolution],
+        ):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.preflight_canary_tools()
+        self.assertEqual(raised.exception.code, "PRIVATE_INTERCONTAINER_FAILED")
+
+    def test_every_private_cleanup_command_failure_continues_later_teardown(self) -> None:
+        actions = (
+            "REMOVE_CLIENT",
+            "REMOVE_SERVICE",
+            "REMOVE_NETWORK",
+            "REMOVE_IMAGE",
+            "QUERY_CONTAINERS",
+            "QUERY_VOLUMES",
+            "QUERY_NETWORKS",
+            "QUERY_IMAGES",
+            "DELETE_NETNS",
+            "QUERY_NETNS",
+        )
+        for failure_kind in ("timeout", "error"):
+            for failure_index, expected_action in enumerate(actions):
+                with self.subTest(kind=failure_kind, action=expected_action):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        runtime = Path(temporary) / "private-netns"
+                        runtime.mkdir()
+                        probe = self.probe_fixture(runtime)
+                        probe.private_image_id = "c" * 64
+                        probe.netns_created = True
+                        probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+                        probe.host_link_pre = "f" * 64
+                        calls: list[list[str]] = []
+
+                        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                            index = len(calls)
+                            calls.append(command)
+                            if index == failure_index:
+                                if failure_kind == "timeout":
+                                    raise subprocess.TimeoutExpired(command, 10)
+                                return subprocess.CompletedProcess(command, 1, b"", b"")
+                            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                        with mock.patch.object(Path, "is_socket", lambda path: path.name == "docker.sock"):
+                            with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
+                                with mock.patch.object(
+                                    probe,
+                                    "host_firewall_snapshot",
+                                    return_value=probe.host_firewall_pre,
+                                ):
+                                    with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                                        cleanup_ok = probe.cleanup()
+                        self.assertFalse(cleanup_ok)
+                        self.assertEqual(len(calls), len(actions))
+                        self.assertEqual(probe.cleanup_failures, [expected_action])
+                        self.assertEqual(
+                            probe.receipt["diagnostic.private_netns.cleanup.command_failure_count"], 1
+                        )
+                        self.assertEqual(
+                            probe.receipt["diagnostic.private_netns.cleanup.namespaces_remaining"],
+                            1 if expected_action == "QUERY_NETNS" else 0,
+                        )
+                        self.assertFalse(runtime.exists())
+                        self.assertEqual(
+                            probe.receipt["diagnostic.private_netns.host_links.final_sha256"],
+                            probe.host_link_pre,
+                        )
+
+    def test_unexpected_cleanup_timeout_still_publishes_blocked_receipt(self) -> None:
+        class TimeoutCleanupProbe(private_netns_probe.Probe):
+            def execute(self) -> None:
+                return None
+
+            def cleanup(self) -> bool:
+                self.receipt["diagnostic.private_netns.cleanup.attempted"] = True
+                raise subprocess.TimeoutExpired(["docker", "rm"], 20)
+
+        args = mock.Mock(
+            runtime=Path("/packet/private-netns"),
+            workspace_root=Path("/packet"),
+            packet="FP-TEST-PACKET",
+            listen_port=59422,
+        )
+        with mock.patch.object(private_netns_probe, "Probe", TimeoutCleanupProbe):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                rc = private_netns_probe.run_probe(args)
+        self.assertEqual(rc, 1)
+        receipt = private_netns_probe.parse_receipt(stdout.getvalue().encode())
+        self.assertEqual(
+            receipt["diagnostic.private_netns.classification"],
+            private_netns_probe.REJECT_CLASS,
+        )
+        self.assertEqual(
+            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_CLEANUP_FAILED"
+        )
+        self.assertEqual(
+            receipt["diagnostic.private_netns.cleanup.command_failure_count"], 1
+        )
+
+    def test_daemon_stop_timeout_is_recorded_even_when_kill_completes(self) -> None:
+        class TimeoutProcess:
+            def __init__(self) -> None:
+                self.wait_count = 0
+                self.killed = False
+
+            def poll(self) -> None:
+                return None
+
+            def send_signal(self, _signal: int) -> None:
+                return None
+
+            def wait(self, timeout: int) -> int:
+                self.wait_count += 1
+                if self.wait_count == 1:
+                    raise subprocess.TimeoutExpired(["dockerd"], timeout)
+                return 0
+
+            def kill(self) -> None:
+                self.killed = True
+
+        probe = self.probe_fixture()
+        process = TimeoutProcess()
+        self.assertFalse(probe.stop_process("STOP_DOCKERD", process))
+        self.assertTrue(process.killed)
+        self.assertEqual(probe.cleanup_failures, ["STOP_DOCKERD"])
+
     def test_firewall_digests_ignore_only_admitted_volatile_fields(self) -> None:
         first = {
             "nftables": [

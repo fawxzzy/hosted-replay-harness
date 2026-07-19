@@ -78,6 +78,9 @@ FAILURE_CODES = frozenset(
         "PRIVATE_NAMESPACE_IDENTITY_FAILED",
         "PRIVATE_CGROUP_OWNERSHIP_FAILED",
         "PRIVATE_INTERCONTAINER_FAILED",
+        "PRIVATE_CANARY_TOOL_MISSING",
+        "PRIVATE_CANARY_RUNTIME_FAILED",
+        "PRIVATE_CANARY_EVIDENCE_INVALID",
         "PRIVATE_DEFAULT_ROUTE_PRESENT",
         "PRIVATE_EXTERNAL_DNS_SUCCEEDED",
         "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED",
@@ -153,6 +156,8 @@ FIELD_SPECS: tuple[tuple[str, str], ...] = (
     ("diagnostic.private_netns.host_links.veth_created", "bool"),
     ("diagnostic.private_netns.cleanup.attempted", "bool"),
     ("diagnostic.private_netns.cleanup.succeeded", "bool"),
+    ("diagnostic.private_netns.cleanup.command_failure_count", "int"),
+    ("diagnostic.private_netns.cleanup.failure_manifest_sha256", "str"),
     ("diagnostic.private_netns.cleanup.containers_remaining", "int"),
     ("diagnostic.private_netns.cleanup.images_remaining", "int"),
     ("diagnostic.private_netns.cleanup.volumes_remaining", "int"),
@@ -560,6 +565,7 @@ class Probe:
         self.service_id = ""
         self.client_id = ""
         self.private_image_id = ""
+        self.cleanup_failures: list[str] = []
 
     @property
     def docker_host(self) -> str:
@@ -1104,25 +1110,111 @@ class Probe:
         self.receipt["diagnostic.private_netns.network.exact_attachment"] = True
         self.receipt["diagnostic.private_netns.network.container_security"] = True
 
-    def exec_expect_failure(self, script: str, code: str) -> None:
-        result = run_command([*self.docker, "exec", self.client_id, "bash", "-ceu", script], timeout=10, env=self.private_env)
-        if result.returncode == 0:
-            self.fail(code)
+    def preflight_canary_tools(self) -> None:
+        script = "for tool in timeout getent ip ping pg_isready; do command -v \"$tool\" >/dev/null || exit 127; done"
+        try:
+            result = run_command(
+                [*self.docker, "exec", self.client_id, "bash", "-ceu", script],
+                timeout=10,
+                env=self.private_env,
+            )
+        except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        if result.returncode == 127:
+            self.fail("PRIVATE_CANARY_TOOL_MISSING")
+        if result.returncode != 0 or result.stdout or result.stderr:
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        try:
+            internal_dns = run_command(
+                [
+                    *self.docker,
+                    "exec",
+                    self.client_id,
+                    "bash",
+                    "-ceu",
+                    (
+                        f"getent hosts {SERVICE_NAME} >/dev/null"
+                        f" && timeout 3 bash -c '</dev/tcp/{SERVICE_NAME}/5432'"
+                        f" && timeout 3 ping -c 1 -W 1 {SERVICE_NAME} >/dev/null"
+                    ),
+                ],
+                timeout=10,
+                env=self.private_env,
+            )
+        except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        if internal_dns.returncode != 0 or internal_dns.stdout or internal_dns.stderr:
+            self.fail("PRIVATE_INTERCONTAINER_FAILED")
+
+    def exec_network_denial(self, command: str, denied_codes: frozenset[int], reachable_code: str) -> None:
+        script = (
+            "printf 'FP_CANARY_ATTEMPTED\\n'; set +e; "
+            f"{command} >/dev/null 2>&1; canary_rc=$?; set -e; "
+            "printf 'FP_CANARY_RESULT:%s\\n' \"$canary_rc\""
+        )
+        try:
+            result = run_command(
+                [*self.docker, "exec", self.client_id, "bash", "-ceu", script],
+                timeout=10,
+                env=self.private_env,
+            )
+        except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        if result.returncode != 0 or result.stderr:
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        matched = re.fullmatch(rb"FP_CANARY_ATTEMPTED\nFP_CANARY_RESULT:([0-9]{1,3})\n", result.stdout)
+        if matched is None:
+            self.fail("PRIVATE_CANARY_EVIDENCE_INVALID")
+        command_rc = int(matched.group(1))
+        if command_rc == 0:
+            self.fail(reachable_code)
+        if command_rc not in denied_codes:
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
 
     def run_network_canaries(self) -> None:
-        route = run_command([*self.docker, "exec", self.client_id, "bash", "-ceu", 'test -z "$(ip -4 route show default)"'], env=self.private_env)
-        if route.returncode != 0:
+        self.preflight_canary_tools()
+        try:
+            route = run_command(
+                [*self.docker, "exec", self.client_id, "bash", "-ceu", 'test -z "$(ip -4 route show default)"'],
+                timeout=10,
+                env=self.private_env,
+            )
+        except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
+        if route.returncode == 1 and not route.stdout and not route.stderr:
             self.fail("PRIVATE_DEFAULT_ROUTE_PRESENT")
+        if route.returncode != 0 or route.stdout or route.stderr:
+            self.fail("PRIVATE_CANARY_RUNTIME_FAILED")
         self.receipt["diagnostic.private_netns.isolation.no_default_route"] = True
-        self.exec_expect_failure("timeout 5 getent ahostsv4 example.com >/dev/null 2>&1", "PRIVATE_EXTERNAL_DNS_SUCCEEDED")
+        self.exec_network_denial(
+            "timeout 5 getent ahostsv4 example.com",
+            frozenset({2, 124}),
+            "PRIVATE_EXTERNAL_DNS_SUCCEEDED",
+        )
         self.receipt["diagnostic.private_netns.network.external_dns_failed"] = True
-        self.exec_expect_failure("timeout 3 bash -c '</dev/tcp/1.1.1.1/443' >/dev/null 2>&1", "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED")
+        self.exec_network_denial(
+            "timeout 3 bash -c '</dev/tcp/1.1.1.1/443'",
+            frozenset({1, 124}),
+            "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED",
+        )
         self.receipt["diagnostic.private_netns.network.literal_ip_failed"] = True
-        self.exec_expect_failure("timeout 3 bash -c '</dev/tcp/169.254.169.254/80' >/dev/null 2>&1", "PRIVATE_METADATA_EGRESS_SUCCEEDED")
+        self.exec_network_denial(
+            "timeout 3 bash -c '</dev/tcp/169.254.169.254/80'",
+            frozenset({1, 124}),
+            "PRIVATE_METADATA_EGRESS_SUCCEEDED",
+        )
         self.receipt["diagnostic.private_netns.network.metadata_failed"] = True
-        self.exec_expect_failure(f"timeout 3 ping -c 1 -W 1 {PRIVATE_GATEWAY} >/dev/null 2>&1", "PRIVATE_GATEWAY_REACHABLE")
+        self.exec_network_denial(
+            f"timeout 3 ping -c 1 -W 1 {PRIVATE_GATEWAY}",
+            frozenset({1, 124}),
+            "PRIVATE_GATEWAY_REACHABLE",
+        )
         self.receipt["diagnostic.private_netns.network.gateway_failed"] = True
-        self.exec_expect_failure("timeout 5 bash -c '</dev/tcp/registry-1.docker.io/443' >/dev/null 2>&1", "PRIVATE_REGISTRY_ACCESS_SUCCEEDED")
+        self.exec_network_denial(
+            "timeout 5 bash -c '</dev/tcp/registry-1.docker.io/443'",
+            frozenset({1, 124}),
+            "PRIVATE_REGISTRY_ACCESS_SUCCEEDED",
+        )
         self.receipt["diagnostic.private_netns.network.registry_failed"] = True
 
     def service_ip(self) -> str:
@@ -1173,7 +1265,7 @@ class Probe:
         for address in self.host_nonloopback_addresses():
             try:
                 connection = socket.create_connection((address, self.args.listen_port), timeout=0.3)
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
             connection.close()
             self.fail("PRIVATE_NONLOOPBACK_REACHABLE")
@@ -1198,54 +1290,103 @@ class Probe:
         self.run_network_canaries()
         self.verify_loopback_proxy()
 
-    def private_query_count(self, command: list[str]) -> int:
+    def record_cleanup_failure(self, action: str) -> None:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", action):
+            action = "UNEXPECTED_CLEANUP"
+        self.cleanup_failures.append(action)
+
+    def cleanup_command(
+        self,
+        action: str,
+        command: list[str],
+        *,
+        timeout: float = 10,
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        try:
+            result = run_command(command, timeout=timeout, env=self.private_env)
+        except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+            self.record_cleanup_failure(action)
+            return None
+        if result.returncode != 0:
+            self.record_cleanup_failure(action)
+            return None
+        return result
+
+    def private_query_count(self, action: str, command: list[str]) -> int:
         if not (self.runtime / "docker.sock").is_socket():
             return 0
-        result = run_command([*self.docker, *command], timeout=10, env=self.private_env)
-        if result.returncode != 0:
+        result = self.cleanup_command(action, [*self.docker, *command])
+        if result is None:
             return 1
         return len([line for line in result.stdout.splitlines() if line])
 
-    def stop_process(self, process: subprocess.Popen[bytes] | None) -> None:
+    def stop_process(self, action: str, process: subprocess.Popen[bytes] | None) -> bool:
         if process is None or process.poll() is not None:
-            return
-        process.send_signal(signal.SIGTERM)
+            return True
         try:
+            process.send_signal(signal.SIGTERM)
             process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            self.record_cleanup_failure(action)
             try:
+                process.kill()
                 process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+                return False
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+
+    def finalize_cleanup_failures(self) -> None:
+        payload = ("\n".join(self.cleanup_failures) + ("\n" if self.cleanup_failures else "")).encode()
+        self.receipt["diagnostic.private_netns.cleanup.command_failure_count"] = len(self.cleanup_failures)
+        self.receipt["diagnostic.private_netns.cleanup.failure_manifest_sha256"] = sha256_bytes(payload)
 
     def cleanup(self) -> bool:
         self.receipt["diagnostic.private_netns.cleanup.attempted"] = True
         cleanup_ok = True
         if self.proxy is not None:
-            self.proxy.close()
+            try:
+                self.proxy.close()
+            except OSError:
+                self.record_cleanup_failure("STOP_PROXY")
+                cleanup_ok = False
             self.proxy = None
         if (self.runtime / "docker.sock").is_socket():
-            for identity in (self.client_id, self.service_id):
+            for action, identity in (
+                ("REMOVE_CLIENT", self.client_id),
+                ("REMOVE_SERVICE", self.service_id),
+            ):
                 if identity:
-                    run_command([*self.docker, "rm", "-f", identity], timeout=20, env=self.private_env)
-            run_command([*self.docker, "network", "rm", NETWORK_NAME], timeout=20, env=self.private_env)
+                    self.cleanup_command(action, [*self.docker, "rm", "-f", identity], timeout=20)
+            self.cleanup_command("REMOVE_NETWORK", [*self.docker, "network", "rm", NETWORK_NAME], timeout=20)
             if self.private_image_id:
-                run_command([*self.docker, "image", "rm", "-f", self.private_image_id], timeout=30, env=self.private_env)
-            self.receipt["diagnostic.private_netns.cleanup.containers_remaining"] = self.private_query_count(["ps", "-aq"])
-            self.receipt["diagnostic.private_netns.cleanup.volumes_remaining"] = self.private_query_count(["volume", "ls", "-q"])
-            self.receipt["diagnostic.private_netns.cleanup.networks_remaining"] = self.private_query_count(["network", "ls", "-q", "--filter", "type=custom"])
-            self.receipt["diagnostic.private_netns.cleanup.images_remaining"] = self.private_query_count(["image", "ls", "-q"])
-        self.stop_process(self.dockerd_process)
-        self.stop_process(self.containerd_process)
+                self.cleanup_command(
+                    "REMOVE_IMAGE",
+                    [*self.docker, "image", "rm", "-f", self.private_image_id],
+                    timeout=30,
+                )
+            self.receipt["diagnostic.private_netns.cleanup.containers_remaining"] = self.private_query_count(
+                "QUERY_CONTAINERS", ["ps", "-aq"]
+            )
+            self.receipt["diagnostic.private_netns.cleanup.volumes_remaining"] = self.private_query_count(
+                "QUERY_VOLUMES", ["volume", "ls", "-q"]
+            )
+            self.receipt["diagnostic.private_netns.cleanup.networks_remaining"] = self.private_query_count(
+                "QUERY_NETWORKS", ["network", "ls", "-q", "--filter", "type=custom"]
+            )
+            self.receipt["diagnostic.private_netns.cleanup.images_remaining"] = self.private_query_count(
+                "QUERY_IMAGES", ["image", "ls", "-q"]
+            )
+        cleanup_ok = self.stop_process("STOP_DOCKERD", self.dockerd_process) and cleanup_ok
+        cleanup_ok = self.stop_process("STOP_CONTAINERD", self.containerd_process) and cleanup_ok
         process_count = sum(1 for process in self.processes if process.poll() is None)
         self.receipt["diagnostic.private_netns.cleanup.processes_remaining"] = process_count
         cleanup_ok = cleanup_ok and process_count == 0
         if self.netns_created:
-            removed = run_command(["ip", "netns", "delete", NS_NAME], env=self.private_env)
-            cleanup_ok = cleanup_ok and removed.returncode == 0
-        listed = run_command(["ip", "netns", "list"], env=self.private_env)
-        namespace_count = 1 if listed.returncode != 0 or NS_NAME.encode() in listed.stdout else 0
+            removed = self.cleanup_command("DELETE_NETNS", ["ip", "netns", "delete", NS_NAME])
+            cleanup_ok = cleanup_ok and removed is not None
+        listed = self.cleanup_command("QUERY_NETNS", ["ip", "netns", "list"])
+        namespace_count = 1 if listed is None or NS_NAME.encode() in listed.stdout else 0
         self.receipt["diagnostic.private_netns.cleanup.namespaces_remaining"] = namespace_count
         cleanup_ok = cleanup_ok and namespace_count == 0
         if self.cgroup_created:
@@ -1258,6 +1399,7 @@ class Probe:
                     directory.rmdir()
                 self.cgroup_path.rmdir()
             except OSError:
+                self.record_cleanup_failure("REMOVE_CGROUP")
                 cleanup_ok = False
         cgroup_count = 1 if self.cgroup_path.exists() else 0
         self.receipt["diagnostic.private_netns.cleanup.cgroups_remaining"] = cgroup_count
@@ -1266,6 +1408,7 @@ class Probe:
             if self.runtime.exists() and not self.runtime.is_symlink():
                 shutil.rmtree(self.runtime)
         except OSError:
+            self.record_cleanup_failure("REMOVE_RUNTIME_ROOT")
             cleanup_ok = False
         root_count = 1 if os.path.lexists(self.runtime) else 0
         socket_paths = (self.runtime / "docker.sock", self.runtime / "containerd.sock")
@@ -1286,9 +1429,14 @@ class Probe:
         cleanup_ok = cleanup_ok and listener_count == 0
         try:
             final_firewall = self.host_firewall_snapshot("final")
-            final_links = self.host_links()
-        except ProbeFailure:
+        except (OSError, ProbeFailure, subprocess.TimeoutExpired):
+            self.record_cleanup_failure("QUERY_HOST_FIREWALL")
             final_firewall = (ZERO_SHA256, ZERO_SHA256, {})
+            cleanup_ok = False
+        try:
+            final_links = self.host_links()
+        except (OSError, ProbeFailure, subprocess.TimeoutExpired):
+            self.record_cleanup_failure("QUERY_HOST_LINKS")
             final_links = ZERO_SHA256
             cleanup_ok = False
         self.receipt["diagnostic.private_netns.host_firewall.observation_count"] = len(self.host_firewall_phases)
@@ -1305,7 +1453,33 @@ class Probe:
         self.receipt["diagnostic.private_netns.host_links.restored"] = links_restored
         self.receipt["diagnostic.private_netns.host_links.veth_created"] = False
         self.receipt["diagnostic.private_netns.cleanup.veths_remaining"] = 0 if links_restored and namespace_count == 0 else 1
-        cleanup_ok = cleanup_ok and canonical_restored and semantic_restored and links_restored
+        self.finalize_cleanup_failures()
+        residue_is_zero = all(
+            self.receipt[key] == 0
+            for key in (
+                "diagnostic.private_netns.cleanup.containers_remaining",
+                "diagnostic.private_netns.cleanup.images_remaining",
+                "diagnostic.private_netns.cleanup.volumes_remaining",
+                "diagnostic.private_netns.cleanup.networks_remaining",
+                "diagnostic.private_netns.cleanup.listeners_remaining",
+                "diagnostic.private_netns.cleanup.processes_remaining",
+                "diagnostic.private_netns.cleanup.namespaces_remaining",
+                "diagnostic.private_netns.cleanup.veths_remaining",
+                "diagnostic.private_netns.cleanup.sockets_remaining",
+                "diagnostic.private_netns.cleanup.pidfiles_remaining",
+                "diagnostic.private_netns.cleanup.cgroups_remaining",
+                "diagnostic.private_netns.cleanup.roots_remaining",
+                "diagnostic.private_netns.cleanup.scratch_remaining",
+            )
+        )
+        cleanup_ok = (
+            cleanup_ok
+            and canonical_restored
+            and semantic_restored
+            and links_restored
+            and residue_is_zero
+            and not self.cleanup_failures
+        )
         self.receipt["diagnostic.private_netns.cleanup.succeeded"] = cleanup_ok
         return cleanup_ok
 
@@ -1319,7 +1493,14 @@ def run_probe(args: argparse.Namespace) -> int:
         failure_code = exc.code
     except (OSError, ValueError, UnicodeError, json.JSONDecodeError, subprocess.TimeoutExpired):
         failure_code = "PROBE_INTERNAL_ERROR"
-    cleanup_ok = probe.cleanup()
+    try:
+        cleanup_ok = probe.cleanup()
+    except Exception:
+        probe.record_cleanup_failure("UNEXPECTED_CLEANUP")
+        probe.finalize_cleanup_failures()
+        probe.receipt["diagnostic.private_netns.cleanup.attempted"] = True
+        probe.receipt["diagnostic.private_netns.cleanup.succeeded"] = False
+        cleanup_ok = False
     if not cleanup_ok and failure_code == "PASS":
         failure_code = "PRIVATE_CLEANUP_FAILED"
     if failure_code == "PASS":
