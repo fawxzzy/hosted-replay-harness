@@ -96,6 +96,64 @@ private_netns_probe = load_module(
 )
 
 
+class FitnessStackIsolationContractTests(unittest.TestCase):
+    FOUNDATION = "6901855ab62ec3d2751491558825d9270666c934"
+    ALLOWLIST = {
+        ".github/workflows/fitness-full-chain-replay.yml",
+        "docs/FITNESS_FULL_CHAIN_REPLAY_CONTRACT.md",
+        "fitness/contract.v1.json",
+        "fitness/source-manifest.v1.json",
+        "fitness/receipt.schema.v1.json",
+        "scripts/fitness_full_chain_replay.py",
+        "scripts/fitness_replay_fixture.sql",
+        "scripts/verify_fitness_replay_receipt.py",
+        "tests/test_fitness_full_chain_replay.py",
+        "tests/fixtures/fitness_replay_receipt.valid.json",
+        "tests/test_contracts.py",
+        "README.md",
+    }
+    IMMUTABLE = {
+        ".github/workflows/containment-smoke.yml": "e0440e1748c4655c559fc82f5882e73b11c37b9cfd3e389bdbddf4ddecc7db99",
+        "scripts/run-containment-smoke.sh": "81cb185b6a2ab626498e1de3eb4069b2dedcacc0089d424be60a23a2703a97cb",
+        "scripts/private_docker_netns_probe.py": "3d1a4266febf3952c50093894668f162935e88d05dacb9c71b9f085e278a9dbc",
+        "scripts/docker_api_boundary.py": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
+        "scripts/write_result.py": "883c2a6b4ecb9cc26b5bd025d1c6e0637d844a76f1dfb58947e6bee79fd8d6d6",
+        "pins.json": "fe6105e121af3347a2de2494330d1e793a7bc3634f9d3d95964f6593ea990f50",
+        "supabase/config.toml": "1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6",
+    }
+
+    def test_stack_is_descended_from_exact_foundation(self) -> None:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", self.FOUNDATION, "HEAD"],
+            cwd=ROOT, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_cumulative_and_worktree_scope_never_exceeds_allowlist(self) -> None:
+        committed = subprocess.run(
+            ["git", "diff", "--name-only", f"{self.FOUNDATION}..HEAD"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        worktree = []
+        for line in status:
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            worktree.append(path.replace("\\", "/"))
+        self.assertTrue(set(committed) | set(worktree))
+        self.assertLessEqual(set(committed) | set(worktree), self.ALLOWLIST)
+
+    def test_generic_containment_foundation_is_byte_identical(self) -> None:
+        for relative, expected in self.IMMUTABLE.items():
+            with self.subTest(path=relative):
+                actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+                self.assertEqual(actual, expected)
+
+
 class PinContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.pins = json.loads((ROOT / "pins.json").read_text(encoding="utf-8"))

@@ -4,6 +4,19 @@ This repository contains one bounded, secret-free GitHub-hosted containment smok
 
 The smoke does not log in to Supabase, contact a Supabase project, use application migrations, inspect Auth rows, or replay application/provider/user data.
 
+## Fitness source adapter
+
+The stacked Fitness adapter freezes the exact public 101-migration base plus
+the single PR #108 migration as a 102-object manifest and defines a
+synthetic-only, full-chain replay. Its manual workflow targets only the
+repository-scoped `fp-hosted-replay-jit-v1` ephemeral runner label. It cannot
+run on the standard hosted workflow and has no host-Docker fallback.
+
+This repository change is source-only. The JIT runtime, any chargeable
+infrastructure, exact-head review, and a single workflow dispatch remain held
+under separate authority. See
+[`docs/FITNESS_FULL_CHAIN_REPLAY_CONTRACT.md`](docs/FITNESS_FULL_CHAIN_REPLAY_CONTRACT.md).
+
 ## Source contract
 
 The pinned CLI source at commit `6d4c19870ed213ba7f682f117d0345c8a40bfa94` establishes the path used here:

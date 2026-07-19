@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fawxzzy.hosted-replay.fitness.contract.v1",
+  "packet": "FP-HOSTED-REPLAY-FITNESS-FULL-CHAIN-SOURCE-001",
+  "foundation": {
+    "repository": "fawxzzy/hosted-replay-harness",
+    "base_branch": "agent/hosted-replay-containment-smoke",
+    "commit": "6901855ab62ec3d2751491558825d9270666c934",
+    "tree": "16f1598cd5f4985059753e4768bb94b238e1e8d4",
+    "private_runtime_label": "fp-hosted-replay-jit-v1",
+    "docker_host": "unix:///run/fp-hosted-replay-jit-v1/docker.sock",
+    "cli_observer_host": "unix:///run/fp-hosted-replay-jit-v1/observer.sock",
+    "observer_sha256": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
+    "observer_policy": "foundation-db-start-v1",
+    "supabase_binary": "/run/fp-hosted-replay-jit-v1/bin/supabase",
+    "supabase_sidecar": "/run/fp-hosted-replay-jit-v1/bin/supabase-go",
+    "runtime_attestation": "/run/fp-hosted-replay-jit-v1/attestation.v1.json"
+  },
+  "source": {
+    "repository": "fawxzzy/fawxzzy-fitness",
+    "base_commit": "317568f9dcbc7d6c9dcf2ad30ef1cd80022ce8b3",
+    "base_tree": "bd4b2809a2a613a4bc67a4cc8166bee56d64a30f",
+    "candidate_commit": "4ff406c92c1d9b9e7ab23a4ebdaa01820b9b5c01",
+    "candidate_tree": "e8314980790dd9c711f63f4b38ad61e59ec6f409",
+    "base_migration_count": 101,
+    "candidate_migration_count": 102,
+    "base_chain_sha256": "236ded2d260b2787838219f6e54fa63cbed80a8581930f165ca6025bca91db3a",
+    "candidate_chain_sha256": "711445d03b3d98466c278c4dfcbaa7cda326f188427b6dbcd55065fae1a2bbb5",
+    "candidate_path": "supabase/migrations/20260718015422_retire_human_member_number_compaction.sql",
+    "candidate_blob": "007eca9503dfd10a6910a27b02a46def30583d18",
+    "candidate_bytes": 15431,
+    "candidate_sha256": "ca502e3bcef4532ce4de336d33334c5620efaf3863286db51f6440bb9224662d",
+    "source_manifest_sha256": "cc121bfcb216df8f42cc6d0c404c61563071609a07f610bdd4ef3745e0590cd1"
+  },
+  "replay": {
+    "project_id": "fp-hosted-replay-ro-001",
+    "network_name": "fp-fitness-replay-001-net",
+    "packet_label": "FP-HOSTED-REPLAY-FITNESS-FULL-CHAIN-001",
+    "database_name": "postgres",
+    "database_role": "postgres",
+    "initial_human_numbers": [0, 1, 2, 3, 4, 5],
+    "initial_automation_count": 1,
+    "deleted_fixture": "human-003",
+    "concurrent_human_count": 8,
+    "fixture_labels": [
+      "automation-000",
+      "human-000",
+      "human-001",
+      "human-002",
+      "human-003",
+      "human-004",
+      "human-005",
+      "human-concurrent-000",
+      "human-concurrent-001",
+      "human-concurrent-002",
+      "human-concurrent-003",
+      "human-concurrent-004",
+      "human-concurrent-005",
+      "human-concurrent-006",
+      "human-concurrent-007"
+    ],
+    "immutable_columns": ["user_number", "user_kind", "user_number_assigned_at"],
+    "sequence_roles": {
+      "PUBLIC": [],
+      "anon": [],
+      "authenticated": [],
+      "service_role": ["SELECT"]
+    },
+    "max_migration_seconds": 120,
+    "max_concurrent_insert_seconds": 30
+  },
+  "receipt": {
+    "schema": "fawxzzy.hosted-replay.fitness.receipt.v1",
+    "artifact": "artifacts/fitness-full-chain-replay.json",
+    "retention_days": 7,
+    "unsafe_key_pattern": "(?i)(email|discord|jwt|token|secret|password|database_?url|db_?uri|profile_?id|user_?id|request_?body|raw_?log)"
+  }
+}
