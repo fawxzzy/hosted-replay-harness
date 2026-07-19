@@ -3,11 +3,11 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-MODE="${1:-firewall-rehearsal}"
+MODE="${1:-private-netns-probe}"
 RESULT_PROFILE="${RESULT_PROFILE:-}"
 [[ "$#" -le 1 ]] || exit 2
 case "$MODE" in
-  run|direct-port|firewall-rehearsal|cleanup-only) ;;
+  run|direct-port|firewall-rehearsal|private-netns-probe|cleanup-only) ;;
   *) exit 2 ;;
 esac
 case "$RESULT_PROFILE" in
@@ -17,9 +17,11 @@ esac
 CONTAINMENT_PACKET="FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001"
 DIRECT_PACKET="FP-HOSTED-REPLAY-DIRECT-PORT-DIAG-001"
 FIREWALL_PACKET="FP-HOSTED-REPLAY-FIREWALL-PUBLICATION-REHEARSAL-001"
+PRIVATE_NETNS_PACKET="FP-HOSTED-REPLAY-STANDARD-RUNNER-NETNS-PROBE-001"
 PACKET="$CONTAINMENT_PACKET"
 [[ "$MODE" != "direct-port" ]] || PACKET="$DIRECT_PACKET"
 [[ "$MODE" != "firewall-rehearsal" ]] || PACKET="$FIREWALL_PACKET"
+[[ "$MODE" != "private-netns-probe" ]] || PACKET="$PRIVATE_NETNS_PACKET"
 NETWORK_ROLE="containment-network"
 [[ "$MODE" != "firewall-rehearsal" ]] || NETWORK_ROLE="firewall-publication-network"
 PROJECT="fp-hosted-replay-ro-001"
@@ -56,6 +58,8 @@ DOCKER_API_BOUNDARY_STATE_FILE="$RUNTIME/docker-api-boundary.tsv"
 DOCKER_API_SOCKET="$RUNTIME/docker-api.sock"
 DOCKER_API_READY="$RUNTIME/docker-api.ready"
 DOCKER_API_POLICY_FILE="$RUNTIME/docker-api-policy.json"
+PRIVATE_NETNS_STATE_FILE="$RUNTIME/private-netns-probe.tsv"
+PRIVATE_NETNS_ROOT="$RUNTIME/private-netns"
 CONTAINER_EVENTS_FILE="$RAW/docker-container-events.jsonl"
 VOLUME_EVENTS_FILE="$RAW/docker-volume-events.jsonl"
 NETWORK_EVENTS_FILE="$RAW/docker-network-events.jsonl"
@@ -161,7 +165,7 @@ record() {
 
 cleanup_mode_firewall_required() {
   case "$1" in
-    run|direct-port) printf 'false\n' ;;
+    run|direct-port|private-netns-probe) printf 'false\n' ;;
     firewall-rehearsal) printf 'true\n' ;;
     *) return 1 ;;
   esac
@@ -204,7 +208,7 @@ read_cleanup_mode_contract() {
   mapfile -t lines <"$CLEANUP_MODE_FILE" || return 1
   [[ "${#lines[@]}" == "4" ]] || return 1
   [[ "${lines[0]}" == $'schema\tstr\t'"$CLEANUP_MODE_SCHEMA" ]] || return 1
-  [[ "${lines[1]}" =~ ^mode$'\t'str$'\t'(run|direct-port|firewall-rehearsal)$ ]] || return 1
+  [[ "${lines[1]}" =~ ^mode$'\t'str$'\t'(run|direct-port|firewall-rehearsal|private-netns-probe)$ ]] || return 1
   [[ "${lines[2]}" =~ ^firewall_required$'\t'bool$'\t'(true|false)$ ]] || return 1
   [[ "${lines[3]}" =~ ^payload_sha256$'\t'str$'\t'([0-9a-f]{64})$ ]] || return 1
   stored_mode="${lines[1]##*$'\t'}"
@@ -456,6 +460,7 @@ schema = sys.argv[7]
 allowed_roots = (
     "bin/",
     "home/",
+    "private-netns/",
     "project/",
     "raw/",
     "root-init/",
@@ -482,6 +487,7 @@ allowed_files = (
     "host-test-listener.ready",
     "publication-firewall_client.tsv",
     "publication-foreign_canary.tsv",
+    "private-netns-probe.tsv",
     "supabase_2.109.1_linux_amd64.tar.gz",
     "watcher.ready",
 )
@@ -1522,6 +1528,7 @@ docker_cleanup_query_ids() {
     "label=io.fawxzzy.packet=${CONTAINMENT_PACKET}" \
     "label=io.fawxzzy.packet=${DIRECT_PACKET}" \
     "label=io.fawxzzy.packet=${FIREWALL_PACKET}" \
+    "label=io.fawxzzy.packet=${PRIVATE_NETNS_PACKET}" \
     "label=com.supabase.cli.project=${PROJECT}"; do
     if ! query_output="$(mktemp "$RAW/cleanup-docker-query.XXXXXX")"; then
       record_cleanup_docker_query_failure "$phase" "$resource" LIST COMMAND_FAILED
@@ -1606,7 +1613,7 @@ docker_cleanup_verify_ownership() {
     *) return 1 ;;
   esac
   case "$packet_label" in
-    ""|"<no value>"|"$CONTAINMENT_PACKET"|"$DIRECT_PACKET"|"$FIREWALL_PACKET") ;;
+    ""|"<no value>"|"$CONTAINMENT_PACKET"|"$DIRECT_PACKET"|"$FIREWALL_PACKET"|"$PRIVATE_NETNS_PACKET") ;;
     *)
       record_cleanup_docker_query_failure "$phase" "$resource" PACKET_LABEL_INSPECT MALFORMED_OUTPUT
       return 1
@@ -1620,7 +1627,8 @@ docker_cleanup_verify_ownership() {
       ;;
   esac
   if [[ "$packet_label" != "$CONTAINMENT_PACKET" && "$packet_label" != "$DIRECT_PACKET" \
-    && "$packet_label" != "$FIREWALL_PACKET" && "$project_label" != "$PROJECT" ]]; then
+    && "$packet_label" != "$FIREWALL_PACKET" && "$packet_label" != "$PRIVATE_NETNS_PACKET" \
+    && "$project_label" != "$PROJECT" ]]; then
     record_cleanup_docker_query_failure "$phase" "$resource" OWNERSHIP OWNERSHIP_MISMATCH
     return 1
   fi
@@ -2038,6 +2046,65 @@ run_direct_port_probe() {
 
   record diagnostic.timing.completed_at str "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SMOKE_PASSED=1
+}
+
+run_private_docker_netns_probe() {
+  local probe_rc classification failure_code
+  local helper="$ROOT/scripts/private_docker_netns_probe.py"
+  local probe_stderr="$RAW/private-netns-probe.log"
+  local -a probe_command=(
+    python3 -B "$helper" probe
+    --workspace-root "$ROOT"
+    --runtime "$PRIVATE_NETNS_ROOT"
+    --image "$POSTGRES_PULL"
+    --expected-image-id "$POSTGRES_IMAGE_ID"
+    --packet "$PRIVATE_NETNS_PACKET"
+    --runner-uid "$(id -u)"
+    --listen-port "$DB_PORT"
+  )
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED helper-missing
+  [[ ! -e "$PRIVATE_NETNS_STATE_FILE" && ! -L "$PRIVATE_NETNS_STATE_FILE" \
+    && ! -e "$PRIVATE_NETNS_ROOT" && ! -L "$PRIVATE_NETNS_ROOT" ]] \
+    || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED packet-state-collision
+  set +e
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n env -i \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      "${probe_command[@]}" >"$PRIVATE_NETNS_STATE_FILE" 2>"$probe_stderr"
+  else
+    env -i \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      HOME="$RUNTIME_HOME" \
+      "${probe_command[@]}" >"$PRIVATE_NETNS_STATE_FILE" 2>"$probe_stderr"
+  fi
+  probe_rc="$?"
+  set -e
+  rm -f -- "$probe_stderr" || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED raw-output-delete-failed
+  [[ ! -e "$probe_stderr" ]] || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED raw-output-delete-failed
+  if ! python3 -B "$helper" validate --input "$PRIVATE_NETNS_STATE_FILE" >/dev/null 2>&1; then
+    rm -f -- "$PRIVATE_NETNS_STATE_FILE"
+    record diagnostic.private_netns.classification str STANDARD_RUNNER_REJECTED_JIT_REQUIRED
+    record diagnostic.private_netns.failure_code str PRIVATE_NETNS_PROBE_EVIDENCE_INVALID
+    block STANDARD_RUNNER_REJECTED_JIT_REQUIRED evidence-invalid
+  fi
+  cat "$PRIVATE_NETNS_STATE_FILE" >>"$STATE_FILE" \
+    || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED evidence-append-failed
+  classification="$(awk -F '\t' '$1=="diagnostic.private_netns.classification" && $2=="str"{print $3; exit}' "$PRIVATE_NETNS_STATE_FILE")"
+  failure_code="$(awk -F '\t' '$1=="diagnostic.private_netns.failure_code" && $2=="str"{print $3; exit}' "$PRIVATE_NETNS_STATE_FILE")"
+  [[ "$failure_code" =~ ^[A-Z0-9_]+$ ]] \
+    || block STANDARD_RUNNER_REJECTED_JIT_REQUIRED evidence-invalid
+  case "$classification:$probe_rc:$failure_code" in
+    STANDARD_RUNNER_PRIVATE_NETNS_PASS:0:PASS)
+      block PRIVATE_NETNS_PROBE_DIAGNOSTIC_STOP capability-pass
+      ;;
+    STANDARD_RUNNER_REJECTED_JIT_REQUIRED:1:*)
+      block STANDARD_RUNNER_REJECTED_JIT_REQUIRED "$failure_code"
+      ;;
+    *)
+      block STANDARD_RUNNER_REJECTED_JIT_REQUIRED evidence-exit-mismatch
+      ;;
+  esac
 }
 
 firewall_counter_value() {
@@ -3084,6 +3151,20 @@ elif [[ "$MODE" == "firewall-rehearsal" ]]; then
   record source_contract.application_migrations_enabled bool false
   record source_contract.seed_enabled bool false
   record source_contract.gotrue_enabled bool false
+elif [[ "$MODE" == "private-netns-probe" ]]; then
+  record result.profile str containment-smoke-v1
+  record packet str "$PRIVATE_NETNS_PACKET"
+  record diagnostic.profile str private-docker-netns-probe-v1
+  record source_contract.command str private-docker-netns-probe
+  record source_contract.root_persistent_prerun bool false
+  record source_contract.load_config bool false
+  record source_contract.docker_access_expected bool true
+  record source_contract.provider_access_enabled bool false
+  record source_contract.telemetry_endpoint_enabled bool false
+  record source_contract.database_only bool false
+  record source_contract.application_migrations_enabled bool false
+  record source_contract.seed_enabled bool false
+  record source_contract.gotrue_enabled bool false
 else
   record result.profile str containment-smoke-v1
   record diagnostic.profile str db-start-policy-v1
@@ -3187,7 +3268,7 @@ postgres_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "
 docker image inspect --format '{{json .RepoDigests}}' "$POSTGRES_PULL" | grep -Fq "${POSTGRES_TAG%:*}@${POSTGRES_DIGEST}" || block POSTGRES_REPODIGEST_MISMATCH
 POSTGRES_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$POSTGRES_PULL")"
 record images.postgres.digest str "$POSTGRES_DIGEST"
-if [[ "$MODE" == "firewall-rehearsal" ]]; then
+if [[ "$MODE" == "firewall-rehearsal" || "$MODE" == "private-netns-probe" ]]; then
   record images.postgres.image_id_sha256 str "$(hash_identifier "$POSTGRES_IMAGE_ID")"
 else
   record images.postgres.image_id str "$POSTGRES_IMAGE_ID"
@@ -3209,6 +3290,11 @@ if [[ "$MODE" == "run" ]]; then
   record images.pull_count int 2
 else
   record images.pull_count int 1
+fi
+
+if [[ "$MODE" == "private-netns-probe" ]]; then
+  run_private_docker_netns_probe
+  exit 0
 fi
 
 mapfile -t existing_prefixes < <(

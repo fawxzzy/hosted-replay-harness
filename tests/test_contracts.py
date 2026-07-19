@@ -91,6 +91,9 @@ docker_api_boundary = load_module(
     "docker_api_boundary", "scripts/docker_api_boundary.py"
 )
 firewall_boundary = load_module("firewall_boundary", "scripts/firewall_boundary.py")
+private_netns_probe = load_module(
+    "private_docker_netns_probe", "scripts/private_docker_netns_probe.py"
+)
 
 
 class PinContractTests(unittest.TestCase):
@@ -184,7 +187,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(upload_paths, ["artifacts/containment-smoke.json"])
         self.assertNotIn("supabase-db-start.log", self.workflow)
 
-    def test_manual_workflow_selects_only_fixed_firewall_rehearsal_mode(self) -> None:
+    def test_manual_workflow_selects_only_the_fixed_default_mode(self) -> None:
         self.assertIn("Hosted replay containment smoke", self.workflow)
         self.assertEqual(self.workflow.count("./scripts/run-containment-smoke.sh\n"), 1)
         self.assertNotIn("run-containment-smoke.sh direct-port", self.workflow)
@@ -250,7 +253,7 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertIn('record images.pull_count int 2', self.runner)
 
     def test_direct_mode_isolated_from_cli_and_uses_one_exact_target(self) -> None:
-        self.assertIn('run|direct-port|firewall-rehearsal|cleanup-only', self.runner)
+        self.assertIn('run|direct-port|firewall-rehearsal|private-netns-probe|cleanup-only', self.runner)
         self.assertRegex(self.runner, r'(?s)if \[\[ "\$MODE" == "direct-port" \]\]; then\s+run_direct_port_probe\s+exit 0\s+fi')
         direct_function = self.runner[
             self.runner.index("run_direct_port_probe() {") : self.runner.index(
@@ -267,8 +270,25 @@ class RunnerStaticContractTests(unittest.TestCase):
         self.assertNotIn("$RUNTIME/bin/supabase", direct_function)
         self.assertNotIn("db start", direct_function)
 
-    def test_default_mode_is_fixed_firewall_rehearsal_without_cli(self) -> None:
-        self.assertIn('MODE="${1:-firewall-rehearsal}"', self.runner)
+    def test_default_mode_is_fixed_private_netns_probe_without_cli(self) -> None:
+        self.assertIn('MODE="${1:-private-netns-probe}"', self.runner)
+        probe_function = self.runner[
+            self.runner.index("run_private_docker_netns_probe() {") : self.runner.index(
+                "firewall_counter_value() {"
+            )
+        ]
+        self.assertIn('python3 -B "$helper" probe', probe_function)
+        self.assertIn('sudo -n env -i', probe_function)
+        self.assertIn('STANDARD_RUNNER_PRIVATE_NETNS_PASS:0:PASS', probe_function)
+        self.assertIn('PRIVATE_NETNS_PROBE_DIAGNOSTIC_STOP', probe_function)
+        self.assertNotIn("$RUNTIME/bin/supabase", probe_function)
+        self.assertNotIn("db start", probe_function)
+        self.assertNotIn('"$GOTRUE_PULL"', probe_function)
+        dispatch = 'if [[ "$MODE" == "private-netns-probe" ]]; then\n  run_private_docker_netns_probe\n  exit 0\nfi'
+        self.assertIn(dispatch, self.runner)
+        self.assertLess(self.runner.index(dispatch), self.runner.index("mapfile -t existing_prefixes"))
+
+    def test_firewall_rehearsal_remains_inactive_and_cli_free(self) -> None:
         rehearsal = self.runner[
             self.runner.index("run_firewall_publication_rehearsal() {") : self.runner.index(
                 "packet_object_counts() {"
@@ -641,7 +661,7 @@ stat() {{
   if [[ "$1" == -c && "$2" == %a ]]; then printf '600\n'; return 0; fi
   command stat "$@"
 }}
-for mode in run direct-port firewall-rehearsal; do
+for mode in run direct-port firewall-rehearsal private-netns-probe; do
   : >"$STATE_FILE"
   write_cleanup_mode_contract "$mode"
   resolve_cleanup_mode_contract "$mode"
@@ -665,7 +685,12 @@ rm -f "$CLEANUP_MODE_STAGE_FILE"
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(
             completed.stdout.splitlines(),
-            ["MODE:run:false", "MODE:direct-port:false", "MODE:firewall-rehearsal:true"],
+            [
+                "MODE:run:false",
+                "MODE:direct-port:false",
+                "MODE:firewall-rehearsal:true",
+                "MODE:private-netns-probe:false",
+            ],
         )
 
     def test_cleanup_docker_query_contract_distinguishes_empty_failure_partial_and_malformed(self) -> None:
@@ -692,6 +717,7 @@ mkdir -p "$RAW"
 CONTAINMENT_PACKET=containment
 DIRECT_PACKET=direct
 FIREWALL_PACKET=firewall
+PRIVATE_NETNS_PACKET=private
 PROJECT=project
 CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
 DOCKER_CLEANUP_QUERY_VALUES=()
@@ -742,12 +768,12 @@ exit "$rc"
             with self.subTest(resource=resource, kind="successful-empty"):
                 empty = execute(resource)
                 self.assertEqual(empty.returncode, 0, empty.stderr)
-                self.assertIn("RC:0 COUNT:0 CALLS:4 RESIDUE:0", empty.stdout)
+                self.assertIn("RC:0 COUNT:0 CALLS:5 RESIDUE:0", empty.stdout)
                 self.assertNotIn("cleanup.docker_query.", empty.stdout)
             with self.subTest(resource=resource, kind="cross-filter-overlap"):
                 overlap = execute(resource, valid_output=True)
                 self.assertEqual(overlap.returncode, 0, overlap.stderr)
-                self.assertIn("RC:0 COUNT:1 CALLS:4 RESIDUE:0", overlap.stdout)
+                self.assertIn("RC:0 COUNT:1 CALLS:5 RESIDUE:0", overlap.stdout)
 
     def test_cleanup_docker_query_framing_rejects_blank_duplicate_and_ambiguous_records(self) -> None:
         functions = self.runner_functions(
@@ -833,6 +859,7 @@ mkdir -p "$RAW"
 CONTAINMENT_PACKET=containment
 DIRECT_PACKET=direct
 FIREWALL_PACKET=firewall
+PRIVATE_NETNS_PACKET=private
 PROJECT=project
 CLEANUP_DOCKER_QUERY_FAILURE_RECORDED=0
 printf '0\n' >"$ROOT/docker-call"
@@ -916,6 +943,7 @@ DB_PORT=56422
 CONTAINMENT_PACKET=containment
 DIRECT_PACKET=direct
 FIREWALL_PACKET=firewall
+PRIVATE_NETNS_PACKET=private
 PROJECT=project
 FIREWALL_LEDGER="$ROOT/firewall-ledger"
 LISTENER_SNAPSHOT_COUNT=0
@@ -1028,7 +1056,7 @@ exit "$rc"
 """
                 return self.run_bash(script)
 
-        for mode in ("run", "direct-port"):
+        for mode in ("run", "direct-port", "private-netns-probe"):
             with self.subTest(mode=mode):
                 result = execute(mode, "false")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -4937,6 +4965,355 @@ def owned_firewall_entries_with_markers() -> list[dict]:
         for expressions in rules
     )
     return entries
+
+
+class PrivateDockerNetnsProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (ROOT / "scripts/private_docker_netns_probe.py").read_text(
+            encoding="utf-8"
+        )
+        cls.runner = (ROOT / "scripts/run-containment-smoke.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_closed_receipt_roundtrip_and_digest(self) -> None:
+        receipt = private_netns_probe.default_receipt()
+        receipt["diagnostic.private_netns.failure_code"] = "ROOT_PRIVILEGE_UNAVAILABLE"
+        private_netns_probe.finalize_receipt(receipt)
+        rendered = private_netns_probe.format_receipt(receipt).encode()
+        self.assertEqual(private_netns_probe.parse_receipt(rendered), receipt)
+        self.assertEqual(
+            set(receipt), {key for key, _ in private_netns_probe.FIELD_SPECS}
+        )
+        self.assertNotIn("/home/runner", rendered.decode())
+        self.assertNotIn("password", rendered.decode().lower())
+        self.assertNotIn("token", rendered.decode().lower())
+
+    def test_receipt_rejects_missing_duplicate_wrong_type_and_digest_drift(self) -> None:
+        receipt = private_netns_probe.default_receipt()
+        receipt["diagnostic.private_netns.failure_code"] = "CAPABILITY_TOOL_MISSING"
+        private_netns_probe.finalize_receipt(receipt)
+        rendered = private_netns_probe.format_receipt(receipt)
+        with self.assertRaises(ValueError):
+            private_netns_probe.parse_receipt("\n".join(rendered.splitlines()[1:]).encode() + b"\n")
+        first = rendered.splitlines()[0]
+        with self.assertRaises(ValueError):
+            private_netns_probe.parse_receipt((rendered + first + "\n").encode())
+        with self.assertRaises(ValueError):
+            private_netns_probe.parse_receipt(
+                rendered.replace(
+                    "diagnostic.private_netns.cleanup.succeeded\tbool\tfalse",
+                    "diagnostic.private_netns.cleanup.succeeded\tbool\t0",
+                ).encode()
+            )
+        with self.assertRaises(ValueError):
+            private_netns_probe.parse_receipt(
+                rendered.replace(
+                    receipt["diagnostic.private_netns.receipt_sha256"], "f" * 64
+                ).encode()
+            )
+
+    def test_multiple_daemon_commands_are_fully_distinct_and_unix_only(self) -> None:
+        runtime = Path("/packet/private-netns")
+        containerd = private_netns_probe.build_containerd_command(
+            "/usr/bin/containerd", runtime
+        )
+        dockerd = private_netns_probe.build_dockerd_command(
+            "/usr/bin/dockerd", runtime
+        )
+        rendered = "\n".join((*containerd, *dockerd))
+        for fragment in (
+            "/packet/private-netns/containerd.sock",
+            "/packet/private-netns/containerd.toml",
+            "/packet/private-netns/containerd-state",
+            "/packet/private-netns/containerd-root",
+            "--host=unix:///packet/private-netns/docker.sock",
+            "--config-file=/packet/private-netns/daemon.json",
+            "--pidfile=/packet/private-netns/dockerd.pid",
+            "--data-root=/packet/private-netns/docker-data",
+            "--exec-root=/packet/private-netns/docker-exec",
+            "--bridge=none",
+            "--firewall-backend=iptables",
+            f"--containerd-namespace={private_netns_probe.CONTAINERD_NAMESPACE}",
+            f"--containerd-plugins-namespace={private_netns_probe.CONTAINERD_PLUGINS_NAMESPACE}",
+            f"--cgroup-parent=/{private_netns_probe.CGROUP_NAME}",
+        ):
+            self.assertIn(fragment, rendered)
+        self.assertNotIn("tcp://", rendered)
+        self.assertNotIn("/run/containerd/containerd.sock", rendered)
+        self.assertIn('disabled_plugins = ["io.containerd.grpc.v1.cri"]', self.source)
+        self.assertIn('"namespaces",\n                    "create"', self.source)
+
+    def test_private_firewall_is_namespace_local_and_same_bridge_only(self) -> None:
+        batch = private_netns_probe.build_private_firewall_batch().decode()
+        self.assertIn(
+            f"add table inet {private_netns_probe.PRIVATE_TABLE}", batch
+        )
+        self.assertIn(
+            f'iifname "{private_netns_probe.BRIDGE_NAME}" oifname "{private_netns_probe.BRIDGE_NAME}" accept',
+            batch,
+        )
+        self.assertIn(
+            f'iifname "{private_netns_probe.BRIDGE_NAME}" drop', batch
+        )
+        self.assertNotIn("0.0.0.0", batch)
+        self.assertNotIn("172.31.253", batch)
+
+    def private_container_fixture(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        service_id = "a" * 64
+        client_id = "b" * 64
+
+        def container(role: str, size: str) -> dict[str, object]:
+            return {
+                "Config": {
+                    "Labels": {
+                        "io.fawxzzy.packet": "FP-TEST-PACKET",
+                        "io.fawxzzy.role": role,
+                    }
+                },
+                "HostConfig": {
+                    "Tmpfs": {
+                        "/var/lib/postgresql/data": f"rw,nosuid,nodev,noexec,size={size}"
+                    },
+                    "NetworkMode": private_netns_probe.NETWORK_NAME,
+                    "Privileged": False,
+                    "PublishAllPorts": False,
+                    "PidMode": "",
+                    "IpcMode": "private",
+                    "Binds": None,
+                    "Mounts": [],
+                    "CapAdd": None,
+                    "Devices": [],
+                    "PortBindings": {},
+                    "SecurityOpt": ["no-new-privileges"],
+                },
+                "NetworkSettings": {
+                    "Networks": {private_netns_probe.NETWORK_NAME: {}},
+                    "Ports": {"5432/tcp": None},
+                },
+                "Mounts": [],
+            }
+
+        containers = [
+            container("private-netns-service", "512m"),
+            container("private-netns-client", "64m"),
+        ]
+        network = [{
+            "Driver": "bridge",
+            "Internal": True,
+            "EnableIPv6": False,
+            "Options": {
+                "com.docker.network.bridge.name": private_netns_probe.BRIDGE_NAME
+            },
+            "IPAM": {"Config": [{
+                "Subnet": private_netns_probe.PRIVATE_SUBNET,
+                "Gateway": private_netns_probe.PRIVATE_GATEWAY,
+            }]},
+            "Containers": {service_id: {}, client_id: {}},
+        }]
+        return containers, network
+
+    def test_container_contract_accepts_only_exact_private_attachment_and_security(self) -> None:
+        args = mock.Mock(
+            runtime=Path("/packet/private-netns"),
+            workspace_root=Path("/packet"),
+            packet="FP-TEST-PACKET",
+        )
+        probe = private_netns_probe.Probe(args)
+        probe.service_id = "a" * 64
+        probe.client_id = "b" * 64
+        containers, network = self.private_container_fixture()
+        responses = [
+            subprocess.CompletedProcess([], 0, json.dumps(containers).encode(), b""),
+            subprocess.CompletedProcess([], 0, json.dumps(network).encode(), b""),
+        ]
+        with mock.patch.object(private_netns_probe, "run_command", side_effect=responses):
+            probe.verify_container_contract()
+        self.assertIs(
+            probe.receipt["diagnostic.private_netns.network.exact_attachment"], True
+        )
+        self.assertIs(
+            probe.receipt["diagnostic.private_netns.network.container_security"], True
+        )
+
+    def test_container_contract_rejects_network_publication_mount_and_privilege_drift(self) -> None:
+        for mutation in ("extra_network", "binding", "bind", "privileged", "volume"):
+            with self.subTest(mutation=mutation):
+                args = mock.Mock(
+                    runtime=Path("/packet/private-netns"),
+                    workspace_root=Path("/packet"),
+                    packet="FP-TEST-PACKET",
+                )
+                probe = private_netns_probe.Probe(args)
+                probe.service_id = "a" * 64
+                probe.client_id = "b" * 64
+                containers, network = self.private_container_fixture()
+                target = containers[0]
+                if mutation == "extra_network":
+                    target["NetworkSettings"]["Networks"]["foreign"] = {}
+                elif mutation == "binding":
+                    target["NetworkSettings"]["Ports"]["5432/tcp"] = [
+                        {"HostIp": "127.0.0.1", "HostPort": "56422"}
+                    ]
+                elif mutation == "bind":
+                    target["HostConfig"]["Binds"] = ["/host:/container"]
+                elif mutation == "privileged":
+                    target["HostConfig"]["Privileged"] = True
+                else:
+                    target["Mounts"] = [{"Type": "volume"}]
+                responses = [
+                    subprocess.CompletedProcess([], 0, json.dumps(containers).encode(), b""),
+                    subprocess.CompletedProcess([], 0, json.dumps(network).encode(), b""),
+                ]
+                with mock.patch.object(private_netns_probe, "run_command", side_effect=responses):
+                    with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                        probe.verify_container_contract()
+                self.assertEqual(raised.exception.code, "PRIVATE_CONTAINER_CONTRACT_INVALID")
+
+    def test_firewall_digests_ignore_only_admitted_volatile_fields(self) -> None:
+        first = {
+            "nftables": [
+                {"metainfo": {"json_schema_version": 1}},
+                {"table": {"family": "inet", "name": "foreign", "handle": 1}},
+                {"chain": {"family": "inet", "table": "foreign", "name": "input", "handle": 2}},
+                {
+                    "rule": {
+                        "family": "inet",
+                        "table": "foreign",
+                        "chain": "input",
+                        "expr": [{"counter": {"packets": 1, "bytes": 2}}, {"accept": None}],
+                        "handle": 3,
+                    }
+                },
+            ]
+        }
+        volatile = copy.deepcopy(first)
+        volatile["nftables"][1]["table"]["handle"] = 91
+        volatile["nftables"][3]["rule"]["expr"][0]["counter"]["packets"] = 99
+        a = private_netns_probe.firewall_snapshot_from_json(json.dumps(first).encode())
+        b = private_netns_probe.firewall_snapshot_from_json(json.dumps(volatile).encode())
+        self.assertEqual(a, b)
+        reordered = {"nftables": [first["nftables"][0], first["nftables"][2], first["nftables"][1], first["nftables"][3]]}
+        c = private_netns_probe.firewall_snapshot_from_json(json.dumps(reordered).encode())
+        self.assertNotEqual(a[0], c[0])
+        self.assertEqual(a[1], c[1])
+        semantic_drift = copy.deepcopy(first)
+        semantic_drift["nftables"][3]["rule"]["expr"][-1] = {"drop": None}
+        d = private_netns_probe.firewall_snapshot_from_json(json.dumps(semantic_drift).encode())
+        self.assertNotEqual(a[1], d[1])
+
+    def test_host_link_digest_ignores_index_but_not_topology(self) -> None:
+        first = [{"ifindex": 2, "ifname": "eth0", "flags": ["UP"], "link_type": "ether", "address": "00:11"}]
+        second = [{"ifindex": 90, "ifname": "eth0", "flags": ["UP"], "link_type": "ether", "address": "aa:bb"}]
+        changed = [{"ifindex": 2, "ifname": "veth-owned", "flags": ["UP"], "link_type": "ether", "address": "00:11"}]
+        self.assertEqual(
+            private_netns_probe.host_link_digest(json.dumps(first).encode()),
+            private_netns_probe.host_link_digest(json.dumps(second).encode()),
+        )
+        self.assertNotEqual(
+            private_netns_probe.host_link_digest(json.dumps(first).encode()),
+            private_netns_probe.host_link_digest(json.dumps(changed).encode()),
+        )
+
+    def test_probe_source_forbids_install_and_host_configuration_mutation(self) -> None:
+        for forbidden in (
+            "apt-get",
+            "apt install",
+            "dnf install",
+            "sysctl -w",
+            "systemctl",
+            "service docker",
+            "--privileged",
+            "tcp://",
+            "/etc/docker",
+            "docker context",
+            "buildkit",
+            "supabase",
+        ):
+            self.assertNotIn(forbidden, self.source.lower())
+        self.assertNotIn("shell=True", self.source)
+        self.assertIn('subprocess.DEVNULL', self.source)
+
+    def test_runner_invokes_probe_before_host_network_creation_and_never_cli(self) -> None:
+        function = self.runner[
+            self.runner.index("run_private_docker_netns_probe() {") : self.runner.index(
+                "firewall_counter_value() {"
+            )
+        ]
+        self.assertIn('sudo -n env -i', function)
+        self.assertIn('private_docker_netns_probe.py', function)
+        self.assertIn('validate --input "$PRIVATE_NETNS_STATE_FILE"', function)
+        self.assertIn('rm -f -- "$probe_stderr"', function)
+        self.assertNotIn("supabase", function.lower())
+        self.assertNotIn("gotrue", function.lower())
+        dispatch = self.runner.index(
+            'if [[ "$MODE" == "private-netns-probe" ]]; then\n  run_private_docker_netns_probe'
+        )
+        self.assertLess(dispatch, self.runner.index("mapfile -t existing_prefixes"))
+
+    def test_namespace_process_cgroup_canary_and_cleanup_gates_are_mandatory(self) -> None:
+        for fragment in (
+            "namespace_identity",
+            "containerd-shim",
+            "cgroup.procs",
+            "PRIVATE_INTERCONTAINER_FAILED",
+            "PRIVATE_DEFAULT_ROUTE_PRESENT",
+            "PRIVATE_EXTERNAL_DNS_SUCCEEDED",
+            "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED",
+            "PRIVATE_METADATA_EGRESS_SUCCEEDED",
+            "PRIVATE_GATEWAY_REACHABLE",
+            "PRIVATE_REGISTRY_ACCESS_SUCCEEDED",
+            "127.0.0.1",
+            "cleanup.containers_remaining",
+            "cleanup.images_remaining",
+            "cleanup.volumes_remaining",
+            "cleanup.networks_remaining",
+            "cleanup.listeners_remaining",
+            "cleanup.processes_remaining",
+            "cleanup.namespaces_remaining",
+            "cleanup.veths_remaining",
+            "cleanup.cgroups_remaining",
+            "cleanup.scratch_remaining",
+        ):
+            self.assertIn(fragment, self.source)
+        self.assertIn("links_restored and namespace_count == 0", self.source)
+        self.assertNotIn('cleanup.veths_remaining\"] = 0\n', self.source)
+
+    def test_missing_required_pass_evidence_becomes_stable_rejection(self) -> None:
+        class IncompleteProbe:
+            def __init__(self, _args: object):
+                self.receipt = private_netns_probe.default_receipt()
+
+            def execute(self) -> None:
+                return None
+
+            def cleanup(self) -> bool:
+                self.receipt["diagnostic.private_netns.cleanup.succeeded"] = True
+                return True
+
+        with mock.patch.object(private_netns_probe, "Probe", IncompleteProbe):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                rc = private_netns_probe.run_probe(object())
+        self.assertEqual(rc, 1)
+        receipt = private_netns_probe.parse_receipt(stdout.getvalue().encode())
+        self.assertEqual(
+            receipt["diagnostic.private_netns.classification"],
+            private_netns_probe.REJECT_CLASS,
+        )
+        self.assertEqual(
+            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_RESIDUE"
+        )
+
+    def test_runner_cleanup_contract_includes_private_packet_and_scratch(self) -> None:
+        self.assertIn('"label=io.fawxzzy.packet=${PRIVATE_NETNS_PACKET}"', self.runner)
+        self.assertIn('run|direct-port|private-netns-probe', self.runner)
+        self.assertIn('"private-netns/",', self.runner)
+        self.assertIn('"private-netns-probe.tsv",', self.runner)
+        self.assertIn(
+            'mode$\'\\t\'str$\'\\t\'(run|direct-port|firewall-rehearsal|private-netns-probe)',
+            self.runner,
+        )
 
 
 class FirewallBoundaryTests(unittest.TestCase):
