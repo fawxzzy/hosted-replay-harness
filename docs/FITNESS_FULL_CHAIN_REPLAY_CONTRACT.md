@@ -58,9 +58,13 @@ network through the trusted host executor. The pinned Supabase CLI `v2.109.1`
 receives only the policy-observer socket, not the private daemon socket, and
 uses the reviewed no-source configuration. The host executor accepts one
 database container only when its exact project label, one-network attachment,
-and zero host publication are proven. All SQL is streamed with `docker exec
--i` by the trusted packet executor; no host database listener or database URI
-is used.
+and the single policy-mandated `5432/tcp` mapping to
+`127.0.0.1:56422` inside the private daemon's network namespace are proven.
+Empty, wildcard, IPv6, wrong-port, additional-binding, and additional-port
+representations are rejected. The initial JIT host must still prove zero host
+publication and no listener on 56422. All SQL is streamed with `docker exec -i`
+by the trusted packet executor; no host database listener or database URI is
+used.
 
 No source or target project ref, access token, API key, JWT, password, linked
 state, Auth identity, provider credential, remote database URL, or real user
@@ -81,9 +85,10 @@ base history intentionally reserves human member number `0`, while migration
 - fixed synthetic UUIDs with no email, Discord identity, or external account.
 
 Migration 102 is then applied exactly once as the candidate-chain delta. The
-adapter records all 102 ordinal/path/digest/duration records. Re-executing its
-SQL later is an explicit idempotency probe and is not recorded as a second
-chain application.
+adapter records all 102 ordinal/path/digest/applied/duration records. Every
+`applied` value must be a JSON boolean, and a PASS receipt requires every value
+to be `true`. Re-executing migration 102 later is an explicit idempotency probe
+and is not recorded as a second chain application.
 
 The proof deletes `human-003` and requires that only its mapping disappears and
 number `3` remains a gap. Eight fixed synthetic humans are inserted through

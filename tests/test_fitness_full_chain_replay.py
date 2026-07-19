@@ -175,6 +175,22 @@ class FitnessReceiptTests(unittest.TestCase):
             with self.subTest(keys=value["cleanup"].keys()), self.assertRaises(ValueError):
                 self.validate(value)
 
+    def test_pass_receipt_requires_boolean_true_applied_records(self) -> None:
+        for applied in (False, "true", 1, None):
+            receipt = copy.deepcopy(self.valid)
+            receipt["migrations"]["records"][0]["applied"] = applied
+            records = receipt["migrations"]["records"]
+            payload = [
+                {key: row[key] for key in ("ordinal", "path", "sha256", "applied")}
+                for row in records
+            ]
+            receipt["migrations"]["records_digest"] = adapter.sha256_bytes(
+                adapter.canonical_bytes(payload)
+            )
+            self.resigned(receipt)
+            with self.subTest(applied=applied), self.assertRaises(ValueError):
+                self.validate(receipt)
+
     def test_receipt_rejects_unsafe_fields_and_values(self) -> None:
         for key, value in [
             ("email", "synthetic" + "@" + "example.com"),
@@ -235,6 +251,45 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
         self.assertIn('cli_env["DOCKER_HOST"] = self.cli_observer_host', start)
         self.assertNotIn('cli_env["DOCKER_HOST"] = self.docker_host', start)
 
+    def test_private_database_publication_is_exact_loopback_only(self) -> None:
+        expected = {
+            "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}],
+        }
+        adapter.validate_private_database_publication(expected)
+        rejected = [
+            {},
+            {"5432/tcp": None},
+            {"5432/tcp": []},
+            {"5432/tcp": [{"HostIp": "", "HostPort": "56422"}]},
+            {"5432/tcp": [{"HostIp": "0.0.0.0", "HostPort": "56422"}]},
+            {"5432/tcp": [{"HostIp": "::", "HostPort": "56422"}]},
+            {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "5432"}]},
+            {"5432/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": "56422"},
+                {"HostIp": "127.0.0.1", "HostPort": "56423"},
+            ]},
+            {
+                "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422"}],
+                "5433/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56423"}],
+            },
+            {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "56422", "extra": True}]},
+        ]
+        for ports in rejected:
+            with self.subTest(ports=ports), self.assertRaises(ValueError):
+                adapter.validate_private_database_publication(ports)
+
+    def test_private_namespace_publication_does_not_relax_host_listener_gate(self) -> None:
+        self.assertEqual(self.contract["foundation"]["observer_policy"], "foundation-db-start-v1")
+        self.assertEqual(adapter.PRIVATE_DATABASE_PORT, "56422")
+        config = (ROOT / "supabase/config.toml").read_text(encoding="utf-8")
+        self.assertRegex(config, r"(?m)^\[db\]\nport = 56422$")
+        receipt = adapter.default_receipt(self.contract, "a" * 40, "b" * 40)
+        self.assertEqual(receipt["containment"]["host_publication_count"], 0)
+        self.assertIn(
+            'listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))',
+            self.source,
+        )
+
     def test_source_is_staged_before_runtime_attestation(self) -> None:
         execute = self.source[self.source.index("def execute(expected_head:") : self.source.index("def verify_receipt(path:")]
         self.assertLess(execute.index("stage_source(SOURCE_ROOT"), execute.index("runtime.attest()"))
@@ -251,7 +306,7 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
         self.assertIn("label=com.supabase.cli.project", self.source)
         self.assertIn("label=io.fawxzzy.packet", self.source)
         self.assertIn('["ls", "-aq"] if object_type == "container"', self.source)
-        self.assertIn('listener.bind(("127.0.0.1", 56422))', self.source)
+        self.assertIn('listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))', self.source)
         self.assertIn('network_names - {"bridge", "host", "none"}', self.source)
         self.assertNotRegex(self.source, r"system\s+prune|volume\s+prune|network\s+prune|rm\s+-rf\s+/|container\s+prune")
         self.assertIn("cleanup_only(expected_head", self.source)

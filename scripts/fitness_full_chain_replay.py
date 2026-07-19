@@ -36,6 +36,7 @@ ARTIFACT_PATH = ROOT / "artifacts" / "fitness-full-chain-replay.json"
 SOURCE_ROOT = ROOT / ".fitness-replay-runtime"
 WORKFLOW_PATH = ".github/workflows/fitness-full-chain-replay.yml"
 ZERO_SHA256 = "0" * 64
+PRIVATE_DATABASE_PORT = "56422"
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MIGRATION_PATH = re.compile(r"^supabase/migrations/[0-9A-Za-z_]+\.sql$")
@@ -135,6 +136,14 @@ def run_command(
 def require_keys(value: dict[str, Any], keys: set[str]) -> None:
     if set(value) != keys:
         raise ValueError("closed schema mismatch")
+
+
+def validate_private_database_publication(ports: Any) -> None:
+    expected = {
+        "5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": PRIVATE_DATABASE_PORT}],
+    }
+    if ports != expected:
+        raise ValueError("publication")
 
 
 def chain_digest(rows: list[dict[str, Any]]) -> str:
@@ -266,6 +275,8 @@ def validate_receipt(receipt: dict[str, Any], manifest: dict[str, Any], contract
             raise ValueError("receipt migration order")
         if record["sha256"] != manifest["migrations"][index - 1]["sha256"]:
             raise ValueError("receipt migration digest")
+        if not isinstance(record["applied"], bool):
+            raise ValueError("receipt migration applied")
         if not isinstance(record["duration_ms"], int) or not 0 <= record["duration_ms"] <= 120000:
             raise ValueError("receipt duration")
     records_payload = [{key: row[key] for key in ("ordinal", "path", "sha256", "applied")} for row in records]
@@ -344,6 +355,8 @@ def validate_receipt(receipt: dict[str, Any], manifest: dict[str, Any], contract
             raise ValueError("source isolation proof")
         if migrations["ordered_count"] != 102 or migrations["candidate_applied_count"] != 1 or not migrations["idempotency_rerun"]:
             raise ValueError("migration acceptance")
+        if not all(record["applied"] is True for record in records):
+            raise ValueError("migration application acceptance")
         if not cleanup["attempted"] or not cleanup["succeeded"] or any(cleanup[key] != 0 for key in required_cleanup - {"attempted", "succeeded"}):
             raise ValueError("cleanup acceptance")
         if not all(value is True for value in containment.values() if isinstance(value, bool)):
@@ -649,8 +662,7 @@ class PrivateRuntime:
                 raise ValueError("ownership")
             if set(networks) != {self.network_name}:
                 raise ValueError("network")
-            if any(isinstance(value, list) and value for value in ports.values()):
-                raise ValueError("publication")
+            validate_private_database_publication(ports)
             self.owned_ids.append(container_id)
         except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             raise ReplayFailure("CONTAINMENT_PROOF_FAILED") from None
@@ -836,7 +848,7 @@ class PrivateRuntime:
         self.receipt["cleanup"].update(counts)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-                listener.bind(("127.0.0.1", 56422))
+                listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))
             listener_count = 0
         except OSError:
             listener_count = 1
