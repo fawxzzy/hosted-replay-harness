@@ -66,6 +66,9 @@ CLEANUP_STATE_FILE="$ROOT/artifacts/.cleanup-state.tsv"
 CLEANUP_MODE_FILE="$ROOT/artifacts/.cleanup-mode.tsv"
 CLEANUP_MODE_STAGE_FILE="$ROOT/artifacts/.cleanup-mode.tsv.stage"
 CLEANUP_MODE_SCHEMA="fawxzzy.hosted-replay-harness.cleanup-mode.v1"
+SCRATCH_AUDIT_STAGE_FILE="$ROOT/artifacts/.packet-scratch-audit.jsonl.stage"
+SCRATCH_PROOF_STAGE_FILE="$ROOT/artifacts/.packet-scratch-proof.tsv.stage"
+SCRATCH_PROOF_SCHEMA="fawxzzy.hosted-replay-harness.packet-scratch-proof.v1"
 FIREWALL_LEDGER="$ROOT/artifacts/.firewall-ledger.json"
 FIREWALL_COMPLETION="$FIREWALL_LEDGER.restoration-complete"
 FIREWALL_COMPLETION_STAGE="$ROOT/artifacts/.$(basename "$FIREWALL_COMPLETION").stage"
@@ -354,11 +357,298 @@ print(code)
 PY
 }
 
+# BEGIN PACKET_SCRATCH_FUNCTION
+validate_packet_scratch_proof() {
+  local path="$1" phase="$2"
+  python3 -B - "$path" "$phase" "$SCRATCH_PROOF_SCHEMA" >/dev/null 2>&1 <<'PY'
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+phase = sys.argv[2]
+schema = sys.argv[3]
+try:
+    info = path.lstat()
+    effective_uid = os.geteuid() if hasattr(os, "geteuid") else info.st_uid
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != effective_uid
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise SystemExit(1)
+    text = path.read_bytes().decode("utf-8", "strict")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if not text.endswith("\n") or "\r" in text or "\x00" in text:
+    raise SystemExit(1)
+rows = text[:-1].split("\n")
+names = (
+    "schema", "phase", "root_identity_sha256", "allowlist_sha256",
+    "allowlist_count", "root_valid", "audit_staged", "cleanup_attempted",
+    "cleanup_succeeded", "remaining_entry_count", "escape_count",
+    "symlink_count", "reparse_count", "ownership_mismatch_count",
+    "allowlist_mismatch_count", "proof_status", "proof_sha256",
+)
+kinds = (
+    "str", "str", "str", "str", "int", "bool", "bool", "bool", "bool",
+    "int", "int", "int", "int", "int", "int", "str", "str",
+)
+if len(rows) != len(names):
+    raise SystemExit(1)
+parsed = []
+for row, name, kind in zip(rows, names, kinds):
+    parts = row.split("\t")
+    if len(parts) != 3 or parts[:2] != [f"scratch.{phase}.{name}", kind]:
+        raise SystemExit(1)
+    parsed.append(parts[2])
+if parsed[0] != schema or parsed[1] != phase:
+    raise SystemExit(1)
+for value in (parsed[2], parsed[3], parsed[16]):
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise SystemExit(1)
+for index in (4, 9, 10, 11, 12, 13, 14):
+    if not re.fullmatch(r"0|[1-9][0-9]*", parsed[index]):
+        raise SystemExit(1)
+for index in (5, 6, 7, 8):
+    if parsed[index] not in {"true", "false"}:
+        raise SystemExit(1)
+if parsed[15] not in {
+    "PASS", "ROOT_INVALID", "AUDIT_INVALID", "OWNERSHIP_OR_ESCAPE_REJECTED",
+    "ALLOWLIST_REJECTED", "CLEANUP_FAILED",
+}:
+    raise SystemExit(1)
+expected = hashlib.sha256(("\n".join(rows[:16]) + "\n").encode("utf-8")).hexdigest()
+if parsed[16] != expected:
+    raise SystemExit(1)
+PY
+}
+
+cleanup_packet_scratch() {
+  local phase="$1" proof_rc=0
+  case "$phase" in
+    primary|cleanup) ;;
+    *) return 1 ;;
+  esac
+  [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" && ! -L "$SCRATCH_AUDIT_STAGE_FILE" \
+    && ! -e "$SCRATCH_PROOF_STAGE_FILE" && ! -L "$SCRATCH_PROOF_STAGE_FILE" ]] || return 1
+  python3 -B - "$RUNTIME" "$AUDIT_FILE" "$SCRATCH_AUDIT_STAGE_FILE" \
+    "$SCRATCH_PROOF_STAGE_FILE" "$phase" "$PACKET" "$SCRATCH_PROOF_SCHEMA" \
+    >/dev/null 2>&1 <<'PY' || proof_rc=1
+import hashlib
+import os
+import pathlib
+import shutil
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+audit = pathlib.Path(sys.argv[2])
+audit_stage = pathlib.Path(sys.argv[3])
+proof_stage = pathlib.Path(sys.argv[4])
+phase = sys.argv[5]
+packet = sys.argv[6]
+schema = sys.argv[7]
+allowed_roots = (
+    "bin/",
+    "home/",
+    "project/",
+    "raw/",
+    "root-init/",
+)
+allowed_files = (
+    "cli-archive-contract.tsv",
+    "container-violations.jsonl",
+    "db-start-diagnostic.tsv",
+    "direct-port-probe.tsv",
+    "docker-api-boundary.tsv",
+    "docker-api-policy.json",
+    "docker-api.ready",
+    "docker-api.sock",
+    "docker-event-history.tsv",
+    "firewall-counters.tsv",
+    "firewall-install.tsv",
+    "firewall-marker-counters.tsv",
+    "firewall-marker-install.tsv",
+    "firewall-marker-manifest.tsv",
+    "firewall-phase-manifest.tsv",
+    "firewall-port-probe.tsv",
+    "firewall-prepare.tsv",
+    "firewall-state.tsv",
+    "host-test-listener.ready",
+    "publication-firewall_client.tsv",
+    "publication-foreign_canary.tsv",
+    "supabase_2.109.1_linux_amd64.tar.gz",
+    "watcher.ready",
+)
+allowlist = tuple(sorted((*allowed_roots, *allowed_files)))
+root_identity = hashlib.sha256(
+    f"{schema}|{packet}|.smoke-runtime".encode("utf-8")
+).hexdigest()
+allowlist_sha = hashlib.sha256(
+    ("\n".join(allowlist) + "\n").encode("utf-8")
+).hexdigest()
+
+root_valid = False
+audit_staged = False
+cleanup_attempted = False
+cleanup_succeeded = False
+remaining = 0
+escape_count = 0
+symlink_count = 0
+reparse_count = 0
+ownership_mismatch_count = 0
+allowlist_mismatch_count = 0
+status = "ROOT_INVALID"
+effective_uid = os.geteuid() if hasattr(os, "geteuid") else root.parent.stat().st_uid
+
+try:
+    expected_root = root.parent.resolve(strict=True) / ".smoke-runtime"
+    observed = root.lstat()
+    root_valid = (
+        phase in {"primary", "cleanup"}
+        and root == expected_root
+        and stat.S_ISDIR(observed.st_mode)
+        and not stat.S_ISLNK(observed.st_mode)
+        and observed.st_uid == effective_uid
+    )
+except (OSError, RuntimeError, ValueError):
+    root_valid = False
+
+if root_valid:
+    try:
+        expected_artifacts = root.parent / "artifacts"
+        stage_parent = audit_stage.parent.resolve(strict=True)
+        proof_parent = proof_stage.parent.resolve(strict=True)
+        audit_info = audit.lstat()
+        if (
+            audit == root / "container-audit.jsonl"
+            and stage_parent == expected_artifacts.resolve(strict=True)
+            and proof_parent == expected_artifacts.resolve(strict=True)
+            and audit_stage == expected_artifacts / ".packet-scratch-audit.jsonl.stage"
+            and proof_stage == expected_artifacts / ".packet-scratch-proof.tsv.stage"
+            and not os.path.lexists(audit_stage)
+            and not os.path.lexists(proof_stage)
+            and stat.S_ISREG(audit_info.st_mode)
+            and not stat.S_ISLNK(audit_info.st_mode)
+            and audit_info.st_uid == effective_uid
+        ):
+            os.replace(audit, audit_stage)
+            audit_staged = True
+    except (OSError, RuntimeError, ValueError):
+        audit_staged = False
+
+if root_valid and audit_staged:
+    root_resolved = root.resolve(strict=True)
+    try:
+        paths = sorted(root.rglob("*"), key=lambda item: item.as_posix())
+    except OSError:
+        paths = []
+        escape_count += 1
+    remaining = len(paths)
+    for path in paths:
+        try:
+            info = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            resolved = path.resolve(strict=False)
+            if os.path.commonpath((str(root_resolved), str(resolved))) != str(root_resolved):
+                escape_count += 1
+            if stat.S_ISLNK(info.st_mode):
+                symlink_count += 1
+            if getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+                reparse_count += 1
+            if info.st_uid != effective_uid:
+                ownership_mismatch_count += 1
+            admitted = relative in allowed_files or any(
+                relative == root_name[:-1] or relative.startswith(root_name)
+                for root_name in allowed_roots
+            )
+            if not admitted:
+                allowlist_mismatch_count += 1
+        except (OSError, RuntimeError, ValueError):
+            escape_count += 1
+
+    if any((escape_count, symlink_count, reparse_count, ownership_mismatch_count)):
+        status = "OWNERSHIP_OR_ESCAPE_REJECTED"
+    elif allowlist_mismatch_count:
+        status = "ALLOWLIST_REJECTED"
+    else:
+        cleanup_attempted = True
+        try:
+            shutil.rmtree(root)
+            remaining = 0 if not os.path.lexists(root) else 1
+            cleanup_succeeded = remaining == 0
+            status = "PASS" if cleanup_succeeded else "CLEANUP_FAILED"
+        except OSError:
+            remaining = 1 if os.path.lexists(root) else 0
+            status = "CLEANUP_FAILED"
+elif root_valid:
+    status = "AUDIT_INVALID"
+
+fields = [
+    (f"scratch.{phase}.schema", "str", schema),
+    (f"scratch.{phase}.phase", "str", phase),
+    (f"scratch.{phase}.root_identity_sha256", "str", root_identity),
+    (f"scratch.{phase}.allowlist_sha256", "str", allowlist_sha),
+    (f"scratch.{phase}.allowlist_count", "int", len(allowlist)),
+    (f"scratch.{phase}.root_valid", "bool", str(root_valid).lower()),
+    (f"scratch.{phase}.audit_staged", "bool", str(audit_staged).lower()),
+    (f"scratch.{phase}.cleanup_attempted", "bool", str(cleanup_attempted).lower()),
+    (f"scratch.{phase}.cleanup_succeeded", "bool", str(cleanup_succeeded).lower()),
+    (f"scratch.{phase}.remaining_entry_count", "int", remaining),
+    (f"scratch.{phase}.escape_count", "int", escape_count),
+    (f"scratch.{phase}.symlink_count", "int", symlink_count),
+    (f"scratch.{phase}.reparse_count", "int", reparse_count),
+    (f"scratch.{phase}.ownership_mismatch_count", "int", ownership_mismatch_count),
+    (f"scratch.{phase}.allowlist_mismatch_count", "int", allowlist_mismatch_count),
+    (f"scratch.{phase}.proof_status", "str", status),
+]
+payload = "".join(f"{key}\t{kind}\t{value}\n" for key, kind, value in fields)
+proof_sha = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+payload += f"scratch.{phase}.proof_sha256\tstr\t{proof_sha}\n"
+try:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(proof_stage, flags, 0o600)
+    try:
+        os.write(descriptor, payload.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if status == "PASS" else 1)
+PY
+  if [[ ! -f "$SCRATCH_PROOF_STAGE_FILE" || -L "$SCRATCH_PROOF_STAGE_FILE" ]]; then
+    record "scratch.${phase}.proof_status" str PROOF_INVALID || true
+    [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" ]] || AUDIT_FILE="$SCRATCH_AUDIT_STAGE_FILE"
+    return 1
+  fi
+  if ! validate_packet_scratch_proof "$SCRATCH_PROOF_STAGE_FILE" "$phase"; then
+    rm -f -- "$SCRATCH_PROOF_STAGE_FILE"
+    record "scratch.${phase}.proof_status" str PROOF_INVALID || true
+    [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" ]] || AUDIT_FILE="$SCRATCH_AUDIT_STAGE_FILE"
+    return 1
+  fi
+  cat "$SCRATCH_PROOF_STAGE_FILE" >>"$STATE_FILE" || return 1
+  rm -f -- "$SCRATCH_PROOF_STAGE_FILE" || return 1
+  [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" ]] || AUDIT_FILE="$SCRATCH_AUDIT_STAGE_FILE"
+  [[ "$proof_rc" == "0" ]]
+}
+# END PACKET_SCRATCH_FUNCTION
+
 publish_result_receipt() {
-  local expected_status="$1" operation="$2"
+  local expected_status="$1" operation="$2" writer_rc=0
   local -a writer_args=(
     --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_STAGE_FILE"
   )
+  [[ ! -e "$SCRATCH_PROOF_STAGE_FILE" && ! -L "$SCRATCH_PROOF_STAGE_FILE" ]] || return 1
+  if [[ "$AUDIT_FILE" == "$SCRATCH_AUDIT_STAGE_FILE" ]]; then
+    [[ -f "$SCRATCH_AUDIT_STAGE_FILE" && ! -L "$SCRATCH_AUDIT_STAGE_FILE" ]] || return 1
+  fi
   rm -f -- "$RESULT_STAGE_FILE" || return 1
   case "$operation" in
     replace) ;;
@@ -369,8 +659,13 @@ publish_result_receipt() {
       ;;
     *) return 1 ;;
   esac
-  if ! python3 "$ROOT/scripts/write_result.py" "${writer_args[@]}" \
-    >"$RAW/result-writer.log" 2>&1; then
+  python3 "$ROOT/scripts/write_result.py" "${writer_args[@]}" \
+    >/dev/null 2>&1 || writer_rc=1
+  if [[ "$AUDIT_FILE" == "$SCRATCH_AUDIT_STAGE_FILE" ]]; then
+    rm -f -- "$SCRATCH_AUDIT_STAGE_FILE" || writer_rc=1
+    [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" && ! -L "$SCRATCH_AUDIT_STAGE_FILE" ]] || writer_rc=1
+  fi
+  if [[ "$writer_rc" != "0" ]]; then
     rm -f -- "$RESULT_STAGE_FILE"
     return 1
   fi
@@ -1452,7 +1747,7 @@ cleanup_exact() {
 
 finalize() {
   local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1
-  local primary_failure listener_phase receipt_failure=0
+  local primary_failure listener_phase receipt_failure=0 cleanup_rc=0 scratch_rc=0
   [[ "$FINALIZING" == "0" ]] || return
   FINALIZING=1
   set +e
@@ -1486,6 +1781,7 @@ finalize() {
   fi
 
   if ! cleanup_exact; then
+    cleanup_rc=1
     record cleanup.failure_code str CLEANUP_RESIDUE
     primary_failure="$(current_failure_code)"
     if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
@@ -1493,7 +1789,19 @@ finalize() {
       record failure.code str CLEANUP_RESIDUE
       record failure.detail str exact-packet-resource-remains
     fi
-  elif [[ "$SMOKE_PASSED" == "1" && "$original_rc" == "0" && "$network_contract_ok" == "1" ]]; then
+  fi
+  if ! cleanup_packet_scratch primary; then
+    scratch_rc=1
+    record cleanup.scratch_failure_code str PACKET_SCRATCH_PROOF_FAILED || true
+    primary_failure="$(current_failure_code)"
+    if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+      record status str BLOCKED || true
+      record failure.code str PACKET_SCRATCH_PROOF_FAILED || true
+      record failure.detail str packet-scratch-not-proven || true
+    fi
+  fi
+  if [[ "$cleanup_rc" == "0" && "$scratch_rc" == "0" \
+    && "$SMOKE_PASSED" == "1" && "$original_rc" == "0" && "$network_contract_ok" == "1" ]]; then
     if [[ "$MODE" == "direct-port" ]]; then
       record status str DIRECT_DOCKER_PORT_PATH_PASS
       final_status=DIRECT_DOCKER_PORT_PATH_PASS
@@ -1506,7 +1814,7 @@ finalize() {
       final_status=CONTAINMENT_SMOKE_PASS
     fi
     final_rc=0
-  else
+  elif [[ "$cleanup_rc" == "0" && "$scratch_rc" == "0" ]]; then
     if ! grep -q $'^status\tstr\tBLOCKED$' "$STATE_FILE" 2>/dev/null; then
       record status str BLOCKED
       record failure.code str HARNESS_INTERRUPTED
@@ -1538,15 +1846,12 @@ finalize() {
   fi
 
   [[ "$receipt_failure" != "0" ]] || rm -f -- "$STATE_FILE"
-  case "$RUNTIME" in
-    "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
-  esac
   trap - EXIT
   exit "$final_rc"
 }
 
 cleanup_only() {
-  local cleanup_rc=0 recovery_state=0 expected_status=BLOCKED publish_operation=merge
+  local cleanup_rc=0 recovery_state=0 expected_status=BLOCKED publish_operation=merge scratch_rc=0
   local primary_failure existing_status="" existing_failure=""
   mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
   if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
@@ -1612,6 +1917,17 @@ cleanup_only() {
     fi
     cleanup_rc=1
   fi
+  if ! cleanup_packet_scratch cleanup; then
+    scratch_rc=1
+    cleanup_rc=1
+    record cleanup.scratch_failure_code str PACKET_SCRATCH_PROOF_FAILED || true
+    primary_failure="$(current_failure_code)"
+    record status str BLOCKED || true
+    if [[ -z "$primary_failure" || "$primary_failure" == "HARNESS_INTERRUPTED" ]]; then
+      record failure.code str PACKET_SCRATCH_PROOF_FAILED || true
+      record failure.detail str packet-scratch-not-proven || true
+    fi
+  fi
   if [[ ! -f "$RESULT_FILE" ]]; then
     publish_operation=replace
     if [[ "$recovery_state" == "1" && "$cleanup_rc" == "0" ]]; then
@@ -1656,9 +1972,6 @@ cleanup_only() {
     rm -f -- "$STATE_FILE" "$CLEANUP_STATE_FILE"
     rm -f -- "$FIREWALL_ROLLBACK_RECEIPT"
   fi
-  case "$RUNTIME" in
-    "$ROOT"/.smoke-runtime) rm -rf -- "$RUNTIME" ;;
-  esac
   [[ "$cleanup_rc" == "0" ]] || exit "$cleanup_rc"
   printf 'CLEANUP_EXACT_PASS\n'
   exit 0

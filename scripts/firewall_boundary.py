@@ -173,7 +173,11 @@ LEDGER_KEYS = {
     "interface",
     "subnet",
     "preimage_sha256",
+    "preimage_semantic_sha256",
     "preimage_counts",
+    "installation_sha256",
+    "installation_semantic_sha256",
+    "installation_counts",
     "installed",
     "owned_sha256",
     "markers_installed",
@@ -208,6 +212,12 @@ def state_line(key: str, kind: str, value: Any) -> str:
 def emit(values: list[tuple[str, str, Any]]) -> None:
     for key, kind, value in values:
         print(state_line(key, kind, value))
+    sys.stdout.flush()
+    try:
+        os.fsync(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        # Tests and callers may intentionally use an in-memory sanitized sink.
+        pass
 
 
 def _run(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -359,6 +369,42 @@ def canonical_snapshot(
             counts[kind] = counts.get(kind, 0) + 1
     encoded = json.dumps(retained, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), dict(sorted(counts.items()))
+
+
+def semantic_snapshot(
+    entries: list[dict[str, Any]], *, exclude_table: str | None = None
+) -> str:
+    """Hash semantic topology while ignoring only safe top-level list ordering.
+
+    Independent nft object records may be serialized in a different top-level
+    order. Rule order within each exact chain remains ordered and therefore
+    semantic. All object fields continue to use the same narrow volatile-field
+    exclusions as ``canonical_snapshot``.
+    """
+
+    non_rules: list[str] = []
+    rule_groups: dict[str, list[Any]] = {}
+    for entry in entries:
+        if "metainfo" in entry:
+            continue
+        if exclude_table and belongs_to_table(entry, exclude_table):
+            continue
+        canonical = _canonicalize(entry)
+        rule = canonical.get("rule") if isinstance(canonical, dict) else None
+        if isinstance(rule, dict):
+            identity = [rule.get("family"), rule.get("table"), rule.get("chain")]
+            identity_key = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            rule_groups.setdefault(identity_key, []).append(canonical)
+        else:
+            non_rules.append(json.dumps(canonical, sort_keys=True, separators=(",", ":")))
+    normalized = {
+        "non_rules": sorted(non_rules),
+        "rule_groups": [
+            {"identity": identity, "rules": rule_groups[identity]}
+            for identity in sorted(rule_groups)
+        ],
+    }
+    return canonical_json_sha256(normalized)
 
 
 def owned_entries(entries: list[dict[str, Any]], table_name: str) -> list[dict[str, Any]]:
@@ -1871,21 +1917,34 @@ def read_ledger(path: Path) -> dict[str, Any]:
         ledger.get("markers_installed"), bool
     ):
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    counts = ledger.get("preimage_counts")
-    if not isinstance(counts, dict) or any(
-        not isinstance(key, str) or not isinstance(value, int) or value < 0
-        for key, value in counts.items()
-    ):
-        raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    for key in ("preimage_sha256",):
+    for key in ("preimage_counts", "installation_counts"):
+        counts = ledger.get(key)
+        if not isinstance(counts, dict) or any(
+            not isinstance(kind, str) or not isinstance(value, int) or value < 0
+            for kind, value in counts.items()
+        ):
+            raise BoundaryError("FIREWALL_LEDGER_INVALID")
+    for key in ("preimage_sha256", "preimage_semantic_sha256"):
         value = ledger.get(key)
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
             raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    for key in ("owned_sha256", "marker_sha256", "combined_sha256"):
+    for key in (
+        "installation_sha256",
+        "installation_semantic_sha256",
+        "owned_sha256",
+        "marker_sha256",
+        "combined_sha256",
+    ):
         value = ledger.get(key)
         if not isinstance(value, str) or (value and not re.fullmatch(r"[0-9a-f]{64}", value)):
             raise BoundaryError("FIREWALL_LEDGER_INVALID")
-    if ledger["installed"] and not ledger["owned_sha256"]:
+    installation_recorded = bool(
+        ledger["installation_sha256"]
+        and ledger["installation_semantic_sha256"]
+    )
+    if ledger["installed"] != installation_recorded or (
+        ledger["installed"] and not ledger["owned_sha256"]
+    ) or (not ledger["installed"] and ledger["installation_counts"]):
         raise BoundaryError("FIREWALL_LEDGER_INVALID")
     if ledger["markers_installed"] != bool(
         ledger["marker_sha256"] and ledger["combined_sha256"]
@@ -2029,13 +2088,18 @@ def prepare(ledger_path: Path, interface: str, subnet: str) -> None:
     if owned_entries(entries, TABLE):
         raise BoundaryError("FIREWALL_TABLE_COLLISION")
     pre_sha, pre_counts = canonical_snapshot(entries, exclude_table=TABLE)
+    pre_semantic_sha = semantic_snapshot(entries, exclude_table=TABLE)
     ledger = {
         "schema": SCHEMA,
         "table": TABLE,
         "interface": interface,
         "subnet": subnet,
         "preimage_sha256": pre_sha,
+        "preimage_semantic_sha256": pre_semantic_sha,
         "preimage_counts": pre_counts,
+        "installation_sha256": "",
+        "installation_semantic_sha256": "",
+        "installation_counts": {},
         "installed": False,
         "owned_sha256": "",
         "markers_installed": False,
@@ -2051,6 +2115,7 @@ def prepare(ledger_path: Path, interface: str, subnet: str) -> None:
             ("firewall.runner_nonroot", "bool", runner_nonroot),
             ("firewall.prepared_before_network", "bool", True),
             ("firewall.preimage_sha256", "str", pre_sha),
+            ("firewall.preimage_semantic_sha256", "str", pre_semantic_sha),
             ("firewall.preimage_table_count", "int", pre_counts.get("table", 0)),
             ("firewall.preimage_chain_count", "int", pre_counts.get("chain", 0)),
             ("firewall.preimage_rule_count", "int", pre_counts.get("rule", 0)),
@@ -2074,6 +2139,9 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
         or ledger["installed"] is not False
         or ledger["markers_installed"] is not False
         or ledger["owned_sha256"]
+        or ledger["installation_sha256"]
+        or ledger["installation_semantic_sha256"]
+        or ledger["installation_counts"]
         or ledger["marker_sha256"]
         or ledger["combined_sha256"]
     ):
@@ -2084,6 +2152,7 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     if owned_entries(entries, TABLE):
         raise BoundaryError("FIREWALL_TABLE_COLLISION")
     install_pre_sha, install_pre_counts = canonical_snapshot(entries, exclude_table=TABLE)
+    install_pre_semantic_sha = semantic_snapshot(entries, exclude_table=TABLE)
     batch = build_batch(TABLE, interface, subnet)
     checked = _run([*prefix, "--check", "-f", "-"], input_text=batch)
     if checked.returncode != 0:
@@ -2097,6 +2166,9 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
     if foreign_sha != install_pre_sha or foreign_counts != install_pre_counts:
         raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
     ledger["installed"] = True
+    ledger["installation_sha256"] = install_pre_sha
+    ledger["installation_semantic_sha256"] = install_pre_semantic_sha
+    ledger["installation_counts"] = install_pre_counts
     ledger["owned_sha256"] = owned_sha
     write_ledger(ledger_path, ledger)
     emit(
@@ -2104,6 +2176,11 @@ def install(ledger_path: Path, interface: str, subnet: str) -> None:
             ("firewall.atomic_install", "bool", True),
             ("firewall.install_foreign_unchanged", "bool", True),
             ("firewall.install_preimage_sha256", "str", install_pre_sha),
+            (
+                "firewall.install_preimage_semantic_sha256",
+                "str",
+                install_pre_semantic_sha,
+            ),
             ("firewall.install_postimage_sha256", "str", foreign_sha),
             (
                 "firewall.install_preimage_table_count",
@@ -2296,6 +2373,45 @@ def marker_counters(ledger_path: Path) -> None:
     )
 
 
+def _restoration_observation_values(observation: dict[str, Any]) -> list[tuple[str, str, Any]]:
+    ordinal = int(observation["ordinal"])
+    prefix = f"firewall.restoration.observations.{ordinal:02d}"
+    return [
+        (f"{prefix}.ordinal", "int", ordinal),
+        (f"{prefix}.total", "int", RESTORATION_POLL_ATTEMPTS),
+        (f"{prefix}.query_succeeded", "bool", observation["query_succeeded"]),
+        (f"{prefix}.owned_shape_valid", "bool", observation["owned_shape_valid"]),
+        (f"{prefix}.owned_table_present", "bool", observation["owned_table_present"]),
+        (f"{prefix}.classification", "str", observation["classification"]),
+        (f"{prefix}.foreign_sha256", "str", observation["foreign_sha256"]),
+        (f"{prefix}.foreign_semantic_sha256", "str", observation["foreign_semantic_sha256"]),
+        (f"{prefix}.foreign_counts", "json", json.dumps(observation["foreign_counts"], sort_keys=True, separators=(",", ":"))),
+        (f"{prefix}.foreign_counts_sha256", "str", counts_sha256(observation["foreign_counts"])),
+        (f"{prefix}.equals_pre_network", "bool", observation["equals_pre_network"]),
+        (f"{prefix}.semantic_equals_pre_network", "bool", observation["semantic_equals_pre_network"]),
+        (f"{prefix}.equals_installation", "bool", observation["equals_installation"]),
+        (f"{prefix}.semantic_equals_installation", "bool", observation["semantic_equals_installation"]),
+        (f"{prefix}.equals_prior", "bool", observation["equals_prior"]),
+        (f"{prefix}.semantic_equals_prior", "bool", observation["semantic_equals_prior"]),
+        (f"{prefix}.error_class", "str", observation["error_class"]),
+    ]
+
+
+def _emit_restoration_summary(observations: list[dict[str, Any]], classification: str) -> None:
+    emit(
+        [
+            ("firewall.restoration_observation_count", "int", len(observations)),
+            ("firewall.restoration_observation_total", "int", RESTORATION_POLL_ATTEMPTS),
+            ("firewall.restoration_classification", "str", classification),
+            (
+                "firewall.restoration_observation_manifest_sha256",
+                "str",
+                canonical_json_sha256(observations),
+            ),
+        ]
+    )
+
+
 def wait_for_restoration_preimage(
     prefix: list[str], ledger: dict[str, Any], entries: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2306,23 +2422,148 @@ def wait_for_restoration_preimage(
     drift before the atomic deletion transaction.
     """
 
+    observations: list[dict[str, Any]] = []
+    prior_sha = ""
+    prior_semantic_sha = ""
+    prior_counts: dict[str, int] | None = None
     for attempt in range(RESTORATION_POLL_ATTEMPTS):
+        ordinal = attempt + 1
         selected = owned_entries(entries, TABLE)
-        if selected:
-            if ledger.get("markers_installed") is True:
-                _validated_current_owned(entries, ledger)
-            else:
-                validate_owned(entries, TABLE, markers_installed=False)
+        try:
+            if selected:
+                if ledger.get("markers_installed") is True:
+                    _validated_current_owned(entries, ledger)
+                else:
+                    validate_owned(entries, TABLE, markers_installed=False)
+        except BoundaryError as exc:
+            observation = {
+                "ordinal": ordinal,
+                "query_succeeded": True,
+                "owned_shape_valid": False,
+                "owned_table_present": bool(selected),
+                "classification": "OWNED_SHAPE_FAILED",
+                "foreign_sha256": "0" * 64,
+                "foreign_semantic_sha256": "0" * 64,
+                "foreign_counts": {},
+                "equals_pre_network": False,
+                "semantic_equals_pre_network": False,
+                "equals_installation": False,
+                "semantic_equals_installation": False,
+                "equals_prior": False,
+                "semantic_equals_prior": False,
+                "error_class": exc.code,
+            }
+            observations.append(observation)
+            emit(_restoration_observation_values(observation))
+            _emit_restoration_summary(observations, "OWNED_SHAPE_FAILED")
+            raise
         foreign_sha, foreign_counts = canonical_snapshot(entries, exclude_table=TABLE)
-        if (
+        foreign_semantic_sha = semantic_snapshot(entries, exclude_table=TABLE)
+        equals_pre = (
             foreign_sha == ledger["preimage_sha256"]
             and foreign_counts == ledger["preimage_counts"]
+        )
+        semantic_equals_pre = (
+            foreign_semantic_sha == ledger["preimage_semantic_sha256"]
+            and foreign_counts == ledger["preimage_counts"]
+        )
+        equals_installation = (
+            foreign_sha == ledger["installation_sha256"]
+            and foreign_counts == ledger["installation_counts"]
+        )
+        semantic_equals_installation = (
+            foreign_semantic_sha == ledger["installation_semantic_sha256"]
+            and foreign_counts == ledger["installation_counts"]
+        )
+        equals_prior = bool(
+            observations and foreign_sha == prior_sha and foreign_counts == prior_counts
+        )
+        semantic_equals_prior = bool(
+            observations
+            and foreign_semantic_sha == prior_semantic_sha
+            and foreign_counts == prior_counts
+        )
+        if equals_pre:
+            classification = "PRE_NETWORK_IDENTITY"
+        elif equals_installation:
+            classification = "PERSISTENT_INSTALLATION_IDENTITY"
+        elif semantic_equals_pre or semantic_equals_installation or (
+            semantic_equals_prior and not equals_prior
         ):
+            classification = "LIST_ORDER_SERIALIZATION_VARIANCE"
+        elif equals_prior:
+            classification = "STABLE_UNRELATED_FOREIGN_DRIFT"
+        else:
+            classification = "UNSTABLE_FOREIGN_DRIFT"
+        observation = {
+            "ordinal": ordinal,
+            "query_succeeded": True,
+            "owned_shape_valid": True,
+            "owned_table_present": bool(selected),
+            "classification": classification,
+            "foreign_sha256": foreign_sha,
+            "foreign_semantic_sha256": foreign_semantic_sha,
+            "foreign_counts": foreign_counts,
+            "equals_pre_network": equals_pre,
+            "semantic_equals_pre_network": semantic_equals_pre,
+            "equals_installation": equals_installation,
+            "semantic_equals_installation": semantic_equals_installation,
+            "equals_prior": equals_prior,
+            "semantic_equals_prior": semantic_equals_prior,
+            "error_class": "NONE",
+        }
+        observations.append(observation)
+        emit(_restoration_observation_values(observation))
+        prior_sha = foreign_sha
+        prior_semantic_sha = foreign_semantic_sha
+        prior_counts = foreign_counts
+        if equals_pre:
+            _emit_restoration_summary(observations, "PRE_NETWORK_IDENTITY")
             return entries, selected
         if attempt + 1 == RESTORATION_POLL_ATTEMPTS:
             break
         time.sleep(RESTORATION_POLL_INTERVAL_SECONDS)
-        entries = read_ruleset(prefix)
+        try:
+            entries = read_ruleset(prefix)
+        except BoundaryError as exc:
+            failed = {
+                "ordinal": ordinal + 1,
+                "query_succeeded": False,
+                "owned_shape_valid": False,
+                "owned_table_present": False,
+                "classification": "OBSERVATION_QUERY_FAILED",
+                "foreign_sha256": "0" * 64,
+                "foreign_semantic_sha256": "0" * 64,
+                "foreign_counts": {},
+                "equals_pre_network": False,
+                "semantic_equals_pre_network": False,
+                "equals_installation": False,
+                "semantic_equals_installation": False,
+                "equals_prior": False,
+                "semantic_equals_prior": False,
+                "error_class": exc.code,
+            }
+            observations.append(failed)
+            emit(_restoration_observation_values(failed))
+            _emit_restoration_summary(observations, "OBSERVATION_QUERY_FAILED")
+            raise
+    if all(item["equals_installation"] for item in observations):
+        terminal_class = "PERSISTENT_INSTALLATION_IDENTITY"
+    elif all(
+        item["semantic_equals_pre_network"]
+        or item["semantic_equals_installation"]
+        for item in observations
+    ):
+        terminal_class = "LIST_ORDER_SERIALIZATION_VARIANCE"
+    elif all(item["semantic_equals_prior"] for item in observations[1:]) and any(
+        not item["equals_prior"] for item in observations[1:]
+    ):
+        terminal_class = "LIST_ORDER_SERIALIZATION_VARIANCE"
+    elif all(item["equals_prior"] for item in observations[1:]):
+        terminal_class = "STABLE_UNRELATED_FOREIGN_DRIFT"
+    else:
+        terminal_class = "UNSTABLE_FOREIGN_DRIFT"
+    _emit_restoration_summary(observations, terminal_class)
     raise BoundaryError("FIREWALL_FOREIGN_STATE_DRIFT")
 
 

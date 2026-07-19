@@ -528,7 +528,7 @@ validate_network_ipam_contract fixture-network after-create
             "supabase/config.toml": "1b955c23161259dd41f3849f261bab41525b5ffeca83ab3074e44c5cc18ac0c6",
             "pins.json": "fe6105e121af3347a2de2494330d1e793a7bc3634f9d3d95964f6593ea990f50",
             "scripts/docker_api_boundary.py": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
-            "scripts/firewall_boundary.py": "594c7a18f3a521a3524f243da17986f449ebfb41b1e7517359391667a22ce599",
+            "scripts/firewall_boundary.py": "2670436b34c9891f0b3671c23119626ed727b6d22a15ea0e7c1435873c0594ad",
         }
         for relative, digest in expected.items():
             self.assertEqual(hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(), digest)
@@ -1082,6 +1082,7 @@ printf 'status\tstr\tBLOCKED\nfailure.code\tstr\t{initial_failure}\nfailure.deta
 current_listener_phase() {{ :; }}
 listener_phase_is_unexpected() {{ return 1; }}
 cleanup_exact() {{ return 0; }}
+cleanup_packet_scratch() {{ return 0; }}
 network_contract_code() {{ printf 'PASS\n'; }}
 publish_result_receipt() {{ return 1; }}
 set +e
@@ -1132,6 +1133,7 @@ mkdir -p "$ROOT/artifacts"
 printf 'status\tstr\tBLOCKED\nfailure.code\tstr\tDATABASE_HEALTH_FAILED\nreceipt.publication_failure_code\tstr\tRESULT_RECEIPT_PUBLICATION_FAILED\n' >"$STATE_FILE"
 {functions}
 cleanup_exact() {{ return 0; }}
+cleanup_packet_scratch() {{ return 0; }}
 publish_result_receipt() {{ return 1; }}
 retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
 result_receipt_status() {{ printf 'BLOCKED\n'; }}
@@ -1188,6 +1190,7 @@ EXISTING_STATUS={shlex.quote(status)}
 EXISTING_FAILURE={shlex.quote((failure or {}).get('code', ''))}
 {functions}
 cleanup_exact() {{ return 0; }}
+cleanup_packet_scratch() {{ return 0; }}
 publish_result_receipt() {{ return 1; }}
 retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
 result_receipt_status() {{ printf '%s\n' "$EXISTING_STATUS"; }}
@@ -1233,6 +1236,7 @@ FIREWALL_ROLLBACK_RECEIPT="$ROOT/artifacts/rollback.tsv"
 RESULT_PROFILE=""
 {functions}
 cleanup_exact() {{ return 1; }}
+cleanup_packet_scratch() {{ return 0; }}
 publish_result_receipt() {{ printf 'PUBLISH:%s:%s\n' "$1" "$2"; return 0; }}
 retire_cleanup_mode_contract() {{ printf 'RETIRED\n'; }}
 result_receipt_status() {{ return 1; }}
@@ -1265,6 +1269,96 @@ cleanup_only
         )
         self.assertIn("RESULT_RECEIPT_PUBLICATION_FAILED", finalize)
         self.assertIn('[[ "$receipt_failure" != "0" ]] || rm -f -- "$STATE_FILE"', finalize)
+
+    def test_packet_scratch_proof_is_closed_sanitized_and_precedes_receipt(self) -> None:
+        scratch_match = re.search(
+            r"(?ms)^# BEGIN PACKET_SCRATCH_FUNCTION\n(?P<source>.*?)^# END PACKET_SCRATCH_FUNCTION$",
+            self.runner,
+        )
+        self.assertIsNotNone(scratch_match)
+        cleanup_source = self.runner_functions("record") + "\n" + scratch_match.group("source")
+        self.assertIn("fawxzzy.hosted-replay-harness.packet-scratch-proof.v1", self.runner)
+        self.assertIn("stat.S_ISLNK", cleanup_source)
+        self.assertIn("FILE_ATTRIBUTE_REPARSE_POINT", cleanup_source)
+        self.assertIn("ownership_mismatch_count", cleanup_source)
+        self.assertIn("allowlist_mismatch_count", cleanup_source)
+        self.assertIn("os.path.commonpath", cleanup_source)
+        self.assertNotIn('rm -rf -- "$RUNTIME"', self.runner)
+        for function_name, phase in (("finalize", "primary"), ("cleanup_only", "cleanup")):
+            source = self.runner_functions(function_name)
+            self.assertLess(
+                source.index(f"cleanup_packet_scratch {phase}"),
+                source.index("publish_result_receipt"),
+            )
+        if os.name == "nt":
+            # Git Bash cannot pass its POSIX-translated private paths to the
+            # native Python used by this repository. The exact same fixture is
+            # executed on the required Ubuntu hosted runner.
+            return
+
+        def execute(*, audit: bool = True, unexpected: bool = False) -> tuple[subprocess.CompletedProcess[str], bool, bool, str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root_path = Path(directory)
+                runtime = root_path / ".smoke-runtime"
+                raw = runtime / "raw"
+                artifacts = root_path / "artifacts"
+                raw.mkdir(parents=True)
+                artifacts.mkdir()
+                (raw / "sanitized.log").write_text("private\n", encoding="utf-8")
+                if audit:
+                    (runtime / "container-audit.jsonl").write_text("", encoding="utf-8")
+                if unexpected:
+                    (runtime / "unowned-entry").write_text("blocked\n", encoding="utf-8")
+                python_path = Path(sys.executable).as_posix()
+                if re.match(r"^[A-Za-z]:/", python_path):
+                    python_path = f"/{python_path[0].lower()}{python_path[2:]}"
+                script = f"""set -Eeuo pipefail
+ROOT={shlex.quote(root_path.as_posix())}
+RUNTIME="$ROOT/.smoke-runtime"
+AUDIT_FILE="$RUNTIME/container-audit.jsonl"
+STATE_FILE="$ROOT/artifacts/state.tsv"
+SCRATCH_AUDIT_STAGE_FILE="$ROOT/artifacts/.packet-scratch-audit.jsonl.stage"
+SCRATCH_PROOF_STAGE_FILE="$ROOT/artifacts/.packet-scratch-proof.tsv.stage"
+SCRATCH_PROOF_SCHEMA=fawxzzy.hosted-replay-harness.packet-scratch-proof.v1
+PACKET=FP-HOSTED-REPLAY-FIREWALL-PUBLICATION-REHEARSAL-001
+python3() {{ {shlex.quote(python_path)} "$@"; }}
+{cleanup_source}
+set +e
+cleanup_packet_scratch primary
+rc="$?"
+cat "$STATE_FILE" 2>/dev/null || true
+exit "$rc"
+"""
+                completed = self.run_bash(script)
+                state_path = artifacts / "state.tsv"
+                state = state_path.read_text(encoding="utf-8") if state_path.is_file() else ""
+                return (
+                    completed,
+                    runtime.exists(),
+                    (artifacts / ".packet-scratch-audit.jsonl.stage").is_file(),
+                    state,
+                )
+
+        success, runtime_exists, audit_staged, state = execute()
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertFalse(runtime_exists)
+        self.assertTrue(audit_staged)
+        self.assertIn("scratch.primary.proof_status\tstr\tPASS", state)
+        self.assertIn("scratch.primary.remaining_entry_count\tint\t0", state)
+        self.assertNotIn(str(Path(tempfile.gettempdir())), state)
+
+        missing, runtime_exists, audit_staged, state = execute(audit=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertTrue(runtime_exists)
+        self.assertFalse(audit_staged)
+        self.assertIn("scratch.primary.proof_status\tstr\tAUDIT_INVALID", state)
+
+        rejected, runtime_exists, audit_staged, state = execute(unexpected=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertTrue(runtime_exists)
+        self.assertTrue(audit_staged)
+        self.assertIn("scratch.primary.allowlist_mismatch_count\tint\t1", state)
+        self.assertIn("scratch.primary.proof_status\tstr\tALLOWLIST_REJECTED", state)
 
     def test_result_receipt_validator_rejects_duplicate_ambiguous_or_contradictory_json(self) -> None:
         start = self.runner.index("validate_result_receipt() {")
@@ -1383,7 +1477,9 @@ validate_result_receipt {q((root / 'blocked.json').as_posix())} BLOCKED
         self.assertIn("OBSERVER_FORWARDING_FAILED", self.runner)
         self.assertNotIn('cat "$RAW/docker-api-observer.log"', self.runner)
         self.assertIn('cat "$DOCKER_API_BOUNDARY_STATE_FILE" >>"$STATE_FILE"', self.runner)
-        self.assertIn('rm -rf -- "$RUNTIME"', self.runner)
+        self.assertNotIn('rm -rf -- "$RUNTIME"', self.runner)
+        self.assertIn("cleanup_packet_scratch primary", self.runner)
+        self.assertIn("cleanup_packet_scratch cleanup", self.runner)
 
     def test_precli_object_listener_and_event_history_boundaries(self) -> None:
         freeze = "freeze_precli_objects_and_listeners"
@@ -4876,7 +4972,11 @@ class FirewallBoundaryTests(unittest.TestCase):
             "interface": "br-fpro001",
             "subnet": "172.31.253.0/24",
             "preimage_sha256": pre_sha,
+            "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
             "preimage_counts": pre_counts,
+            "installation_sha256": "",
+            "installation_semantic_sha256": "",
+            "installation_counts": {},
             "installed": False,
             "owned_sha256": "",
             "markers_installed": False,
@@ -4886,9 +4986,14 @@ class FirewallBoundaryTests(unittest.TestCase):
 
     @staticmethod
     def _restoration_ledger_payload(
-        foreign: list[dict], *, markers_installed: bool = True
+        foreign: list[dict], *, markers_installed: bool = True,
+        installation_foreign: list[dict] | None = None,
     ) -> dict[str, object]:
         pre_sha, pre_counts = firewall_boundary.canonical_snapshot(foreign)
+        installation = foreign if installation_foreign is None else installation_foreign
+        installation_sha, installation_counts = firewall_boundary.canonical_snapshot(
+            installation
+        )
         owned = (
             owned_firewall_entries_with_markers()
             if markers_installed
@@ -4913,7 +5018,13 @@ class FirewallBoundaryTests(unittest.TestCase):
             "interface": "br-fpro001",
             "subnet": "172.31.253.0/24",
             "preimage_sha256": pre_sha,
+            "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
             "preimage_counts": pre_counts,
+            "installation_sha256": installation_sha,
+            "installation_semantic_sha256": firewall_boundary.semantic_snapshot(
+                installation
+            ),
+            "installation_counts": installation_counts,
             "installed": True,
             "owned_sha256": owned_sha,
             "markers_installed": markers_installed,
@@ -6250,7 +6361,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "interface": "br-fpro001",
                     "subnet": "172.31.253.0/24",
                     "preimage_sha256": pre_sha,
+                    "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
                     "preimage_counts": pre_counts,
+                    "installation_sha256": pre_sha,
+                    "installation_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
+                    "installation_counts": pre_counts,
                     "installed": True,
                     "owned_sha256": owned_sha,
                     "markers_installed": False,
@@ -6329,7 +6444,7 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             {"chain": {"family": "ip", "table": "foreign-original", "name": "docker-setup"}}
         ]
         original_sha, original_counts = firewall_boundary.canonical_snapshot(original)
-        setup_sha, _ = firewall_boundary.canonical_snapshot(setup)
+        setup_sha, setup_counts = firewall_boundary.canonical_snapshot(setup)
         owned_sha, _ = firewall_boundary.validate_owned(
             owned_firewall_entries(), firewall_boundary.TABLE
         )
@@ -6348,7 +6463,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "interface": "br-fpro001",
                     "subnet": "172.31.253.0/24",
                     "preimage_sha256": original_sha,
+                    "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(original),
                     "preimage_counts": original_counts,
+                    "installation_sha256": setup_sha,
+                    "installation_semantic_sha256": firewall_boundary.semantic_snapshot(setup),
+                    "installation_counts": setup_counts,
                     "installed": True,
                     "owned_sha256": owned_sha,
                     "markers_installed": False,
@@ -6431,7 +6550,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                         "interface": "br-fpro001",
                         "subnet": "172.31.253.0/24",
                         "preimage_sha256": pre_sha,
+                        "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
                         "preimage_counts": pre_counts,
+                        "installation_sha256": pre_sha,
+                        "installation_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
+                        "installation_counts": pre_counts,
                         "installed": True,
                         "owned_sha256": owned_sha,
                         "markers_installed": False,
@@ -6514,6 +6637,7 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
             {"chain": {"family": "ip", "table": "foreign", "name": "during-marker"}}
         ]
         original_sha, original_counts = firewall_boundary.canonical_snapshot(original)
+        setup_sha, setup_counts = firewall_boundary.canonical_snapshot(setup)
         owned_sha, _ = firewall_boundary.validate_owned(
             owned_firewall_entries(), firewall_boundary.TABLE
         )
@@ -6526,7 +6650,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 "interface": "br-fpro001",
                 "subnet": "172.31.253.0/24",
                 "preimage_sha256": original_sha,
+                "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(original),
                 "preimage_counts": original_counts,
+                "installation_sha256": setup_sha,
+                "installation_semantic_sha256": firewall_boundary.semantic_snapshot(setup),
+                "installation_counts": setup_counts,
                 "installed": True,
                 "owned_sha256": owned_sha,
                 "markers_installed": False,
@@ -6644,7 +6772,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "interface": "br-fpro001",
                     "subnet": "172.31.253.0/24",
                     "preimage_sha256": pre_sha,
+                    "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
                     "preimage_counts": pre_counts,
+                    "installation_sha256": pre_sha,
+                    "installation_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
+                    "installation_counts": pre_counts,
                     "installed": True,
                     "owned_sha256": owned_sha,
                     "markers_installed": False,
@@ -7082,6 +7214,138 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                 firewall_boundary.remove(ledger)
             self.assertFalse(completion.exists())
 
+    def test_semantic_snapshot_ignores_only_safe_top_level_order(self) -> None:
+        first = [
+            {"table": {"family": "ip", "name": "foreign"}},
+            {"chain": {"family": "ip", "table": "foreign", "name": "input"}},
+            {
+                "rule": {
+                    "family": "ip",
+                    "table": "foreign",
+                    "chain": "input",
+                    "expr": [{"accept": None}],
+                }
+            },
+            {
+                "rule": {
+                    "family": "ip",
+                    "table": "foreign",
+                    "chain": "input",
+                    "expr": [{"drop": None}],
+                }
+            },
+        ]
+        reordered_objects = [first[1], first[0], first[2], first[3]]
+        reordered_rules = [first[1], first[0], first[3], first[2]]
+        strict_first, _ = firewall_boundary.canonical_snapshot(first)
+        strict_reordered, _ = firewall_boundary.canonical_snapshot(reordered_objects)
+        self.assertNotEqual(strict_first, strict_reordered)
+        self.assertEqual(
+            firewall_boundary.semantic_snapshot(first),
+            firewall_boundary.semantic_snapshot(reordered_objects),
+        )
+        self.assertNotEqual(
+            firewall_boundary.semantic_snapshot(first),
+            firewall_boundary.semantic_snapshot(reordered_rules),
+        )
+
+    def test_restoration_observations_close_all_postimage_classes(self) -> None:
+        baseline = [
+            {"table": {"family": "ip", "name": "foreign"}},
+            {"chain": {"family": "ip", "table": "foreign", "name": "input"}},
+        ]
+        installation = baseline + [
+            {"chain": {"family": "ip", "table": "docker", "name": "packet"}}
+        ]
+        unrelated = baseline + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "concurrent"}}
+        ]
+        other = baseline + [
+            {"chain": {"family": "ip", "table": "foreign", "name": "other"}}
+        ]
+        owned = owned_firewall_entries()
+        ledger = self._restoration_ledger_payload(
+            baseline,
+            markers_installed=False,
+            installation_foreign=installation,
+        )
+
+        cases = {
+            "PERSISTENT_INSTALLATION_IDENTITY": [installation] * 20,
+            "STABLE_UNRELATED_FOREIGN_DRIFT": [unrelated] * 20,
+            "UNSTABLE_FOREIGN_DRIFT": [unrelated, other] * 10,
+            "LIST_ORDER_SERIALIZATION_VARIANCE": [list(reversed(baseline))] * 20,
+        }
+        for expected, observations in cases.items():
+            with self.subTest(expected=expected):
+                state = io.StringIO()
+                with mock.patch.object(
+                    firewall_boundary,
+                    "read_ruleset",
+                    side_effect=[item + owned for item in observations[1:]],
+                ), mock.patch.object(
+                    firewall_boundary.time, "sleep"
+                ), contextlib.redirect_stdout(state):
+                    with self.assertRaisesRegex(
+                        firewall_boundary.BoundaryError,
+                        "FIREWALL_FOREIGN_STATE_DRIFT",
+                    ):
+                        firewall_boundary.wait_for_restoration_preimage(
+                            ["nft"], ledger, observations[0] + owned
+                        )
+                sanitized = state.getvalue()
+                self.assertIn(
+                    f"firewall.restoration_classification\tstr\t{expected}",
+                    sanitized,
+                )
+                self.assertIn(
+                    "firewall.restoration_observation_count\tint\t20", sanitized
+                )
+                self.assertEqual(
+                    sanitized.count(".query_succeeded\tbool\ttrue"), 20
+                )
+                self.assertEqual(
+                    sanitized.count(".semantic_equals_prior\tbool\t"), 20
+                )
+                self.assertNotIn("concurrent", sanitized)
+                self.assertNotIn("packet", sanitized)
+
+        unrelated_reordered = [unrelated, list(reversed(unrelated))] * 10
+        reordered_state = io.StringIO()
+        with mock.patch.object(
+            firewall_boundary,
+            "read_ruleset",
+            side_effect=[item + owned for item in unrelated_reordered[1:]],
+        ), mock.patch.object(
+            firewall_boundary.time, "sleep"
+        ), contextlib.redirect_stdout(reordered_state):
+            with self.assertRaisesRegex(
+                firewall_boundary.BoundaryError,
+                "FIREWALL_FOREIGN_STATE_DRIFT",
+            ):
+                firewall_boundary.wait_for_restoration_preimage(
+                    ["nft"], ledger, unrelated_reordered[0] + owned
+                )
+        self.assertIn(
+            "firewall.restoration_classification\tstr\tLIST_ORDER_SERIALIZATION_VARIANCE",
+            reordered_state.getvalue(),
+        )
+        self.assertIn(
+            ".semantic_equals_prior\tbool\ttrue", reordered_state.getvalue()
+        )
+
+        success_state = io.StringIO()
+        with contextlib.redirect_stdout(success_state):
+            current, selected = firewall_boundary.wait_for_restoration_preimage(
+                ["nft"], ledger, baseline + owned
+            )
+        self.assertEqual(current, baseline + owned)
+        self.assertEqual(selected, owned)
+        self.assertIn(
+            "firewall.restoration_classification\tstr\tPRE_NETWORK_IDENTITY",
+            success_state.getvalue(),
+        )
+
     def test_cleanup_never_adopts_persistent_foreign_drift(self) -> None:
         baseline = [{"table": {"family": "ip", "name": "foreign"}}]
         changed = baseline + [
@@ -7250,7 +7514,11 @@ printf 'expected-output=%s\\n' "$EXPECTED_OUTPUT_DENIES"
                     "interface": "br-fpro001",
                     "subnet": "172.31.253.0/24",
                     "preimage_sha256": pre_sha,
+                    "preimage_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
                     "preimage_counts": pre_counts,
+                    "installation_sha256": pre_sha,
+                    "installation_semantic_sha256": firewall_boundary.semantic_snapshot(foreign),
+                    "installation_counts": pre_counts,
                     "installed": True,
                     "owned_sha256": "a" * 64,
                     "markers_installed": False,
