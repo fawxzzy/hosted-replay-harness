@@ -5708,6 +5708,8 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
             workspace_root=Path("/packet"),
             packet="FP-TEST-PACKET",
             listen_port=59422,
+            image="postgres@sha256:" + "d" * 64,
+            expected_image_id="sha256:" + "c" * 64,
         )
         probe = private_netns_probe.Probe(args)
         probe.service_id = "a" * 64
@@ -5825,14 +5827,15 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                             return subprocess.CompletedProcess(command, 0, b"", b"")
 
                         with mock.patch.object(Path, "is_socket", lambda path: path.name == "docker.sock"):
-                            with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
-                                with mock.patch.object(
-                                    probe,
-                                    "host_firewall_snapshot",
-                                    return_value=probe.host_firewall_pre,
-                                ):
-                                    with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
-                                        cleanup_ok = probe.cleanup()
+                            with mock.patch.object(probe, "private_docker_target_present", return_value=True):
+                                with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
+                                    with mock.patch.object(
+                                        probe,
+                                        "host_firewall_snapshot",
+                                        return_value=probe.host_firewall_pre,
+                                    ):
+                                        with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                                            cleanup_ok = probe.cleanup()
                         self.assertFalse(cleanup_ok)
                         self.assertEqual(len(calls), len(actions))
                         self.assertEqual(probe.cleanup_failures, [expected_action])
@@ -5865,6 +5868,138 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                             probe.receipt["diagnostic.private_netns.host_links.final_sha256"],
                             probe.host_link_pre,
                         )
+
+    def test_resource_creation_ambiguity_prelatches_exact_cleanup_targets(self) -> None:
+        cases = (
+            ("image", "REMOVE_IMAGE", "PRIVATE_IMAGE_LOAD_FAILED"),
+            ("network", "REMOVE_NETWORK", "PRIVATE_NETWORK_CREATE_FAILED"),
+            ("service", "REMOVE_SERVICE", "PRIVATE_CONTAINER_CREATE_FAILED"),
+            ("client", "REMOVE_CLIENT", "PRIVATE_CONTAINER_CREATE_FAILED"),
+        )
+        expected_targets = {
+            "REMOVE_IMAGE": "sha256:" + "c" * 64,
+            "REMOVE_NETWORK": private_netns_probe.NETWORK_NAME,
+            "REMOVE_SERVICE": private_netns_probe.SERVICE_NAME,
+            "REMOVE_CLIENT": private_netns_probe.CLIENT_NAME,
+        }
+        for failure_kind in ("timeout", "error"):
+            for operation, action, expected_code in cases:
+                with self.subTest(kind=failure_kind, operation=operation):
+                    probe = self.probe_fixture()
+                    failed = (
+                        subprocess.TimeoutExpired(["docker"], 45)
+                        if failure_kind == "timeout"
+                        else subprocess.CompletedProcess([], 1, b"", b"")
+                    )
+                    responses: list[object]
+                    if operation == "client":
+                        responses = [
+                            subprocess.CompletedProcess([], 0, ("a" * 64).encode(), b""),
+                            failed,
+                        ]
+                    else:
+                        responses = [failed]
+                    with mock.patch.object(
+                        private_netns_probe, "run_command", side_effect=responses
+                    ):
+                        if failure_kind == "timeout":
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                if operation == "image":
+                                    probe.load_image()
+                                elif operation == "network":
+                                    probe.create_private_network()
+                                else:
+                                    probe.start_containers()
+                        else:
+                            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                                if operation == "image":
+                                    probe.load_image()
+                                elif operation == "network":
+                                    probe.create_private_network()
+                                else:
+                                    probe.start_containers()
+                            self.assertEqual(raised.exception.code, expected_code)
+                    self.assertIn(action, probe.private_docker_action_obligations)
+                    self.assertEqual(
+                        probe.private_docker_action_target(action),
+                        expected_targets[action],
+                    )
+                    with mock.patch.object(
+                        probe, "private_docker_target_present", return_value=True
+                    ):
+                        with mock.patch.object(
+                            private_netns_probe,
+                            "run_command",
+                            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                        ) as remover:
+                            self.assertTrue(probe.cleanup_private_docker_action(action))
+                    remove_command = remover.call_args.args[0]
+                    self.assertEqual(remove_command, probe.private_docker_action_command(action))
+                    self.assertEqual(probe.cleanup_action_required, [action])
+                    self.assertEqual(probe.cleanup_action_attempted, [action])
+                    self.assertEqual(probe.cleanup_action_succeeded, [action])
+                    probe.receipt["diagnostic.private_netns.cleanup.attempted"] = True
+                    probe.finalize_cleanup_failures()
+                    probe.finalize_cleanup_completeness()
+                    probe.receipt["diagnostic.private_netns.failure_code"] = expected_code
+                    private_netns_probe.finalize_receipt(probe.receipt)
+                    first = private_netns_probe.format_receipt(probe.receipt)
+                    second = private_netns_probe.format_receipt(probe.receipt)
+                    self.assertEqual(first, second)
+
+    def test_prelatched_cleanup_is_idempotent_when_target_is_absent(self) -> None:
+        for action in private_netns_probe.DOCKER_CLEANUP_ACTION_ORDER:
+            with self.subTest(action=action):
+                probe = self.probe_fixture()
+                probe.latch_private_docker_action(action)
+                with mock.patch.object(
+                    probe, "private_docker_target_present", return_value=False
+                ):
+                    with mock.patch.object(private_netns_probe, "run_command") as runner:
+                        self.assertTrue(probe.cleanup_private_docker_action(action))
+                runner.assert_not_called()
+                self.assertEqual(probe.cleanup_failures, [])
+                self.assertEqual(probe.cleanup_action_required, [action])
+                self.assertEqual(probe.cleanup_action_attempted, [action])
+                self.assertEqual(probe.cleanup_action_succeeded, [action])
+
+    def test_cleanup_target_presence_is_closed_and_fail_closed(self) -> None:
+        probe = self.probe_fixture()
+        present_outputs = {
+            "REMOVE_CLIENT": (private_netns_probe.CLIENT_NAME + "\n").encode(),
+            "REMOVE_SERVICE": (private_netns_probe.SERVICE_NAME + "\n").encode(),
+            "REMOVE_NETWORK": ("bridge\n" + private_netns_probe.NETWORK_NAME + "\n").encode(),
+            "REMOVE_IMAGE": ("sha256:" + "c" * 64 + "\n").encode(),
+        }
+        for action, output in present_outputs.items():
+            with self.subTest(action=action, state="present"):
+                with mock.patch.object(
+                    private_netns_probe,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, output, b""),
+                ):
+                    self.assertIs(probe.private_docker_target_present(action), True)
+            with self.subTest(action=action, state="absent"):
+                with mock.patch.object(
+                    private_netns_probe,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                ):
+                    self.assertIs(probe.private_docker_target_present(action), False)
+        for result in (
+            subprocess.CompletedProcess([], 1, b"", b""),
+            subprocess.CompletedProcess([], 0, b"invalid value\n", b""),
+        ):
+            with mock.patch.object(private_netns_probe, "run_command", return_value=result):
+                self.assertIs(
+                    probe.private_docker_target_present("REMOVE_NETWORK"), None
+                )
+        with mock.patch.object(
+            private_netns_probe,
+            "run_command",
+            side_effect=subprocess.TimeoutExpired(["docker"], 10),
+        ):
+            self.assertIs(probe.private_docker_target_present("REMOVE_IMAGE"), None)
 
     def test_successful_cleanup_proves_every_query_action_and_zero_residue(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

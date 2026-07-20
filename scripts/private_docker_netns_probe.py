@@ -1139,10 +1139,10 @@ class Probe:
             self.fail("PRIVATE_CGROUP_OWNERSHIP_FAILED")
 
     def load_image(self) -> None:
+        self.latch_private_docker_action("REMOVE_IMAGE")
         loaded = run_command([*self.docker, "image", "load", "--input", str(self.runtime / "image.tar")], timeout=180, env=self.private_env)
         if loaded.returncode != 0:
             self.fail("PRIVATE_IMAGE_LOAD_FAILED")
-        self.latch_private_docker_action("REMOVE_IMAGE")
         inspected = run_command([*self.docker, "image", "inspect", "--format", "{{.Id}}", self.args.image], env=self.private_env)
         if inspected.returncode != 0:
             self.fail("PRIVATE_IMAGE_LOAD_FAILED")
@@ -1172,10 +1172,10 @@ class Probe:
             f"io.fawxzzy.packet={self.args.packet}",
             NETWORK_NAME,
         ]
+        self.latch_private_docker_action("REMOVE_NETWORK")
         created = run_command(command, env=self.private_env)
         if created.returncode != 0 or not created.stdout.strip():
             self.fail("PRIVATE_NETWORK_CREATE_FAILED")
-        self.latch_private_docker_action("REMOVE_NETWORK")
         firewall = run_command(
             ["ip", "netns", "exec", NS_NAME, "nft", "-f", "-"],
             input_bytes=build_private_firewall_batch(),
@@ -1194,6 +1194,7 @@ class Probe:
         self.host_firewall_snapshot("private_network_created")
 
     def start_containers(self) -> None:
+        self.latch_private_docker_action("REMOVE_SERVICE")
         service = run_command(
             [
                 *self.docker,
@@ -1226,8 +1227,8 @@ class Probe:
         )
         if service.returncode != 0 or not service.stdout.strip():
             self.fail("PRIVATE_CONTAINER_CREATE_FAILED")
-        self.latch_private_docker_action("REMOVE_SERVICE")
         self.service_id = service.stdout.decode("utf-8", "strict").strip()
+        self.latch_private_docker_action("REMOVE_CLIENT")
         client = run_command(
             [
                 *self.docker,
@@ -1256,7 +1257,6 @@ class Probe:
         )
         if client.returncode != 0 or not client.stdout.strip():
             self.fail("PRIVATE_CONTAINER_CREATE_FAILED")
-        self.latch_private_docker_action("REMOVE_CLIENT")
         self.client_id = client.stdout.decode("utf-8", "strict").strip()
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -1571,16 +1571,84 @@ class Probe:
         if self.client_id:
             self.latch_private_docker_action("REMOVE_CLIENT")
 
-    def private_docker_action_command(self, action: str) -> list[str] | None:
-        if action == "REMOVE_CLIENT" and self.client_id:
-            return [*self.docker, "rm", "-f", self.client_id]
-        if action == "REMOVE_SERVICE" and self.service_id:
-            return [*self.docker, "rm", "-f", self.service_id]
+    def private_docker_action_target(self, action: str) -> str | None:
+        if action == "REMOVE_CLIENT":
+            return CLIENT_NAME
+        if action == "REMOVE_SERVICE":
+            return SERVICE_NAME
         if action == "REMOVE_NETWORK":
-            return [*self.docker, "network", "rm", NETWORK_NAME]
-        if action == "REMOVE_IMAGE" and self.private_image_id:
-            return [*self.docker, "image", "rm", "-f", self.private_image_id]
+            return NETWORK_NAME
+        if action == "REMOVE_IMAGE":
+            return self.args.expected_image_id
         return None
+
+    def private_docker_action_command(self, action: str) -> list[str] | None:
+        target = self.private_docker_action_target(action)
+        if target is None:
+            return None
+        if action in {"REMOVE_CLIENT", "REMOVE_SERVICE"}:
+            return [*self.docker, "rm", "-f", target]
+        if action == "REMOVE_NETWORK":
+            return [*self.docker, "network", "rm", target]
+        if action == "REMOVE_IMAGE":
+            return [*self.docker, "image", "rm", "-f", target]
+        return None
+
+    def private_docker_target_present(self, action: str) -> bool | None:
+        target = self.private_docker_action_target(action)
+        if target is None:
+            return None
+        if action in {"REMOVE_CLIENT", "REMOVE_SERVICE"}:
+            command = [*self.docker, "container", "ls", "-a", "--format", "{{.Names}}"]
+            expected = target
+            value_pattern = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+        elif action == "REMOVE_NETWORK":
+            command = [*self.docker, "network", "ls", "--format", "{{.Name}}"]
+            expected = target
+            value_pattern = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+        elif action == "REMOVE_IMAGE":
+            command = [*self.docker, "image", "ls", "--all", "--quiet", "--no-trunc"]
+            expected = target
+            value_pattern = r"sha256:[0-9a-f]{64}"
+        else:
+            return None
+        try:
+            result = run_command(command, timeout=10, env=self.private_env)
+            decoded = result.stdout.decode("utf-8", "strict")
+        except (OSError, UnicodeError, subprocess.TimeoutExpired, ProbeFailure):
+            return None
+        if result.returncode != 0:
+            return None
+        values = decoded.splitlines()
+        if any(not re.fullmatch(value_pattern, value) for value in values):
+            return None
+        if action == "REMOVE_IMAGE":
+            return expected in values
+        matches = values.count(expected)
+        return matches == 1 if matches <= 1 else None
+
+    def cleanup_private_docker_action(self, action: str) -> bool:
+        self.record_cleanup_evidence("action", "required", action)
+        self.record_cleanup_evidence("action", "attempted", action)
+        present = self.private_docker_target_present(action)
+        if present is None:
+            self.record_cleanup_failure(action)
+            return False
+        if present:
+            command = self.private_docker_action_command(action)
+            if command is None:
+                self.record_cleanup_failure(action)
+                return False
+            try:
+                result = run_command(command, timeout=30 if action == "REMOVE_IMAGE" else 20, env=self.private_env)
+            except (OSError, subprocess.TimeoutExpired, ProbeFailure):
+                self.record_cleanup_failure(action)
+                return False
+            if result.returncode != 0:
+                self.record_cleanup_failure(action)
+                return False
+        self.record_cleanup_evidence("action", "succeeded", action)
+        return True
 
     def record_cleanup_failure(self, action: str) -> None:
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", action):
@@ -1700,8 +1768,7 @@ class Probe:
                     self.record_unavailable_cleanup_obligation("action", action)
                     cleanup_ok = False
                     continue
-                timeout = 30 if action == "REMOVE_IMAGE" else 20
-                if self.cleanup_command(action, command, timeout=timeout) is None:
+                if not self.cleanup_private_docker_action(action):
                     cleanup_ok = False
             for action, receipt_name, command in DOCKER_CLEANUP_QUERY_SPECS:
                 if not docker_socket_available:
