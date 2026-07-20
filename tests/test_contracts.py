@@ -1281,15 +1281,17 @@ cleanup_only
 
     def test_result_receipt_publication_is_staged_validated_and_fail_closed(self) -> None:
         publisher = self.runner_functions(
-            "validate_result_receipt",
-            "result_receipt_status",
             "publish_result_receipt",
         )
         self.assertIn('RESULT_STAGE_FILE="$ROOT/artifacts/.containment-smoke.json.stage"', self.runner)
-        self.assertIn('validate_result_receipt "$RESULT_STAGE_FILE" "$expected_status"', publisher)
+        self.assertIn('sanitize_public_result_receipt "$RESULT_STAGE_FILE" "$expected_status" "$writer_rc"', publisher)
+        self.assertIn('published_status="$(public_receipt_tool status "$RESULT_STAGE_FILE")"', publisher)
+        self.assertIn('validate_result_receipt "$RESULT_STAGE_FILE" "$published_status"', publisher)
         self.assertIn('mv -f -- "$RESULT_STAGE_FILE" "$RESULT_FILE"', publisher)
-        self.assertIn('validate_result_receipt "$RESULT_FILE" "$expected_status"', publisher)
+        self.assertIn('validate_result_receipt "$RESULT_FILE" "$published_status"', publisher)
         self.assertIn('rm -f -- "$RESULT_FILE"', publisher)
+        self.assertIn("# BEGIN PUBLIC_RECEIPT_TOOL", self.runner)
+        self.assertIn("mandatory leak scan rejected", self.runner)
         finalize = self.runner_functions("finalize")
         self.assertLess(
             finalize.index('publish_result_receipt "$final_status" replace'),
@@ -1388,65 +1390,302 @@ exit "$rc"
         self.assertIn("scratch.primary.allowlist_mismatch_count\tint\t1", state)
         self.assertIn("scratch.primary.proof_status\tstr\tALLOWLIST_REJECTED", state)
 
-    def test_result_receipt_validator_rejects_duplicate_ambiguous_or_contradictory_json(self) -> None:
-        start = self.runner.index("validate_result_receipt() {")
-        end = self.runner.index("\nresult_receipt_status() {", start)
-        validator = self.runner[start:end]
+    def test_public_receipt_is_closed_canonical_and_safely_diagnostic(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixtures = {
-                "pass.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "CONTAINMENT_SMOKE_PASS",
-                    "failure": None,
-                },
-                "direct.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.direct-port-result.v1",
-                    "status": "DIRECT_DOCKER_PORT_PATH_PASS",
-                    "failure": None,
-                },
-                "blocked.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "BLOCKED",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "contradictory.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "CONTAINMENT_SMOKE_PASS",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "wrong-schema.json": {
-                    "schema": "unknown",
-                    "status": "BLOCKED",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "top-level.json": [],
-            }
-            for name, payload in fixtures.items():
-                (root / name).write_text(json.dumps(payload), encoding="utf-8")
-            (root / "duplicate.json").write_text(
-                '{"schema":"fawxzzy.hosted-replay-harness.result.v1",'
-                '"status":"BLOCKED","status":"BLOCKED",'
-                '"failure":{"code":"DATABASE_HEALTH_FAILED"}}',
-                encoding="utf-8",
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes((
+                "status\tstr\tBLOCKED\n"
+                "failure.code\tstr\tPACKET_SCRATCH_PROOF_FAILED\n"
+                "failure.detail\tstr\tprivate detail never published\n"
+                "cleanup.containers_remaining\tint\t0\n"
+                "cleanup.volumes_remaining\tint\t0\n"
+                "cleanup.networks_remaining\tint\t0\n"
+                "cleanup.listeners_remaining\tint\t0\n"
+                "scratch.primary.proof_status\tstr\tPASS\n"
+                "scratch.primary.remaining_entry_count\tint\t0\n"
+            ).encode("utf-8"))
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                    "run", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            q = shlex.quote
-            script = f"""set -Eeuo pipefail
-PYTHON={q(Path(sys.executable).as_posix())}
-python3() {{ "$PYTHON" "$@"; }}
-{validator}
-validate_result_receipt {q((root / 'pass.json').as_posix())} CONTAINMENT_SMOKE_PASS
-validate_result_receipt {q((root / 'direct.json').as_posix())} DIRECT_DOCKER_PORT_PATH_PASS
-validate_result_receipt {q((root / 'blocked.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'contradictory.json').as_posix())} CONTAINMENT_SMOKE_PASS
-! validate_result_receipt {q((root / 'wrong-schema.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'top-level.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'duplicate.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'pass.json').as_posix())} BLOCKED
-"""
-            completed = self.run_bash(script)
+            serialized = result.read_text(encoding="utf-8") if result.exists() else ""
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
+        receipt = json.loads(serialized) if serialized else None
+        self.assertIsNotNone(receipt)
+        self.assertEqual(
+            set(receipt),
+            {"schema", "status", "binding", "failure", "evidence", "cleanup", "receipt"},
+        )
+        self.assertEqual(receipt["failure"]["stage"], "CLEANUP")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "SCRATCH_CLEANUP")
+        self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+        self.assertTrue(receipt["evidence"]["raw_details_withheld"])
+        self.assertNotIn("private detail", serialized)
+
+    def test_public_receipt_redacts_raw_failures_and_missing_pass_evidence(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        injections = (
+            "198.51.100.9",
+            "2001:db8::9",
+            "https://example.invalid/path",
+            r"C:\\Users\\runner\\secret.txt",
+            "postgresql://user:pass@example.invalid/db",
+            "project_ref_abcdefghijklmnopqrst",
+            "Bearer abcdefghijklmnop",
+            "eyJhbGciOiJIUzI1NiJ9.abcdefghijklm.signature",
+            "HOME=/home/runner TOKEN=value",
+            "docker inspect --format raw-output",
+            "RuntimeError: arbitrary exception text",
+            "free form detail with spaces",
+            "MALFORMED-enum",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, injected in enumerate(injections):
+                state = root / f"state-{index}.tsv"
+                result = root / f"result-{index}.json"
+                state.write_bytes((
+                    "status\tstr\tBLOCKED\n"
+                    f"failure.code\tstr\t{injected}\n"
+                    f"failure.detail\tstr\t{injected}\n"
+                    f"failure.extra.nested\tstr\t{injected}\n"
+                    "cleanup.containers_remaining\tint\t0\n"
+                    "cleanup.volumes_remaining\tint\t0\n"
+                    "cleanup.networks_remaining\tint\t0\n"
+                    "cleanup.listeners_remaining\tint\t0\n"
+                    "scratch.primary.proof_status\tstr\tPASS\n"
+                    "scratch.primary.remaining_entry_count\tint\t0\n"
+                ).encode("utf-8"))
+                completed = subprocess.run(
+                    [
+                        sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                        "run", str(ROOT), str(state),
+                    ],
+                    input=public_python,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, (injected, completed.stderr))
+                serialized = result.read_text(encoding="utf-8")
+                receipt = json.loads(serialized)
+                self.assertEqual(receipt["failure"]["code"], "UNKNOWN_SANITIZED")
+                self.assertNotIn(injected, serialized)
+
+            missing_state = root / "missing-pass.tsv"
+            missing_result = root / "missing-pass.json"
+            missing_state.write_bytes(b"status\tstr\tCONTAINMENT_SMOKE_PASS\n")
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(missing_result),
+                    "CONTAINMENT_SMOKE_PASS", "0", "run", str(ROOT), str(missing_state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads(missing_result.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "BLOCKED")
+            self.assertEqual(receipt["cleanup"]["status"], "UNVERIFIED")
+
+    def test_public_receipt_validator_rejects_unknown_nested_and_noncanonical_data(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "unsafe.json"
+            path.write_text(
+                '{"schema":"fawxzzy.hosted-replay-harness.public-receipt.v1",'
+                '"status":"BLOCKED","unknown":{"raw":"https://example.invalid"}}\n',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, "-B", "-", "validate", str(path), "BLOCKED"],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+
+    def test_private_probe_public_receipt_preserves_only_closed_failure_and_cleanup_evidence(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        private = private_netns_probe.default_receipt()
+        private["diagnostic.private_netns.failure_code"] = "PRIVATE_CONTAINERD_START_FAILED"
+        private["diagnostic.private_netns.cleanup.attempted"] = True
+        private["diagnostic.private_netns.cleanup.succeeded"] = True
+        private_netns_probe.finalize_receipt(private)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes(
+                (
+                    "status\tstr\tBLOCKED\n"
+                    "failure.code\tstr\tSTANDARD_RUNNER_REJECTED_JIT_REQUIRED\n"
+                    "failure.detail\tstr\tprivate runtime details withheld\n"
+                    + private_netns_probe.format_receipt(private)
+                    + "cleanup.containers_remaining\tint\t0\n"
+                    "cleanup.volumes_remaining\tint\t0\n"
+                    "cleanup.networks_remaining\tint\t0\n"
+                    "cleanup.listeners_remaining\tint\t0\n"
+                    "scratch.primary.proof_status\tstr\tPASS\n"
+                    "scratch.primary.remaining_entry_count\tint\t0\n"
+                ).encode("utf-8")
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                    "private-netns-probe", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            serialized = result.read_text(encoding="utf-8")
+            receipt = json.loads(serialized)
+        self.assertEqual(receipt["failure"]["code"], "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(receipt["failure"]["stage"], "PRIVATE_RUNTIME")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "PRIVATE_DAEMON_ISOLATION")
+        self.assertEqual(receipt["evidence"]["status"], "COMPLETE")
+        self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+        self.assertEqual(receipt["cleanup"]["private_residue_remaining"], 0)
+        self.assertNotIn("private runtime details withheld", serialized)
+
+    def test_public_receipt_writer_failure_publishes_safe_blocked_fallback(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes(b"status\tstr\tCONTAINMENT_SMOKE_PASS\n")
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result),
+                    "CONTAINMENT_SMOKE_PASS", "1", "run", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "BLOCKED")
+        self.assertEqual(receipt["failure"]["code"], "RESULT_RECEIPT_PUBLICATION_FAILED")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "RECEIPT_INTEGRITY")
+
+    def test_publication_pipeline_replaces_private_writer_output_before_atomic_publish(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        functions = "\n".join(
+            (
+                marker.group("source"),
+                self.runner_functions("sanitize_public_result_receipt"),
+                self.runner_functions("validate_result_receipt"),
+                self.runner_functions("result_receipt_status"),
+                self.runner_functions("publish_result_receipt"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            result = temp / "result.json"
+            stage = temp / "result.stage"
+            state.write_bytes(
+                b"status\tstr\tBLOCKED\n"
+                b"failure.code\tstr\tPACKET_SCRATCH_PROOF_FAILED\n"
+                b"failure.detail\tstr\thttps://raw.invalid/private\n"
+                b"cleanup.containers_remaining\tint\t0\n"
+                b"cleanup.volumes_remaining\tint\t0\n"
+                b"cleanup.networks_remaining\tint\t0\n"
+                b"cleanup.listeners_remaining\tint\t0\n"
+                b"scratch.primary.proof_status\tstr\tPASS\n"
+                b"scratch.primary.remaining_entry_count\tint\t0\n"
+            )
+            audit.write_bytes(
+                b'{"role":"database","container_id":"raw-id","command":["raw-command"]}\n'
+            )
+            python_path = Path(sys.executable).as_posix()
+            if re.match(r"^[A-Za-z]:/", python_path):
+                python_path = f"/{python_path[0].lower()}{python_path[2:]}"
+            script = temp / "pipeline.sh"
+            script.write_text(
+                "set -Eeuo pipefail\n"
+                f"PYTHON={shlex.quote(python_path)}\n"
+                "python3() { \"$PYTHON\" \"$@\"; }\n"
+                f"ROOT={shlex.quote(ROOT.as_posix())}\n"
+                f"STATE_FILE={shlex.quote(state.as_posix())}\n"
+                f"AUDIT_FILE={shlex.quote(audit.as_posix())}\n"
+                f"RESULT_FILE={shlex.quote(result.as_posix())}\n"
+                f"RESULT_STAGE_FILE={shlex.quote(stage.as_posix())}\n"
+                f"SCRATCH_AUDIT_STAGE_FILE={shlex.quote((temp / 'audit.stage').as_posix())}\n"
+                f"SCRATCH_PROOF_STAGE_FILE={shlex.quote((temp / 'proof.stage').as_posix())}\n"
+                "MODE=run\n"
+                f"{functions}\n"
+                "publish_result_receipt BLOCKED replace\n"
+                "validate_result_receipt \"$RESULT_FILE\" BLOCKED\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            completed = subprocess.run(
+                [BASH, str(script)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            serialized = result.read_text(encoding="utf-8")
+            receipt = json.loads(serialized)
+        self.assertEqual(receipt["failure"]["code"], "PACKET_SCRATCH_PROOF_FAILED")
+        self.assertNotIn("raw.invalid", serialized)
+        self.assertNotIn("raw-command", serialized)
+        self.assertNotIn("raw-id", serialized)
 
     def test_loader_output_is_sanitized_classified_and_deleted(self) -> None:
         self.assertIn("umask 077", self.runner)

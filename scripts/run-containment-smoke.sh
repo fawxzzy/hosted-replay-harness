@@ -243,24 +243,126 @@ retire_cleanup_mode_contract() {
   [[ ! -e "$CLEANUP_MODE_FILE" && ! -L "$CLEANUP_MODE_FILE" ]] || return 1
 }
 
-validate_result_receipt() {
-  local path="$1" expected_status="$2"
-  python3 -B - "$path" "$expected_status" <<'PY'
+# BEGIN PUBLIC_RECEIPT_TOOL
+public_receipt_tool() {
+  local operation="$1"
+  shift
+  python3 -B - "$operation" "$@" <<'PY'
+from __future__ import annotations
+
+import copy
+import hashlib
 import json
+import os
 import pathlib
 import re
+import subprocess
 import sys
 
-path = pathlib.Path(sys.argv[1])
-expected = sys.argv[2]
-allowed = {
+SCHEMA = "fawxzzy.hosted-replay-harness.public-receipt.v1"
+ZERO_SHA256 = "0" * 64
+ZERO_GIT_OID = "0" * 40
+STATUSES = {
     "BLOCKED",
     "CONTAINMENT_SMOKE_PASS",
     "DIRECT_DOCKER_PORT_PATH_PASS",
     "FIREWALL_PUBLICATION_REHEARSAL_PASS",
 }
-if expected not in allowed or not path.is_file() or path.is_symlink():
-    raise SystemExit(1)
+MODES = {"run", "direct-port", "firewall-rehearsal", "private-netns-probe", "cleanup-only"}
+PACKET_CLASSES = {
+    "run": "CONTAINMENT_SMOKE",
+    "direct-port": "DIRECT_PORT_DIAGNOSTIC",
+    "firewall-rehearsal": "FIREWALL_REHEARSAL",
+    "private-netns-probe": "PRIVATE_NETNS_PROBE",
+    "cleanup-only": "CLEANUP_RECOVERY",
+}
+FAILURE_CODES = {
+    "NONE",
+    "UNKNOWN_SANITIZED",
+    "HARNESS_INTERRUPTED",
+    "CLEANUP_RESIDUE",
+    "PACKET_SCRATCH_PROOF_FAILED",
+    "RESULT_RECEIPT_PUBLICATION_FAILED",
+    "RESULT_RECEIPT_VALIDATION_FAILED",
+    "PRIVATE_NETNS_PROBE_DIAGNOSTIC_STOP",
+    "STANDARD_RUNNER_REJECTED_JIT_REQUIRED",
+    "PASS",
+    "ROOT_PRIVILEGE_UNAVAILABLE",
+    "RUNNER_IDENTITY_INVALID",
+    "CAPABILITY_TOOL_MISSING",
+    "PACKET_PATH_INVALID",
+    "PACKET_PATH_COLLISION",
+    "HOST_DOCKER_UNAVAILABLE",
+    "HOST_IMAGE_IDENTITY_MISMATCH",
+    "HOST_IMAGE_SAVE_FAILED",
+    "DISK_MARGIN_INADEQUATE",
+    "HOST_FIREWALL_QUERY_FAILED",
+    "HOST_FIREWALL_DRIFT",
+    "HOST_LINK_STATE_DRIFT",
+    "CGROUP_V2_UNAVAILABLE",
+    "CGROUP_CREATE_FAILED",
+    "NETNS_CREATE_FAILED",
+    "NETNS_ROUTE_INVALID",
+    "PRIVATE_CONTAINERD_START_FAILED",
+    "PRIVATE_DOCKERD_START_FAILED",
+    "PRIVATE_DAEMON_ARGUMENT_REJECTED",
+    "SYSTEM_CONTAINERD_COUPLING",
+    "PRIVATE_IMAGE_LOAD_FAILED",
+    "PRIVATE_IMAGE_IDENTITY_MISMATCH",
+    "PRIVATE_NETWORK_CREATE_FAILED",
+    "PRIVATE_FIREWALL_INSTALL_FAILED",
+    "PRIVATE_CONTAINER_CREATE_FAILED",
+    "PRIVATE_CONTAINER_CONTRACT_INVALID",
+    "PRIVATE_SERVICE_HEALTH_FAILED",
+    "PRIVATE_NAMESPACE_IDENTITY_FAILED",
+    "PRIVATE_CGROUP_OWNERSHIP_FAILED",
+    "PRIVATE_INTERCONTAINER_FAILED",
+    "PRIVATE_CANARY_TOOL_MISSING",
+    "PRIVATE_CANARY_RUNTIME_FAILED",
+    "PRIVATE_CANARY_EVIDENCE_INVALID",
+    "PRIVATE_DEFAULT_ROUTE_PRESENT",
+    "PRIVATE_EXTERNAL_DNS_SUCCEEDED",
+    "PRIVATE_LITERAL_IP_EGRESS_SUCCEEDED",
+    "PRIVATE_METADATA_EGRESS_SUCCEEDED",
+    "PRIVATE_GATEWAY_REACHABLE",
+    "PRIVATE_REGISTRY_ACCESS_SUCCEEDED",
+    "PRIVATE_LOOPBACK_PROXY_FAILED",
+    "PRIVATE_NONLOOPBACK_REACHABLE",
+    "PRIVATE_CLEANUP_FAILED",
+    "PRIVATE_RESIDUE",
+    "PROBE_INTERNAL_ERROR",
+}
+STAGES = {
+    "NONE", "PRECHECK", "ASSET_STAGE", "PRIVATE_RUNTIME", "NETWORK_BOUNDARY",
+    "CONTAINMENT_PROOF", "CLEANUP", "PUBLICATION", "UNKNOWN_SANITIZED",
+}
+CLASSES = {
+    "NONE", "CAPABILITY_BLOCKED", "POLICY_BLOCKED", "INVARIANT_BLOCKED",
+    "CLEANUP_BLOCKED", "PUBLICATION_BLOCKED", "UNKNOWN_SANITIZED",
+}
+INVARIANTS = {
+    "NONE", "SOURCE_BINDING", "RUNTIME_CAPABILITY", "PINNED_IMAGE_IDENTITY",
+    "PRIVATE_DAEMON_ISOLATION", "PRIVATE_NAMESPACE_ISOLATION", "NO_EGRESS",
+    "LOOPBACK_PUBLICATION", "INTERCONTAINER_CONNECTIVITY", "HOST_STATE_RESTORATION",
+    "RESOURCE_CLEANUP", "SCRATCH_CLEANUP", "RECEIPT_INTEGRITY", "UNKNOWN_SANITIZED",
+}
+EVIDENCE_STATUSES = {"COMPLETE", "PARTIAL", "UNKNOWN_SANITIZED"}
+CLEANUP_STATUSES = {"EXACT_ZERO", "RESIDUE", "UNVERIFIED"}
+BINDING_CLASSES = {"SOURCE_EXACT_ARTIFACT_RUN_METADATA_REQUIRED"}
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+GIT_OID_RE = re.compile(r"[0-9a-f]{40}")
+INT_RE = re.compile(r"0|[1-9][0-9]*")
+SAFE_ENUM_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+LEAK_PATTERNS = (
+    re.compile(rb"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"),
+    re.compile(rb"(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}"),
+    re.compile(rb"(?i)(?:https?|ssh|file|postgres(?:ql)?|mysql|redis|mongodb)://"),
+    re.compile(rb"(?i)(?:[a-z]:[\\/]|/(?:home|users|var|tmp|etc|run)/)"),
+    re.compile(rb"(?i)\b(?:password|passwd|secret|credential|authorization|bearer|private[_-]?key|api[_-]?key|access[_-]?key)\b"),
+    re.compile(rb"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+)
+
+
 def strict_object(pairs):
     result = {}
     for key, value in pairs:
@@ -268,97 +370,378 @@ def strict_object(pairs):
             raise ValueError("duplicate key")
         result[key] = value
     return result
+
+
+def canonical(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def expected_keys(value, names) -> None:
+    if not isinstance(value, dict) or set(value) != set(names):
+        raise ValueError("closed schema mismatch")
+
+
+def receipt_digest(value) -> str:
+    normalized = copy.deepcopy(value)
+    normalized["receipt"]["canonical_sha256"] = ZERO_SHA256
+    return hashlib.sha256(canonical(normalized)).hexdigest()
+
+
+def validate_receipt(value, expected_status=None) -> None:
+    expected_keys(value, ("schema", "status", "binding", "failure", "evidence", "cleanup", "receipt"))
+    expected_keys(value["binding"], (
+        "source_commit_git_oid", "source_tree_git_oid", "source_identity_exact",
+        "mode", "packet_class", "run_binding_class",
+    ))
+    expected_keys(value["failure"], ("stage", "class", "code", "failed_invariant"))
+    expected_keys(value["evidence"], ("status", "safe_scalar_count", "manifest_sha256", "raw_details_withheld"))
+    expected_keys(value["cleanup"], (
+        "status", "proof_complete", "containers_remaining", "volumes_remaining",
+        "networks_remaining", "listeners_remaining", "private_residue_remaining",
+        "scratch_remaining",
+    ))
+    expected_keys(value["receipt"], ("canonical_sha256",))
+    if value["schema"] != SCHEMA or value["status"] not in STATUSES:
+        raise ValueError("top-level enum mismatch")
+    if expected_status is not None and value["status"] != expected_status:
+        raise ValueError("status mismatch")
+    binding = value["binding"]
+    if not GIT_OID_RE.fullmatch(binding["source_commit_git_oid"]) or not GIT_OID_RE.fullmatch(binding["source_tree_git_oid"]):
+        raise ValueError("source binding mismatch")
+    if not isinstance(binding["source_identity_exact"], bool):
+        raise ValueError("source binding status mismatch")
+    if binding["mode"] not in MODES or binding["packet_class"] not in PACKET_CLASSES.values() or binding["run_binding_class"] not in BINDING_CLASSES:
+        raise ValueError("binding enum mismatch")
+    failure = value["failure"]
+    if failure["stage"] not in STAGES or failure["class"] not in CLASSES or failure["code"] not in FAILURE_CODES or failure["failed_invariant"] not in INVARIANTS:
+        raise ValueError("failure enum mismatch")
+    if value["status"] == "BLOCKED":
+        if failure["code"] in {"NONE", "PASS"} or failure["class"] == "NONE" or failure["stage"] == "NONE":
+            raise ValueError("blocked contradiction")
+    elif failure != {"stage": "NONE", "class": "NONE", "code": "NONE", "failed_invariant": "NONE"}:
+        raise ValueError("pass contradiction")
+    elif binding["source_identity_exact"] is not True:
+        raise ValueError("pass source binding contradiction")
+    evidence = value["evidence"]
+    if evidence["status"] not in EVIDENCE_STATUSES or not isinstance(evidence["safe_scalar_count"], int) or isinstance(evidence["safe_scalar_count"], bool) or evidence["safe_scalar_count"] < 0:
+        raise ValueError("evidence mismatch")
+    if not SHA256_RE.fullmatch(evidence["manifest_sha256"]) or evidence["raw_details_withheld"] is not True:
+        raise ValueError("evidence digest mismatch")
+    cleanup = value["cleanup"]
+    if cleanup["status"] not in CLEANUP_STATUSES or not isinstance(cleanup["proof_complete"], bool):
+        raise ValueError("cleanup status mismatch")
+    for key in (
+        "containers_remaining", "volumes_remaining", "networks_remaining",
+        "listeners_remaining", "private_residue_remaining", "scratch_remaining",
+    ):
+        item = cleanup[key]
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise ValueError("cleanup count mismatch")
+    all_zero = not any(cleanup[key] for key in cleanup if key.endswith("_remaining"))
+    if cleanup["status"] == "EXACT_ZERO" and (not cleanup["proof_complete"] or not all_zero):
+        raise ValueError("cleanup contradiction")
+    digest = value["receipt"]["canonical_sha256"]
+    if not SHA256_RE.fullmatch(digest) or digest != receipt_digest(value):
+        raise ValueError("receipt digest mismatch")
+    serialized = canonical(value) + b"\n"
+    if any(pattern.search(serialized) for pattern in LEAK_PATTERNS):
+        raise ValueError("mandatory leak scan rejected")
+
+
+def parse_state(path: pathlib.Path):
+    rows = []
+    safe = True
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", "strict")
+        if not text.endswith("\n") or "\r" in text or "\x00" in text:
+            raise ValueError("state framing")
+        for line in text[:-1].split("\n"):
+            parts = line.split("\t")
+            if len(parts) != 3:
+                raise ValueError("state row")
+            rows.append(tuple(parts))
+    except (OSError, UnicodeError, ValueError):
+        rows = []
+        safe = False
+    latest = {}
+    for key, kind, raw_value in rows:
+        latest[key] = (kind, raw_value)
+    return rows, latest, safe
+
+
+def typed_int(latest, key):
+    item = latest.get(key)
+    if item is None or item[0] != "int" or not INT_RE.fullmatch(item[1]):
+        return None
+    return int(item[1])
+
+
+def typed_bool(latest, key):
+    item = latest.get(key)
+    if item is None or item[0] != "bool" or item[1] not in {"true", "false"}:
+        return None
+    return item[1] == "true"
+
+
+def typed_enum(latest, key, allowed):
+    item = latest.get(key)
+    if item is None or item[0] != "str" or item[1] not in allowed:
+        return None
+    return item[1]
+
+
+def source_identity(root: pathlib.Path):
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD", "HEAD^{tree}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        lines = completed.stdout.decode("ascii", "strict").splitlines()
+        if completed.returncode != 0 or len(lines) != 2 or not all(GIT_OID_RE.fullmatch(line) for line in lines):
+            raise ValueError("source identity")
+        return lines[0], lines[1], True
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+        return ZERO_GIT_OID, ZERO_GIT_OID, False
+
+
+def classify_failure(code):
+    if code in {"RESULT_RECEIPT_PUBLICATION_FAILED", "RESULT_RECEIPT_VALIDATION_FAILED"}:
+        return "PUBLICATION", "PUBLICATION_BLOCKED", "RECEIPT_INTEGRITY"
+    if code in {"CLEANUP_RESIDUE", "PRIVATE_CLEANUP_FAILED", "PRIVATE_RESIDUE"}:
+        return "CLEANUP", "CLEANUP_BLOCKED", "RESOURCE_CLEANUP"
+    if code == "PACKET_SCRATCH_PROOF_FAILED":
+        return "CLEANUP", "CLEANUP_BLOCKED", "SCRATCH_CLEANUP"
+    if code in {"HOST_FIREWALL_DRIFT", "HOST_LINK_STATE_DRIFT", "HOST_FIREWALL_QUERY_FAILED"}:
+        return "CLEANUP", "CLEANUP_BLOCKED", "HOST_STATE_RESTORATION"
+    if code in {"HOST_IMAGE_IDENTITY_MISMATCH", "PRIVATE_IMAGE_IDENTITY_MISMATCH", "PRIVATE_IMAGE_LOAD_FAILED", "HOST_IMAGE_SAVE_FAILED"}:
+        return "ASSET_STAGE", "INVARIANT_BLOCKED", "PINNED_IMAGE_IDENTITY"
+    if code.startswith("PRIVATE_") and any(token in code for token in ("DNS", "EGRESS", "GATEWAY", "NONLOOPBACK", "DEFAULT_ROUTE", "REGISTRY")):
+        return "CONTAINMENT_PROOF", "POLICY_BLOCKED", "NO_EGRESS"
+    if code == "PRIVATE_LOOPBACK_PROXY_FAILED":
+        return "CONTAINMENT_PROOF", "INVARIANT_BLOCKED", "LOOPBACK_PUBLICATION"
+    if code == "PRIVATE_INTERCONTAINER_FAILED":
+        return "CONTAINMENT_PROOF", "INVARIANT_BLOCKED", "INTERCONTAINER_CONNECTIVITY"
+    if code in {"PRIVATE_CONTAINERD_START_FAILED", "PRIVATE_DOCKERD_START_FAILED", "PRIVATE_DAEMON_ARGUMENT_REJECTED", "SYSTEM_CONTAINERD_COUPLING"}:
+        return "PRIVATE_RUNTIME", "CAPABILITY_BLOCKED", "PRIVATE_DAEMON_ISOLATION"
+    if code.startswith("PRIVATE_") or code.startswith("NETNS_") or code.startswith("CGROUP_"):
+        return "PRIVATE_RUNTIME", "CAPABILITY_BLOCKED", "PRIVATE_NAMESPACE_ISOLATION"
+    if code in {"ROOT_PRIVILEGE_UNAVAILABLE", "RUNNER_IDENTITY_INVALID", "CAPABILITY_TOOL_MISSING", "DISK_MARGIN_INADEQUATE", "HOST_DOCKER_UNAVAILABLE"}:
+        return "PRECHECK", "CAPABILITY_BLOCKED", "RUNTIME_CAPABILITY"
+    if code == "UNKNOWN_SANITIZED":
+        return "UNKNOWN_SANITIZED", "UNKNOWN_SANITIZED", "UNKNOWN_SANITIZED"
+    return "CONTAINMENT_PROOF", "INVARIANT_BLOCKED", "UNKNOWN_SANITIZED"
+
+
+def build(path, expected_status, writer_rc, mode, root, state_path):
+    if expected_status not in STATUSES or mode not in MODES or writer_rc not in {"0", "1"}:
+        raise ValueError("build arguments")
+    rows, latest, state_safe = parse_state(state_path)
+    commit_oid, tree_oid, source_exact = source_identity(root)
+    receipt_mode = mode
+    if mode == "cleanup-only":
+        receipt_mode = typed_enum(
+            latest,
+            "cleanup.mode.original",
+            {"run", "direct-port", "firewall-rehearsal", "private-netns-probe"},
+        ) or mode
+    private_rows = [row for row in rows if row[0].startswith("diagnostic.private_netns.")]
+    private_digest_item = latest.get("diagnostic.private_netns.receipt_sha256")
+    private_digest = (
+        private_digest_item[1]
+        if private_digest_item is not None
+        and private_digest_item[0] == "str"
+        and SHA256_RE.fullmatch(private_digest_item[1])
+        else None
+    )
+    private_payload = "".join("\t".join(row) + "\n" for row in private_rows if not row[0].endswith("receipt_sha256"))
+    private_complete = bool(private_digest and private_digest == hashlib.sha256(private_payload.encode("utf-8")).hexdigest())
+    private_code = typed_enum(latest, "diagnostic.private_netns.failure_code", FAILURE_CODES)
+    raw_code = typed_enum(latest, "failure.code", FAILURE_CODES)
+    code = private_code if receipt_mode == "private-netns-probe" and private_code not in {None, "PASS"} else raw_code
+    if expected_status == "BLOCKED" and private_code == "PASS" and raw_code == "PRIVATE_NETNS_PROBE_DIAGNOSTIC_STOP":
+        code = "PRIVATE_NETNS_PROBE_DIAGNOSTIC_STOP"
+    if writer_rc != "0":
+        code = "RESULT_RECEIPT_PUBLICATION_FAILED"
+    if code in {None, "PASS", "NONE"} and expected_status == "BLOCKED":
+        code = "UNKNOWN_SANITIZED"
+
+    outer_keys = (
+        "cleanup.containers_remaining", "cleanup.volumes_remaining",
+        "cleanup.networks_remaining", "cleanup.listeners_remaining",
+    )
+    outer_values = [typed_int(latest, key) for key in outer_keys]
+    scratch_phase = "cleanup" if f"scratch.cleanup.proof_status" in latest else "primary"
+    scratch_status = typed_enum(latest, f"scratch.{scratch_phase}.proof_status", {"PASS"})
+    scratch_remaining_value = typed_int(latest, f"scratch.{scratch_phase}.remaining_entry_count")
+    scratch_remaining = scratch_remaining_value if scratch_remaining_value is not None else 0
+    private_residue_keys = (
+        "diagnostic.private_netns.cleanup.containers_remaining",
+        "diagnostic.private_netns.cleanup.images_remaining",
+        "diagnostic.private_netns.cleanup.volumes_remaining",
+        "diagnostic.private_netns.cleanup.networks_remaining",
+        "diagnostic.private_netns.cleanup.listeners_remaining",
+        "diagnostic.private_netns.cleanup.processes_remaining",
+        "diagnostic.private_netns.cleanup.namespaces_remaining",
+        "diagnostic.private_netns.cleanup.veths_remaining",
+        "diagnostic.private_netns.cleanup.sockets_remaining",
+        "diagnostic.private_netns.cleanup.pidfiles_remaining",
+        "diagnostic.private_netns.cleanup.cgroups_remaining",
+        "diagnostic.private_netns.cleanup.roots_remaining",
+        "diagnostic.private_netns.cleanup.scratch_remaining",
+    )
+    private_values = [typed_int(latest, key) for key in private_residue_keys]
+    private_required = receipt_mode == "private-netns-probe"
+    private_cleanup_ok = typed_bool(latest, "diagnostic.private_netns.cleanup.succeeded")
+    outer_complete = all(item is not None for item in outer_values)
+    private_complete_cleanup = not private_required or (
+        private_complete and private_cleanup_ok is True and all(item is not None for item in private_values)
+    )
+    cleanup_complete = outer_complete and scratch_status == "PASS" and scratch_remaining_value is not None and private_complete_cleanup
+    safe_outer = [item if item is not None else 0 for item in outer_values]
+    safe_private = [item if item is not None else 0 for item in private_values]
+    all_zero = not any((*safe_outer, *safe_private, scratch_remaining))
+    cleanup_status = "EXACT_ZERO" if cleanup_complete and all_zero else "RESIDUE" if any((*safe_outer, *safe_private, scratch_remaining)) else "UNVERIFIED"
+
+    state_status = typed_enum(latest, "status", STATUSES)
+    pass_requested = expected_status != "BLOCKED"
+    pass_admitted = (
+        pass_requested and writer_rc == "0" and source_exact and state_safe and cleanup_status == "EXACT_ZERO"
+        and (state_status in {expected_status, None})
+    )
+    status = expected_status if pass_admitted else "BLOCKED"
+    if status == "BLOCKED" and code in {None, "NONE", "PASS"}:
+        code = "CLEANUP_RESIDUE" if cleanup_status != "EXACT_ZERO" else "UNKNOWN_SANITIZED"
+    if status != "BLOCKED":
+        code = "NONE"
+        stage, failure_class, invariant = "NONE", "NONE", "NONE"
+    else:
+        stage, failure_class, invariant = classify_failure(code)
+
+    diagnostic_complete = private_complete if private_required else True
+    evidence_status = "COMPLETE" if source_exact and state_safe and diagnostic_complete and cleanup_complete else "PARTIAL" if state_safe else "UNKNOWN_SANITIZED"
+    safe_evidence = {
+        "cleanup_complete": cleanup_complete,
+        "cleanup_status": cleanup_status,
+        "diagnostic_complete": diagnostic_complete,
+        "failure_class": failure_class,
+        "failure_code": code,
+        "failure_stage": stage,
+        "mode": receipt_mode,
+        "private_receipt_sha256": private_digest or ZERO_SHA256,
+        "source_commit_git_oid": commit_oid,
+        "source_tree_git_oid": tree_oid,
+        "status": status,
+    }
+    receipt = {
+        "schema": SCHEMA,
+        "status": status,
+        "binding": {
+            "source_commit_git_oid": commit_oid,
+            "source_tree_git_oid": tree_oid,
+            "source_identity_exact": source_exact,
+            "mode": receipt_mode,
+            "packet_class": PACKET_CLASSES[receipt_mode],
+            "run_binding_class": "SOURCE_EXACT_ARTIFACT_RUN_METADATA_REQUIRED",
+        },
+        "failure": {
+            "stage": stage,
+            "class": failure_class,
+            "code": code,
+            "failed_invariant": invariant,
+        },
+        "evidence": {
+            "status": evidence_status,
+            "safe_scalar_count": len(safe_evidence),
+            "manifest_sha256": hashlib.sha256(canonical(safe_evidence)).hexdigest(),
+            "raw_details_withheld": True,
+        },
+        "cleanup": {
+            "status": cleanup_status,
+            "proof_complete": cleanup_complete,
+            "containers_remaining": safe_outer[0],
+            "volumes_remaining": safe_outer[1],
+            "networks_remaining": safe_outer[2],
+            "listeners_remaining": safe_outer[3],
+            "private_residue_remaining": sum(safe_private),
+            "scratch_remaining": scratch_remaining,
+        },
+        "receipt": {"canonical_sha256": ZERO_SHA256},
+    }
+    receipt["receipt"]["canonical_sha256"] = receipt_digest(receipt)
+    validate_receipt(receipt)
+    serialized = canonical(receipt) + b"\n"
+    path.unlink(missing_ok=True)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+operation = sys.argv[1]
 try:
-    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
-except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-    raise SystemExit(1)
-if not isinstance(result, dict) or result.get("status") != expected:
-    raise SystemExit(1)
-schema = result.get("schema")
-if schema not in {
-    "fawxzzy.hosted-replay-harness.result.v1",
-    "fawxzzy.hosted-replay-harness.direct-port-result.v1",
-}:
-    raise SystemExit(1)
-if expected == "DIRECT_DOCKER_PORT_PATH_PASS" and schema != "fawxzzy.hosted-replay-harness.direct-port-result.v1":
-    raise SystemExit(1)
-if expected in {"CONTAINMENT_SMOKE_PASS", "FIREWALL_PUBLICATION_REHEARSAL_PASS"} and schema != "fawxzzy.hosted-replay-harness.result.v1":
-    raise SystemExit(1)
-failure = result.get("failure")
-if expected == "BLOCKED":
-    if not isinstance(failure, dict) or not re.fullmatch(r"[A-Z0-9_]+", str(failure.get("code", ""))):
-        raise SystemExit(1)
-elif failure is not None:
+    if operation == "build":
+        if len(sys.argv) != 8:
+            raise ValueError("argument count")
+        build(
+            pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5],
+            pathlib.Path(sys.argv[6]), pathlib.Path(sys.argv[7]),
+        )
+    elif operation in {"validate", "status", "failure"}:
+        if len(sys.argv) not in {3, 4}:
+            raise ValueError("argument count")
+        path = pathlib.Path(sys.argv[2])
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("receipt path")
+        raw = path.read_bytes()
+        if not raw.endswith(b"\n") or b"\r" in raw or b"\x00" in raw:
+            raise ValueError("framing mismatch")
+        value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=strict_object)
+        expected = sys.argv[3] if len(sys.argv) == 4 else None
+        validate_receipt(value, expected)
+        if canonical(value) + b"\n" != raw:
+            raise ValueError("noncanonical serialization")
+        if operation == "status":
+            print(value["status"])
+        elif operation == "failure":
+            if value["status"] != "BLOCKED":
+                raise ValueError("failure unavailable")
+            print(value["failure"]["code"])
+    else:
+        raise ValueError("operation")
+except (AttributeError, json.JSONDecodeError, OSError, TypeError, UnicodeError, ValueError):
     raise SystemExit(1)
 PY
+}
+# END PUBLIC_RECEIPT_TOOL
+
+sanitize_public_result_receipt() {
+  public_receipt_tool build "$1" "$2" "$3" "$MODE" "$ROOT" "$STATE_FILE"
+}
+
+validate_result_receipt() {
+  public_receipt_tool validate "$1" "$2"
 }
 
 result_receipt_status() {
-  python3 -B - "$RESULT_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-allowed = {
-    "BLOCKED",
-    "CONTAINMENT_SMOKE_PASS",
-    "DIRECT_DOCKER_PORT_PATH_PASS",
-    "FIREWALL_PUBLICATION_REHEARSAL_PASS",
-}
-def strict_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
-try:
-    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
-    value = result.get("status")
-except (AttributeError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
-    raise SystemExit(1)
-if value not in allowed:
-    raise SystemExit(1)
-schema = result.get("schema")
-if schema not in {
-    "fawxzzy.hosted-replay-harness.result.v1",
-    "fawxzzy.hosted-replay-harness.direct-port-result.v1",
-}:
-    raise SystemExit(1)
-if value == "DIRECT_DOCKER_PORT_PATH_PASS" and schema != "fawxzzy.hosted-replay-harness.direct-port-result.v1":
-    raise SystemExit(1)
-if value in {"CONTAINMENT_SMOKE_PASS", "FIREWALL_PUBLICATION_REHEARSAL_PASS"} and schema != "fawxzzy.hosted-replay-harness.result.v1":
-    raise SystemExit(1)
-print(value)
-PY
+  public_receipt_tool status "$RESULT_FILE"
 }
 
 result_receipt_failure_code() {
-  python3 -B - "$RESULT_FILE" <<'PY'
-import json
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-def strict_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
-try:
-    result = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
-except (AttributeError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
-    raise SystemExit(1)
-failure = result.get("failure")
-code = failure.get("code") if isinstance(failure, dict) else None
-if result.get("status") != "BLOCKED" or not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]+", code):
-    raise SystemExit(1)
-print(code)
-PY
+  public_receipt_tool failure "$RESULT_FILE"
 }
 
 # BEGIN PACKET_SCRATCH_FUNCTION
@@ -647,7 +1030,7 @@ PY
 # END PACKET_SCRATCH_FUNCTION
 
 publish_result_receipt() {
-  local expected_status="$1" operation="$2" writer_rc=0
+  local expected_status="$1" operation="$2" writer_rc=0 published_status
   local -a writer_args=(
     --root "$ROOT" --state "$STATE_FILE" --audit "$AUDIT_FILE" --output "$RESULT_STAGE_FILE"
   )
@@ -671,11 +1054,15 @@ publish_result_receipt() {
     rm -f -- "$SCRATCH_AUDIT_STAGE_FILE" || writer_rc=1
     [[ ! -e "$SCRATCH_AUDIT_STAGE_FILE" && ! -L "$SCRATCH_AUDIT_STAGE_FILE" ]] || writer_rc=1
   fi
-  if [[ "$writer_rc" != "0" ]]; then
+  sanitize_public_result_receipt "$RESULT_STAGE_FILE" "$expected_status" "$writer_rc" || {
     rm -f -- "$RESULT_STAGE_FILE"
     return 1
-  fi
-  validate_result_receipt "$RESULT_STAGE_FILE" "$expected_status" || {
+  }
+  published_status="$(public_receipt_tool status "$RESULT_STAGE_FILE")" || {
+    rm -f -- "$RESULT_STAGE_FILE"
+    return 1
+  }
+  validate_result_receipt "$RESULT_STAGE_FILE" "$published_status" || {
     rm -f -- "$RESULT_STAGE_FILE"
     return 1
   }
@@ -683,7 +1070,7 @@ publish_result_receipt() {
     rm -f -- "$RESULT_STAGE_FILE"
     return 1
   }
-  validate_result_receipt "$RESULT_FILE" "$expected_status" || {
+  validate_result_receipt "$RESULT_FILE" "$published_status" || {
     rm -f -- "$RESULT_FILE"
     return 1
   }
@@ -1755,7 +2142,7 @@ cleanup_exact() {
 
 finalize() {
   local original_rc="$?" final_rc=1 final_status=BLOCKED network_code=PASS network_contract_ok=1
-  local primary_failure listener_phase receipt_failure=0 cleanup_rc=0 scratch_rc=0
+  local primary_failure listener_phase receipt_failure=0 cleanup_rc=0 scratch_rc=0 published_status=""
   [[ "$FINALIZING" == "0" ]] || return
   FINALIZING=1
   set +e
@@ -1846,10 +2233,17 @@ finalize() {
     final_status=BLOCKED
     final_rc=1
     printf 'BLOCKED: RESULT_RECEIPT_PUBLICATION_FAILED\n'
-  elif [[ "$final_status" == "BLOCKED" ]]; then
-    failure_code="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("failure") or {}).get("code","UNKNOWN"))' "$RESULT_FILE" 2>/dev/null || printf UNKNOWN)"
-    printf 'BLOCKED: %s\n' "$failure_code"
   else
+    published_status="$(result_receipt_status)" || published_status=""
+    if [[ "$published_status" != "$final_status" ]]; then
+      final_status=BLOCKED
+      final_rc=1
+    fi
+  fi
+  if [[ "$receipt_failure" == "0" && "$final_status" == "BLOCKED" ]]; then
+    failure_code="$(result_receipt_failure_code 2>/dev/null || printf UNKNOWN_SANITIZED)"
+    printf 'BLOCKED: %s\n' "$failure_code"
+  elif [[ "$receipt_failure" == "0" ]]; then
     printf '%s\n' "$final_status"
   fi
 
@@ -1860,7 +2254,7 @@ finalize() {
 
 cleanup_only() {
   local cleanup_rc=0 recovery_state=0 expected_status=BLOCKED publish_operation=merge scratch_rc=0
-  local primary_failure existing_status="" existing_failure=""
+  local primary_failure existing_status="" existing_failure="" published_status=""
   mkdir -p -- "$RAW" "$RUNTIME_HOME" "$PROJECT_DIR/supabase" "$ROOT/artifacts"
   if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
     [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || {
@@ -1971,6 +2365,11 @@ cleanup_only() {
     fi
     [[ "$existing_status" == "BLOCKED" ]] || rm -f -- "$RESULT_FILE"
     rm -f -- "$RESULT_STAGE_FILE"
+  else
+    published_status="$(result_receipt_status)" || published_status=""
+    if [[ "$published_status" != "$expected_status" ]]; then
+      cleanup_rc=1
+    fi
   fi
   if [[ "$cleanup_rc" == "0" ]]; then
     retire_cleanup_mode_contract || cleanup_rc=1
