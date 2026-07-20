@@ -1592,8 +1592,22 @@ exit "$rc"
         public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
         private = private_netns_probe.default_receipt()
         private["diagnostic.private_netns.failure_code"] = "PRIVATE_CONTAINERD_START_FAILED"
+        private["diagnostic.private_netns.startup.terminal_substage"] = "SOCKET_READINESS_TIMEOUT"
+        private["diagnostic.private_netns.startup.proof_complete"] = True
+        private["diagnostic.private_netns.startup.process_started"] = True
+        private["diagnostic.private_netns.startup.socket_wait_timeout"] = True
         private["diagnostic.private_netns.cleanup.attempted"] = True
         private["diagnostic.private_netns.cleanup.succeeded"] = True
+        private["diagnostic.private_netns.cleanup.proof_complete"] = True
+        private["diagnostic.private_netns.cleanup.completeness_finalized"] = True
+        for category in ("query", "action"):
+            private[f"diagnostic.private_netns.cleanup.{category}_required_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_attempted_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_succeeded_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_complete"] = True
+        private["diagnostic.private_netns.host_firewall.semantic_restored"] = True
+        private["diagnostic.private_netns.host_firewall.canonical_restored"] = True
+        private["diagnostic.private_netns.host_links.restored"] = True
         private_netns_probe.finalize_receipt(private)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1632,7 +1646,107 @@ exit "$rc"
         self.assertEqual(receipt["evidence"]["status"], "COMPLETE")
         self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
         self.assertEqual(receipt["cleanup"]["private_residue_remaining"], 0)
+        self.assertEqual(
+            receipt["evidence"]["private_runtime_startup_substage"],
+            "SOCKET_READINESS_TIMEOUT",
+        )
+        self.assertTrue(receipt["evidence"]["private_runtime_socket_wait_timeout"])
+        self.assertTrue(receipt["cleanup"]["private_query_complete"])
+        self.assertTrue(receipt["cleanup"]["private_action_complete"])
+        self.assertTrue(receipt["cleanup"]["private_proof_complete"])
         self.assertNotIn("private runtime details withheld", serialized)
+
+    def test_zero_residue_never_overrides_incomplete_or_malformed_private_proof(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        private = private_netns_probe.default_receipt()
+        private["diagnostic.private_netns.failure_code"] = "PRIVATE_CONTAINERD_START_FAILED"
+        private["diagnostic.private_netns.startup.terminal_substage"] = "SOCKET_READINESS_TIMEOUT"
+        private["diagnostic.private_netns.startup.proof_complete"] = True
+        private["diagnostic.private_netns.startup.process_started"] = True
+        private["diagnostic.private_netns.startup.socket_wait_timeout"] = True
+        private["diagnostic.private_netns.cleanup.attempted"] = True
+        private["diagnostic.private_netns.cleanup.completeness_finalized"] = True
+        private["diagnostic.private_netns.cleanup.query_required_count"] = 1
+        private["diagnostic.private_netns.cleanup.query_attempted_count"] = 1
+        private["diagnostic.private_netns.cleanup.query_failure_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_required_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_attempted_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_succeeded_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_complete"] = True
+        private["diagnostic.private_netns.cleanup.command_failure_count"] = 1
+        private_netns_probe.finalize_receipt(private)
+        rendered = private_netns_probe.format_receipt(private)
+        outer = (
+            "status\tstr\tBLOCKED\n"
+            "failure.code\tstr\tSTANDARD_RUNNER_REJECTED_JIT_REQUIRED\n"
+            "cleanup.containers_remaining\tint\t0\n"
+            "cleanup.volumes_remaining\tint\t0\n"
+            "cleanup.networks_remaining\tint\t0\n"
+            "cleanup.listeners_remaining\tint\t0\n"
+            "scratch.primary.proof_status\tstr\tPASS\n"
+            "scratch.primary.remaining_entry_count\tint\t0\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, private_rows, expected_code in (
+                ("incomplete", rendered, "PRIVATE_CONTAINERD_START_FAILED"),
+                (
+                    "malformed",
+                    "\n".join(
+                        line
+                        for line in rendered.splitlines()
+                        if not line.startswith(
+                            "diagnostic.private_netns.startup.terminal_substage\t"
+                        )
+                    )
+                    + "\n",
+                    "UNKNOWN_SANITIZED",
+                ),
+            ):
+                state = root / f"{name}.tsv"
+                result = root / f"{name}.json"
+                state.write_bytes((outer + private_rows).encode())
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-",
+                        "build",
+                        str(result),
+                        "BLOCKED",
+                        "0",
+                        "private-netns-probe",
+                        str(ROOT),
+                        str(state),
+                    ],
+                    input=public_python,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, (name, completed.stderr))
+                receipt = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["status"], "BLOCKED")
+                self.assertEqual(receipt["failure"]["code"], expected_code)
+                self.assertEqual(receipt["cleanup"]["status"], "UNVERIFIED")
+                self.assertFalse(receipt["cleanup"]["proof_complete"])
+                self.assertEqual(receipt["cleanup"]["private_residue_remaining"], 0)
+                if name == "incomplete":
+                    self.assertEqual(receipt["cleanup"]["private_query_failure_count"], 1)
+                    self.assertFalse(receipt["cleanup"]["private_query_complete"])
+                else:
+                    self.assertEqual(
+                        receipt["evidence"]["private_runtime_startup_substage"],
+                        "UNKNOWN_SANITIZED",
+                    )
+                    self.assertFalse(
+                        receipt["evidence"]["private_runtime_startup_proof_complete"]
+                    )
 
     def test_public_receipt_writer_failure_publishes_safe_blocked_fallback(self) -> None:
         marker = re.search(
@@ -5298,6 +5412,138 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                     receipt["diagnostic.private_netns.receipt_sha256"], "f" * 64
                 ).encode()
             )
+        contradictory_cleanup = private_netns_probe.default_receipt()
+        contradictory_cleanup[
+            "diagnostic.private_netns.cleanup.query_required_count"
+        ] = 1
+        private_netns_probe.finalize_receipt(contradictory_cleanup)
+        with self.assertRaises(ValueError):
+            private_netns_probe.format_receipt(contradictory_cleanup)
+        contradictory_startup = private_netns_probe.default_receipt()
+        contradictory_startup[
+            "diagnostic.private_netns.startup.terminal_substage"
+        ] = "READY"
+        contradictory_startup[
+            "diagnostic.private_netns.startup.proof_complete"
+        ] = True
+        private_netns_probe.finalize_receipt(contradictory_startup)
+        with self.assertRaises(ValueError):
+            private_netns_probe.format_receipt(contradictory_startup)
+
+    def test_startup_substages_are_closed_deterministic_and_raw_output_free(self) -> None:
+        class ExitedProcess:
+            def poll(self) -> int:
+                return 1
+
+        probe = self.probe_fixture()
+        probe.containerd_process = ExitedProcess()
+        probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+        with mock.patch.object(Path, "is_socket", return_value=False):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.wait_for_containerd_socket()
+        self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(
+            probe.receipt["diagnostic.private_netns.startup.terminal_substage"],
+            "PROCESS_EXIT_BEFORE_SOCKET",
+        )
+
+        class RunningProcess:
+            def poll(self) -> None:
+                return None
+
+        timeout_probe = self.probe_fixture()
+        timeout_probe.containerd_process = RunningProcess()
+        timeout_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+        with mock.patch.object(Path, "is_socket", return_value=False):
+            with mock.patch.object(
+                private_netns_probe.time, "monotonic", side_effect=(0.0, 31.0)
+            ):
+                with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                    timeout_probe.wait_for_containerd_socket()
+        self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(
+            timeout_probe.receipt["diagnostic.private_netns.startup.terminal_substage"],
+            "SOCKET_READINESS_TIMEOUT",
+        )
+
+        for results, expected in (
+            (
+                [subprocess.CompletedProcess([], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL")],
+                "NAMESPACE_CREATE_INITIAL_FAILED",
+            ),
+            (
+                [
+                    subprocess.CompletedProcess([], 0, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"),
+                    subprocess.CompletedProcess([], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"),
+                ],
+                "NAMESPACE_CREATE_RETRY_FAILED",
+            ),
+        ):
+            with self.subTest(substage=expected):
+                namespace_probe = self.probe_fixture()
+                namespace_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+                namespace_probe.receipt["diagnostic.private_netns.startup.socket_observed"] = True
+                with mock.patch.object(
+                    private_netns_probe, "run_command", side_effect=results
+                ):
+                    with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                        namespace_probe.create_private_containerd_namespaces()
+                self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+                self.assertEqual(
+                    namespace_probe.receipt[
+                        "diagnostic.private_netns.startup.terminal_substage"
+                    ],
+                    expected,
+                )
+                namespace_probe.receipt["diagnostic.private_netns.failure_code"] = raised.exception.code
+                private_netns_probe.finalize_receipt(namespace_probe.receipt)
+                rendered = private_netns_probe.format_receipt(namespace_probe.receipt)
+                self.assertNotIn("RAW_STARTUP_SENTINEL", rendered)
+
+        for result, expected in (
+            (
+                subprocess.CompletedProcess(
+                    [], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"
+                ),
+                "NAMESPACE_READBACK_FAILED",
+            ),
+            (
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    (
+                        private_netns_probe.CONTAINERD_NAMESPACE
+                        + "\n"
+                        + private_netns_probe.CONTAINERD_PLUGINS_NAMESPACE
+                        + "\n"
+                    ).encode(),
+                    b"RAW_STARTUP_SENTINEL",
+                ),
+                "READY",
+            ),
+        ):
+            with self.subTest(readback=expected):
+                readback_probe = self.probe_fixture()
+                readback_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+                readback_probe.receipt["diagnostic.private_netns.startup.socket_observed"] = True
+                readback_probe.receipt[
+                    "diagnostic.private_netns.startup.namespace_create_attempted_count"
+                ] = 2
+                readback_probe.receipt[
+                    "diagnostic.private_netns.startup.namespace_create_succeeded_count"
+                ] = 2
+                with mock.patch.object(private_netns_probe, "run_command", return_value=result):
+                    if expected == "READY":
+                        readback_probe.verify_private_containerd_namespaces()
+                    else:
+                        with self.assertRaises(private_netns_probe.ProbeFailure):
+                            readback_probe.verify_private_containerd_namespaces()
+                self.assertEqual(
+                    readback_probe.receipt[
+                        "diagnostic.private_netns.startup.terminal_substage"
+                    ],
+                    expected,
+                )
 
     def test_multiple_daemon_commands_are_fully_distinct_and_unix_only(self) -> None:
         runtime = Path("/packet/private-netns")
@@ -5328,7 +5574,7 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
         self.assertNotIn("tcp://", rendered)
         self.assertNotIn("/run/containerd/containerd.sock", rendered)
         self.assertIn('disabled_plugins = ["io.containerd.grpc.v1.cri"]', self.source)
-        self.assertIn('"namespaces",\n                    "create"', self.source)
+        self.assertRegex(self.source, r'"namespaces",\n\s+"create"')
 
     def test_private_firewall_is_namespace_local_and_same_bridge_only(self) -> None:
         batch = private_netns_probe.build_private_firewall_batch().decode()
@@ -5593,6 +5839,23 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                         self.assertEqual(
                             probe.receipt["diagnostic.private_netns.cleanup.command_failure_count"], 1
                         )
+                        self.assertTrue(
+                            probe.receipt[
+                                "diagnostic.private_netns.cleanup.completeness_finalized"
+                            ]
+                        )
+                        self.assertFalse(
+                            probe.receipt["diagnostic.private_netns.cleanup.proof_complete"]
+                        )
+                        self.assertEqual(
+                            probe.receipt[
+                                "diagnostic.private_netns.cleanup.query_failure_count"
+                            ]
+                            + probe.receipt[
+                                "diagnostic.private_netns.cleanup.action_failure_count"
+                            ],
+                            1,
+                        )
                         self.assertEqual(
                             probe.receipt["diagnostic.private_netns.cleanup.namespaces_remaining"],
                             1 if expected_action == "QUERY_NETNS" else 0,
@@ -5602,6 +5865,106 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                             probe.receipt["diagnostic.private_netns.host_links.final_sha256"],
                             probe.host_link_pre,
                         )
+
+    def test_successful_cleanup_proves_every_query_action_and_zero_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "private-netns"
+            runtime.mkdir()
+            probe = self.probe_fixture(runtime)
+            probe.netns_created = True
+            probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+            probe.host_link_pre = "f" * 64
+            success = subprocess.CompletedProcess([], 0, b"", b"")
+            with mock.patch.object(Path, "is_socket", lambda path: path.name == "docker.sock"):
+                with mock.patch.object(private_netns_probe, "run_command", return_value=success):
+                    with mock.patch.object(
+                        probe, "host_firewall_snapshot", return_value=probe.host_firewall_pre
+                    ):
+                        with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                            self.assertTrue(probe.cleanup())
+        cleanup = "diagnostic.private_netns.cleanup."
+        self.assertTrue(probe.receipt[f"{cleanup}completeness_finalized"])
+        self.assertTrue(probe.receipt[f"{cleanup}query_complete"])
+        self.assertTrue(probe.receipt[f"{cleanup}action_complete"])
+        self.assertTrue(probe.receipt[f"{cleanup}proof_complete"])
+        self.assertGreater(probe.receipt[f"{cleanup}query_required_count"], 0)
+        self.assertGreater(probe.receipt[f"{cleanup}action_required_count"], 0)
+        for category in ("query", "action"):
+            self.assertEqual(
+                probe.receipt[f"{cleanup}{category}_required_count"],
+                probe.receipt[f"{cleanup}{category}_attempted_count"],
+            )
+            self.assertEqual(
+                probe.receipt[f"{cleanup}{category}_attempted_count"],
+                probe.receipt[f"{cleanup}{category}_succeeded_count"],
+            )
+            self.assertEqual(probe.receipt[f"{cleanup}{category}_failure_count"], 0)
+        private_netns_probe.finalize_receipt(probe.receipt)
+        first = private_netns_probe.format_receipt(probe.receipt)
+        second = private_netns_probe.format_receipt(probe.receipt)
+        self.assertEqual(first, second)
+
+    def test_host_cleanup_query_failure_is_counted_and_never_hidden_by_zero_residue(self) -> None:
+        for failing_method, expected_failure in (
+            ("host_firewall_snapshot", "QUERY_HOST_FIREWALL"),
+            ("host_links", "QUERY_HOST_LINKS"),
+        ):
+            with self.subTest(query=failing_method):
+                probe = self.probe_fixture()
+                probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+                probe.host_link_pre = "f" * 64
+                success = subprocess.CompletedProcess([], 0, b"", b"")
+                with mock.patch.object(private_netns_probe, "run_command", return_value=success):
+                    with mock.patch.object(
+                        probe,
+                        "host_firewall_snapshot",
+                        side_effect=(
+                            OSError("withheld")
+                            if failing_method == "host_firewall_snapshot"
+                            else None
+                        ),
+                        return_value=probe.host_firewall_pre,
+                    ):
+                        with mock.patch.object(
+                            probe,
+                            "host_links",
+                            side_effect=(
+                                OSError("withheld") if failing_method == "host_links" else None
+                            ),
+                            return_value=probe.host_link_pre,
+                        ):
+                            self.assertFalse(probe.cleanup())
+                cleanup = "diagnostic.private_netns.cleanup."
+                self.assertEqual(probe.cleanup_failures, [expected_failure])
+                self.assertEqual(probe.receipt[f"{cleanup}query_failure_count"], 1)
+                self.assertFalse(probe.receipt[f"{cleanup}query_complete"])
+                self.assertFalse(probe.receipt[f"{cleanup}proof_complete"])
+                self.assertTrue(probe.receipt[f"{cleanup}action_complete"])
+
+    def test_startup_and_cleanup_public_vocabulary_is_closed_and_documented(self) -> None:
+        contract = (ROOT / "docs/CONTAINMENT_CONTRACT.md").read_text(encoding="utf-8")
+        for substage in sorted(private_netns_probe.STARTUP_SUBSTAGES):
+            self.assertIn(substage, self.source)
+            self.assertIn(substage, self.runner)
+            self.assertIn(substage, contract)
+        for field in (
+            "startup.terminal_substage",
+            "cleanup.query_required_count",
+            "cleanup.query_attempted_count",
+            "cleanup.query_succeeded_count",
+            "cleanup.query_failure_count",
+            "cleanup.query_complete",
+            "cleanup.action_required_count",
+            "cleanup.action_attempted_count",
+            "cleanup.action_succeeded_count",
+            "cleanup.action_failure_count",
+            "cleanup.action_complete",
+            "cleanup.completeness_finalized",
+            "cleanup.proof_complete",
+        ):
+            self.assertIn(field, self.source)
+        self.assertIn("required, attempted, succeeded, and failed cleanup queries", contract)
+        self.assertIn("Containerd stdout and stderr remain discarded", contract)
 
     def test_unexpected_cleanup_timeout_still_publishes_blocked_receipt(self) -> None:
         class TimeoutCleanupProbe(private_netns_probe.Probe):
@@ -5792,8 +6155,12 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
             private_netns_probe.REJECT_CLASS,
         )
         self.assertEqual(
-            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_RESIDUE"
+            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_CLEANUP_FAILED"
         )
+        self.assertFalse(
+            receipt["diagnostic.private_netns.cleanup.completeness_finalized"]
+        )
+        self.assertFalse(receipt["diagnostic.private_netns.cleanup.proof_complete"])
 
     def test_runner_cleanup_contract_includes_private_packet_and_scratch(self) -> None:
         self.assertIn('"label=io.fawxzzy.packet=${PRIVATE_NETNS_PACKET}"', self.runner)
