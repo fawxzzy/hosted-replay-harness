@@ -43,6 +43,18 @@ CONTAINERD_PLUGINS_NAMESPACE = "fp-hosted-replay-netns-plugins"
 PRIVATE_TABLE = "fp_private_netns_probe"
 OUTPUT_LIMIT = 8 * 1024 * 1024
 MINIMUM_EXTRA_DISK = 4 * 1024 * 1024 * 1024
+DOCKER_CLEANUP_ACTION_ORDER = (
+    "REMOVE_CLIENT",
+    "REMOVE_SERVICE",
+    "REMOVE_NETWORK",
+    "REMOVE_IMAGE",
+)
+DOCKER_CLEANUP_QUERY_SPECS = (
+    ("QUERY_CONTAINERS", "containers_remaining", ("ps", "-aq")),
+    ("QUERY_VOLUMES", "volumes_remaining", ("volume", "ls", "-q")),
+    ("QUERY_NETWORKS", "networks_remaining", ("network", "ls", "-q", "--filter", "type=custom")),
+    ("QUERY_IMAGES", "images_remaining", ("image", "ls", "-q")),
+)
 
 STARTUP_SUBSTAGES = frozenset(
     {
@@ -749,6 +761,8 @@ class Probe:
         self.cleanup_action_required: list[str] = []
         self.cleanup_action_attempted: list[str] = []
         self.cleanup_action_succeeded: list[str] = []
+        self.private_docker_cleanup_latched = False
+        self.private_docker_action_obligations: set[str] = set()
 
     @property
     def docker_host(self) -> str:
@@ -1010,6 +1024,7 @@ class Probe:
             env=self.private_env,
         )
         self.processes.append(self.dockerd_process)
+        self.latch_private_docker_runtime_cleanup()
         self.move_to_cgroup(self.dockerd_process.pid)
         self.wait_for_socket(self.runtime / "docker.sock", self.dockerd_process, "PRIVATE_DOCKERD_START_FAILED", 45)
         deadline = time.monotonic() + 45
@@ -1127,6 +1142,7 @@ class Probe:
         loaded = run_command([*self.docker, "image", "load", "--input", str(self.runtime / "image.tar")], timeout=180, env=self.private_env)
         if loaded.returncode != 0:
             self.fail("PRIVATE_IMAGE_LOAD_FAILED")
+        self.latch_private_docker_action("REMOVE_IMAGE")
         inspected = run_command([*self.docker, "image", "inspect", "--format", "{{.Id}}", self.args.image], env=self.private_env)
         if inspected.returncode != 0:
             self.fail("PRIVATE_IMAGE_LOAD_FAILED")
@@ -1159,6 +1175,7 @@ class Probe:
         created = run_command(command, env=self.private_env)
         if created.returncode != 0 or not created.stdout.strip():
             self.fail("PRIVATE_NETWORK_CREATE_FAILED")
+        self.latch_private_docker_action("REMOVE_NETWORK")
         firewall = run_command(
             ["ip", "netns", "exec", NS_NAME, "nft", "-f", "-"],
             input_bytes=build_private_firewall_batch(),
@@ -1209,6 +1226,7 @@ class Probe:
         )
         if service.returncode != 0 or not service.stdout.strip():
             self.fail("PRIVATE_CONTAINER_CREATE_FAILED")
+        self.latch_private_docker_action("REMOVE_SERVICE")
         self.service_id = service.stdout.decode("utf-8", "strict").strip()
         client = run_command(
             [
@@ -1238,6 +1256,7 @@ class Probe:
         )
         if client.returncode != 0 or not client.stdout.strip():
             self.fail("PRIVATE_CONTAINER_CREATE_FAILED")
+        self.latch_private_docker_action("REMOVE_CLIENT")
         self.client_id = client.stdout.decode("utf-8", "strict").strip()
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -1520,6 +1539,49 @@ class Probe:
         self.run_network_canaries()
         self.verify_loopback_proxy()
 
+    def latch_private_docker_runtime_cleanup(self) -> None:
+        self.private_docker_cleanup_latched = True
+
+    def latch_private_docker_action(self, action: str) -> None:
+        if action not in DOCKER_CLEANUP_ACTION_ORDER:
+            self.fail("PROBE_INTERNAL_ERROR")
+        self.private_docker_cleanup_latched = True
+        self.private_docker_action_obligations.add(action)
+
+    def synchronize_private_docker_cleanup_obligations(self) -> None:
+        if (
+            self.dockerd_process is not None
+            or self.receipt["diagnostic.private_netns.isolation.private_dockerd_socket"] is True
+            or self.private_image_id
+            or self.service_id
+            or self.client_id
+            or self.receipt["diagnostic.private_netns.network.private_network_count"] > 0
+        ):
+            self.latch_private_docker_runtime_cleanup()
+        if self.private_image_id:
+            self.latch_private_docker_action("REMOVE_IMAGE")
+        if (
+            self.receipt["diagnostic.private_netns.network.private_network_count"] > 0
+            or self.service_id
+            or self.client_id
+        ):
+            self.latch_private_docker_action("REMOVE_NETWORK")
+        if self.service_id:
+            self.latch_private_docker_action("REMOVE_SERVICE")
+        if self.client_id:
+            self.latch_private_docker_action("REMOVE_CLIENT")
+
+    def private_docker_action_command(self, action: str) -> list[str] | None:
+        if action == "REMOVE_CLIENT" and self.client_id:
+            return [*self.docker, "rm", "-f", self.client_id]
+        if action == "REMOVE_SERVICE" and self.service_id:
+            return [*self.docker, "rm", "-f", self.service_id]
+        if action == "REMOVE_NETWORK":
+            return [*self.docker, "network", "rm", NETWORK_NAME]
+        if action == "REMOVE_IMAGE" and self.private_image_id:
+            return [*self.docker, "image", "rm", "-f", self.private_image_id]
+        return None
+
     def record_cleanup_failure(self, action: str) -> None:
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", action):
             action = "UNEXPECTED_CLEANUP"
@@ -1537,6 +1599,10 @@ class Probe:
         if operation in ledger:
             self.fail("PROBE_INTERNAL_ERROR")
         ledger.append(operation)
+
+    def record_unavailable_cleanup_obligation(self, category: str, operation: str) -> None:
+        self.record_cleanup_evidence(category, "required", operation)
+        self.record_cleanup_failure(operation)
 
     def cleanup_command(
         self,
@@ -1560,8 +1626,6 @@ class Probe:
         return result
 
     def private_query_count(self, action: str, command: list[str]) -> int:
-        if not (self.runtime / "docker.sock").is_socket():
-            return 0
         result = self.cleanup_command(action, [*self.docker, *command], category="query")
         if result is None:
             return 1
@@ -1614,6 +1678,7 @@ class Probe:
 
     def cleanup(self) -> bool:
         self.receipt["diagnostic.private_netns.cleanup.attempted"] = True
+        self.synchronize_private_docker_cleanup_obligations()
         cleanup_ok = True
         if self.proxy is not None:
             self.record_cleanup_evidence("action", "required", "STOP_PROXY")
@@ -1625,32 +1690,27 @@ class Probe:
                 self.record_cleanup_failure("STOP_PROXY")
                 cleanup_ok = False
             self.proxy = None
-        if (self.runtime / "docker.sock").is_socket():
-            for action, identity in (
-                ("REMOVE_CLIENT", self.client_id),
-                ("REMOVE_SERVICE", self.service_id),
-            ):
-                if identity:
-                    self.cleanup_command(action, [*self.docker, "rm", "-f", identity], timeout=20)
-            self.cleanup_command("REMOVE_NETWORK", [*self.docker, "network", "rm", NETWORK_NAME], timeout=20)
-            if self.private_image_id:
-                self.cleanup_command(
-                    "REMOVE_IMAGE",
-                    [*self.docker, "image", "rm", "-f", self.private_image_id],
-                    timeout=30,
+        docker_socket_available = (self.runtime / "docker.sock").is_socket()
+        if self.private_docker_cleanup_latched:
+            for action in DOCKER_CLEANUP_ACTION_ORDER:
+                if action not in self.private_docker_action_obligations:
+                    continue
+                command = self.private_docker_action_command(action)
+                if not docker_socket_available or command is None:
+                    self.record_unavailable_cleanup_obligation("action", action)
+                    cleanup_ok = False
+                    continue
+                timeout = 30 if action == "REMOVE_IMAGE" else 20
+                if self.cleanup_command(action, command, timeout=timeout) is None:
+                    cleanup_ok = False
+            for action, receipt_name, command in DOCKER_CLEANUP_QUERY_SPECS:
+                if not docker_socket_available:
+                    self.record_unavailable_cleanup_obligation("query", action)
+                    cleanup_ok = False
+                    continue
+                self.receipt[f"diagnostic.private_netns.cleanup.{receipt_name}"] = self.private_query_count(
+                    action, list(command)
                 )
-            self.receipt["diagnostic.private_netns.cleanup.containers_remaining"] = self.private_query_count(
-                "QUERY_CONTAINERS", ["ps", "-aq"]
-            )
-            self.receipt["diagnostic.private_netns.cleanup.volumes_remaining"] = self.private_query_count(
-                "QUERY_VOLUMES", ["volume", "ls", "-q"]
-            )
-            self.receipt["diagnostic.private_netns.cleanup.networks_remaining"] = self.private_query_count(
-                "QUERY_NETWORKS", ["network", "ls", "-q", "--filter", "type=custom"]
-            )
-            self.receipt["diagnostic.private_netns.cleanup.images_remaining"] = self.private_query_count(
-                "QUERY_IMAGES", ["image", "ls", "-q"]
-            )
         cleanup_ok = self.stop_process("STOP_DOCKERD", self.dockerd_process) and cleanup_ok
         cleanup_ok = self.stop_process("STOP_CONTAINERD", self.containerd_process) and cleanup_ok
         process_count = sum(1 for process in self.processes if process.poll() is None)

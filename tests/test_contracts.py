@@ -5911,6 +5911,8 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
         ):
             with self.subTest(query=failing_method):
                 probe = self.probe_fixture()
+                probe.service_id = ""
+                probe.client_id = ""
                 probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
                 probe.host_link_pre = "f" * 64
                 success = subprocess.CompletedProcess([], 0, b"", b"")
@@ -5940,6 +5942,110 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                 self.assertFalse(probe.receipt[f"{cleanup}query_complete"])
                 self.assertFalse(probe.receipt[f"{cleanup}proof_complete"])
                 self.assertTrue(probe.receipt[f"{cleanup}action_complete"])
+
+    def test_latched_docker_cleanup_obligations_survive_missing_or_wrong_socket(self) -> None:
+        class CleanupProcess:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def poll(self) -> int | None:
+                return 0 if self.stopped else None
+
+            def send_signal(self, _signal: int) -> None:
+                return None
+
+            def wait(self, timeout: int) -> int:
+                self.stopped = True
+                return 0
+
+        unavailable_actions = list(private_netns_probe.DOCKER_CLEANUP_ACTION_ORDER)
+        unavailable_queries = [item[0] for item in private_netns_probe.DOCKER_CLEANUP_QUERY_SPECS]
+        for socket_state in ("missing", "wrong_type"):
+            with self.subTest(socket_state=socket_state):
+                with tempfile.TemporaryDirectory() as temporary:
+                    runtime = Path(temporary) / "private-netns"
+                    runtime.mkdir()
+                    if socket_state == "wrong_type":
+                        (runtime / "docker.sock").write_bytes(b"not-a-socket")
+                    probe = self.probe_fixture(runtime)
+                    probe.receipt[
+                        "diagnostic.private_netns.isolation.private_dockerd_socket"
+                    ] = True
+                    probe.receipt[
+                        "diagnostic.private_netns.network.private_network_count"
+                    ] = 1
+                    probe.private_image_id = "c" * 64
+                    probe.service_id = "a" * 64
+                    probe.client_id = "b" * 64
+                    dockerd_process = CleanupProcess()
+                    containerd_process = CleanupProcess()
+                    probe.dockerd_process = dockerd_process
+                    probe.containerd_process = containerd_process
+                    probe.processes = [dockerd_process, containerd_process]
+                    probe.netns_created = True
+                    probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+                    probe.host_link_pre = "f" * 64
+                    calls: list[list[str]] = []
+
+                    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                        calls.append(command)
+                        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                    with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
+                        with mock.patch.object(
+                            probe, "host_firewall_snapshot", return_value=probe.host_firewall_pre
+                        ):
+                            with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                                self.assertFalse(probe.cleanup())
+
+                cleanup = "diagnostic.private_netns.cleanup."
+                self.assertEqual(
+                    probe.cleanup_failures,
+                    [*unavailable_actions, *unavailable_queries],
+                )
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}query_required_count"],
+                    len(unavailable_queries) + 4,
+                )
+                self.assertEqual(probe.receipt[f"{cleanup}query_attempted_count"], 4)
+                self.assertEqual(probe.receipt[f"{cleanup}query_succeeded_count"], 4)
+                self.assertFalse(probe.receipt[f"{cleanup}query_complete"])
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}action_required_count"],
+                    len(unavailable_actions) + 4,
+                )
+                self.assertEqual(probe.receipt[f"{cleanup}action_attempted_count"], 4)
+                self.assertEqual(probe.receipt[f"{cleanup}action_succeeded_count"], 4)
+                self.assertFalse(probe.receipt[f"{cleanup}action_complete"])
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}command_failure_count"],
+                    len(unavailable_actions) + len(unavailable_queries),
+                )
+                self.assertFalse(probe.receipt[f"{cleanup}proof_complete"])
+                self.assertFalse(probe.receipt[f"{cleanup}succeeded"])
+                self.assertEqual(
+                    [
+                        probe.receipt[f"{cleanup}{receipt_name}"]
+                        for _, receipt_name, _ in private_netns_probe.DOCKER_CLEANUP_QUERY_SPECS
+                    ],
+                    [0, 0, 0, 0],
+                )
+                self.assertFalse(runtime.exists())
+                self.assertTrue(dockerd_process.stopped)
+                self.assertTrue(containerd_process.stopped)
+                self.assertTrue(
+                    any(
+                        command[:4]
+                        == ["ip", "netns", "delete", private_netns_probe.NS_NAME]
+                        for command in calls
+                    )
+                )
+                self.assertFalse(any(command and command[0] == "docker" for command in calls))
+                probe.receipt["diagnostic.private_netns.failure_code"] = "PRIVATE_CLEANUP_FAILED"
+                private_netns_probe.finalize_receipt(probe.receipt)
+                first = private_netns_probe.format_receipt(probe.receipt)
+                second = private_netns_probe.format_receipt(probe.receipt)
+                self.assertEqual(first, second)
 
     def test_startup_and_cleanup_public_vocabulary_is_closed_and_documented(self) -> None:
         contract = (ROOT / "docs/CONTAINMENT_CONTRACT.md").read_text(encoding="utf-8")
