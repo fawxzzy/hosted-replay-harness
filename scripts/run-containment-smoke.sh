@@ -610,7 +610,7 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
     pass_requested = expected_status != "BLOCKED"
     pass_admitted = (
         pass_requested and writer_rc == "0" and source_exact and state_safe and cleanup_status == "EXACT_ZERO"
-        and (state_status in {expected_status, None})
+        and state_status == expected_status
     )
     status = expected_status if pass_admitted else "BLOCKED"
     if status == "BLOCKED" and code in {None, "NONE", "PASS"}:

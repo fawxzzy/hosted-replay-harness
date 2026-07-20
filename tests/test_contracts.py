@@ -1512,6 +1512,52 @@ exit "$rc"
             self.assertEqual(receipt["status"], "BLOCKED")
             self.assertEqual(receipt["cleanup"]["status"], "UNVERIFIED")
 
+    def test_public_receipt_pass_requires_exact_private_terminal_status(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        exact_cleanup = (
+            "cleanup.containers_remaining\tint\t0\n"
+            "cleanup.volumes_remaining\tint\t0\n"
+            "cleanup.networks_remaining\tint\t0\n"
+            "cleanup.listeners_remaining\tint\t0\n"
+            "scratch.primary.proof_status\tstr\tPASS\n"
+            "scratch.primary.remaining_entry_count\tint\t0\n"
+        )
+        invalid_status_rows = {
+            "missing": "",
+            "null": "status\tjson\tnull\n",
+            "malformed": "status\tbool\ttrue\n",
+            "unknown": "status\tstr\tNOT_A_STATUS\n",
+            "mismatched": "status\tstr\tBLOCKED\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case, status_row in invalid_status_rows.items():
+                with self.subTest(case=case):
+                    state = root / f"{case}.tsv"
+                    result = root / f"{case}.json"
+                    state.write_bytes((status_row + exact_cleanup).encode("utf-8"))
+                    completed = subprocess.run(
+                        [
+                            sys.executable, "-B", "-", "build", str(result),
+                            "CONTAINMENT_SMOKE_PASS", "0", "run", str(ROOT), str(state),
+                        ],
+                        input=public_python,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, (case, completed.stderr))
+                    receipt = json.loads(result.read_text(encoding="utf-8"))
+                    self.assertEqual(receipt["status"], "BLOCKED")
+                    self.assertEqual(receipt["failure"]["code"], "UNKNOWN_SANITIZED")
+                    self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+                    self.assertTrue(receipt["cleanup"]["proof_complete"])
+
     def test_public_receipt_validator_rejects_unknown_nested_and_noncanonical_data(self) -> None:
         marker = re.search(
             r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
