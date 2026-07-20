@@ -1,0 +1,49 @@
+{
+  "schema": "fawxzzy.hosted-replay-harness.pins.v1",
+  "packet": "FP-HOSTED-REPLAY-CONTAINMENT-SMOKE-001",
+  "concurrency_group": "fp-hosted-replay-ro-001",
+  "supabase_cli": {
+    "version": "2.109.1",
+    "source_commit": "6d4c19870ed213ba7f682f117d0345c8a40bfa94",
+    "linux_amd64_asset": "supabase_2.109.1_linux_amd64.tar.gz",
+    "sha256": "36d87b7fe6b4bcfe89ac47a4354e526cff22480224de426d7b370f6934556976",
+    "member_manifest_sha256": "290ab75309cc2cd39140125f6f408ca2ef06c26ffc9b057aa87299a02041f140",
+    "adjacency_sha256": "889c5d358daebdfd07db6d21bba8460ce002137f1f85b4280d472ead3f290f7d",
+    "members": [
+      {
+        "name": "supabase",
+        "size": 109918528,
+        "sha256": "e9c1c33233b4341a0475f9acb2ecac35c41f6c9aa6cfdcd4f54b3761cc789c20",
+        "archive_mode": "0755",
+        "runtime_mode": "0555",
+        "platform": "linux/amd64",
+        "format": "ELF64-little-x86-64"
+      },
+      {
+        "name": "supabase-go",
+        "size": 100909240,
+        "sha256": "d10d8059b90d9fd68a69cb808b88dd3fe9f57ec458ffefc79a83083b3e810616",
+        "archive_mode": "0755",
+        "runtime_mode": "0555",
+        "platform": "linux/amd64",
+        "format": "ELF64-little-x86-64"
+      }
+    ]
+  },
+  "images": {
+    "postgres": {
+      "tag": "supabase/postgres:17.6.1.143",
+      "platform": "linux/amd64",
+      "digest": "sha256:b021e96054128399f84f24e39d29c21ee7c7169515e5d9e4e99ff15d5043d1d8"
+    },
+    "gotrue": {
+      "tag": "supabase/gotrue:v2.192.0",
+      "platform": "linux/amd64",
+      "digest": "sha256:288d880ebc80a1cb5ad52dc7d12328f76e9c90127003306864a270118bba00a8"
+    }
+  },
+  "actions": {
+    "checkout": "8e8c483db84b4bee98b60c0593521ed34d9990e8",
+    "upload_artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+  }
+}
