@@ -259,7 +259,7 @@ import re
 import subprocess
 import sys
 
-SCHEMA = "fawxzzy.hosted-replay-harness.public-receipt.v1"
+SCHEMA = "fawxzzy.hosted-replay-harness.public-receipt.v2"
 ZERO_SHA256 = "0" * 64
 ZERO_GIT_OID = "0" * 40
 STATUSES = {
@@ -348,6 +348,15 @@ INVARIANTS = {
 }
 EVIDENCE_STATUSES = {"COMPLETE", "PARTIAL", "UNKNOWN_SANITIZED"}
 CLEANUP_STATUSES = {"EXACT_ZERO", "RESIDUE", "UNVERIFIED"}
+STARTUP_SUBSTAGES = {
+    "PROCESS_EXIT_BEFORE_SOCKET",
+    "SOCKET_READINESS_TIMEOUT",
+    "NAMESPACE_CREATE_INITIAL_FAILED",
+    "NAMESPACE_CREATE_RETRY_FAILED",
+    "NAMESPACE_READBACK_FAILED",
+    "READY",
+    "UNKNOWN_SANITIZED",
+}
 BINDING_CLASSES = {"SOURCE_EXACT_ARTIFACT_RUN_METADATA_REQUIRED"}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_OID_RE = re.compile(r"[0-9a-f]{40}")
@@ -387,6 +396,69 @@ def receipt_digest(value) -> str:
     return hashlib.sha256(canonical(normalized)).hexdigest()
 
 
+def validate_startup_evidence(evidence, private_mode) -> None:
+    substage = evidence["private_runtime_startup_substage"]
+    proof_complete = evidence["private_runtime_startup_proof_complete"]
+    if substage not in STARTUP_SUBSTAGES or not isinstance(proof_complete, bool):
+        raise ValueError("startup evidence mismatch")
+    boolean_keys = (
+        "private_runtime_process_started", "private_runtime_process_exit_observed",
+        "private_runtime_socket_observed", "private_runtime_socket_wait_timeout",
+        "private_runtime_namespace_readback_attempted",
+        "private_runtime_namespace_readback_succeeded",
+    )
+    count_keys = (
+        "private_runtime_namespace_create_attempted_count",
+        "private_runtime_namespace_create_succeeded_count",
+        "private_runtime_namespace_expected_count",
+        "private_runtime_namespace_observed_count",
+    )
+    if any(not isinstance(evidence[key], bool) for key in boolean_keys):
+        raise ValueError("startup boolean mismatch")
+    if any(
+        not isinstance(evidence[key], int) or isinstance(evidence[key], bool) or evidence[key] < 0
+        for key in count_keys
+    ):
+        raise ValueError("startup count mismatch")
+    attempted = evidence["private_runtime_namespace_create_attempted_count"]
+    succeeded = evidence["private_runtime_namespace_create_succeeded_count"]
+    expected = evidence["private_runtime_namespace_expected_count"]
+    observed = evidence["private_runtime_namespace_observed_count"]
+    if succeeded > attempted or attempted > expected or observed > expected:
+        raise ValueError("startup count contradiction")
+    if proof_complete != (substage != "UNKNOWN_SANITIZED"):
+        raise ValueError("startup proof mismatch")
+    if not private_mode:
+        if substage != "UNKNOWN_SANITIZED" or proof_complete or any(evidence[key] for key in (*boolean_keys, *count_keys)):
+            raise ValueError("non-private startup evidence mismatch")
+        return
+    if substage == "UNKNOWN_SANITIZED":
+        return
+    if expected != 2:
+        raise ValueError("startup namespace denominator mismatch")
+    expected_shapes = {
+        "PROCESS_EXIT_BEFORE_SOCKET": (True, True, False, False, 0, 0, False, False, 0),
+        "SOCKET_READINESS_TIMEOUT": (True, False, False, True, 0, 0, False, False, 0),
+        "NAMESPACE_CREATE_INITIAL_FAILED": (True, False, True, False, 1, 0, False, False, 0),
+        "NAMESPACE_CREATE_RETRY_FAILED": (True, False, True, False, 2, 1, False, False, 0),
+        "NAMESPACE_READBACK_FAILED": (True, False, True, False, 2, 2, True, False, observed),
+        "READY": (True, False, True, False, 2, 2, True, True, 2),
+    }
+    shape = (
+        evidence["private_runtime_process_started"],
+        evidence["private_runtime_process_exit_observed"],
+        evidence["private_runtime_socket_observed"],
+        evidence["private_runtime_socket_wait_timeout"],
+        attempted,
+        succeeded,
+        evidence["private_runtime_namespace_readback_attempted"],
+        evidence["private_runtime_namespace_readback_succeeded"],
+        observed,
+    )
+    if substage not in expected_shapes or shape != expected_shapes[substage]:
+        raise ValueError("startup shape mismatch")
+
+
 def validate_receipt(value, expected_status=None) -> None:
     expected_keys(value, ("schema", "status", "binding", "failure", "evidence", "cleanup", "receipt"))
     expected_keys(value["binding"], (
@@ -394,11 +466,28 @@ def validate_receipt(value, expected_status=None) -> None:
         "mode", "packet_class", "run_binding_class",
     ))
     expected_keys(value["failure"], ("stage", "class", "code", "failed_invariant"))
-    expected_keys(value["evidence"], ("status", "safe_scalar_count", "manifest_sha256", "raw_details_withheld"))
+    expected_keys(value["evidence"], (
+        "status", "safe_scalar_count", "manifest_sha256", "raw_details_withheld",
+        "private_runtime_startup_substage", "private_runtime_startup_proof_complete",
+        "private_runtime_process_started", "private_runtime_process_exit_observed",
+        "private_runtime_socket_observed", "private_runtime_socket_wait_timeout",
+        "private_runtime_namespace_create_attempted_count",
+        "private_runtime_namespace_create_succeeded_count",
+        "private_runtime_namespace_readback_attempted",
+        "private_runtime_namespace_readback_succeeded",
+        "private_runtime_namespace_expected_count",
+        "private_runtime_namespace_observed_count",
+    ))
     expected_keys(value["cleanup"], (
         "status", "proof_complete", "containers_remaining", "volumes_remaining",
         "networks_remaining", "listeners_remaining", "private_residue_remaining",
-        "scratch_remaining",
+        "scratch_remaining", "private_query_required_count",
+        "private_query_attempted_count", "private_query_succeeded_count",
+        "private_query_failure_count", "private_query_complete",
+        "private_action_required_count", "private_action_attempted_count",
+        "private_action_succeeded_count", "private_action_failure_count",
+        "private_action_complete", "private_completeness_finalized",
+        "private_proof_complete",
     ))
     expected_keys(value["receipt"], ("canonical_sha256",))
     if value["schema"] != SCHEMA or value["status"] not in STATUSES:
@@ -427,19 +516,87 @@ def validate_receipt(value, expected_status=None) -> None:
         raise ValueError("evidence mismatch")
     if not SHA256_RE.fullmatch(evidence["manifest_sha256"]) or evidence["raw_details_withheld"] is not True:
         raise ValueError("evidence digest mismatch")
+    validate_startup_evidence(evidence, binding["mode"] == "private-netns-probe")
+    startup_substage = evidence["private_runtime_startup_substage"]
+    startup_proof = evidence["private_runtime_startup_proof_complete"]
+    if binding["mode"] == "private-netns-probe" and failure["code"] == "PRIVATE_CONTAINERD_START_FAILED" and startup_substage not in {
+        "PROCESS_EXIT_BEFORE_SOCKET", "SOCKET_READINESS_TIMEOUT",
+        "NAMESPACE_CREATE_INITIAL_FAILED", "NAMESPACE_CREATE_RETRY_FAILED",
+        "NAMESPACE_READBACK_FAILED",
+    }:
+        raise ValueError("containerd diagnostic mismatch")
+    if binding["mode"] == "private-netns-probe" and value["status"] != "BLOCKED" and (
+        startup_substage != "READY" or startup_proof is not True
+    ):
+        raise ValueError("private runtime pass contradiction")
     cleanup = value["cleanup"]
     if cleanup["status"] not in CLEANUP_STATUSES or not isinstance(cleanup["proof_complete"], bool):
         raise ValueError("cleanup status mismatch")
     for key in (
         "containers_remaining", "volumes_remaining", "networks_remaining",
         "listeners_remaining", "private_residue_remaining", "scratch_remaining",
+        "private_query_required_count", "private_query_attempted_count",
+        "private_query_succeeded_count", "private_query_failure_count",
+        "private_action_required_count", "private_action_attempted_count",
+        "private_action_succeeded_count", "private_action_failure_count",
     ):
         item = cleanup[key]
         if not isinstance(item, int) or isinstance(item, bool) or item < 0:
             raise ValueError("cleanup count mismatch")
+    for key in (
+        "private_query_complete", "private_action_complete",
+        "private_completeness_finalized", "private_proof_complete",
+    ):
+        if not isinstance(cleanup[key], bool):
+            raise ValueError("cleanup completeness mismatch")
+    if not cleanup["private_completeness_finalized"]:
+        if (
+            cleanup["private_query_complete"]
+            or cleanup["private_action_complete"]
+            or cleanup["private_proof_complete"]
+            or any(
+                cleanup[key]
+                for key in (
+                    "private_query_required_count", "private_query_attempted_count",
+                    "private_query_succeeded_count", "private_query_failure_count",
+                    "private_action_required_count", "private_action_attempted_count",
+                    "private_action_succeeded_count", "private_action_failure_count",
+                )
+            )
+        ):
+            raise ValueError("cleanup incomplete contradiction")
+    else:
+        for category in ("query", "action"):
+            required = cleanup[f"private_{category}_required_count"]
+            attempted = cleanup[f"private_{category}_attempted_count"]
+            succeeded = cleanup[f"private_{category}_succeeded_count"]
+            failures = cleanup[f"private_{category}_failure_count"]
+            complete = cleanup[f"private_{category}_complete"]
+            if succeeded > attempted or attempted > required or failures != attempted - succeeded:
+                raise ValueError("cleanup denominator mismatch")
+            if complete != (required == attempted == succeeded and failures == 0):
+                raise ValueError("cleanup completeness contradiction")
+        if cleanup["private_proof_complete"] and (
+            not cleanup["private_query_complete"] or not cleanup["private_action_complete"]
+        ):
+            raise ValueError("cleanup proof contradiction")
     all_zero = not any(cleanup[key] for key in cleanup if key.endswith("_remaining"))
     if cleanup["status"] == "EXACT_ZERO" and (not cleanup["proof_complete"] or not all_zero):
         raise ValueError("cleanup contradiction")
+    if binding["mode"] == "private-netns-probe" and cleanup["status"] == "EXACT_ZERO" and cleanup["private_proof_complete"] is not True:
+        raise ValueError("private cleanup contradiction")
+    if binding["mode"] != "private-netns-probe" and any(
+        cleanup[key]
+        for key in (
+            "private_query_required_count", "private_query_attempted_count",
+            "private_query_succeeded_count", "private_query_failure_count",
+            "private_query_complete", "private_action_required_count",
+            "private_action_attempted_count", "private_action_succeeded_count",
+            "private_action_failure_count", "private_action_complete",
+            "private_completeness_finalized", "private_proof_complete",
+        )
+    ):
+        raise ValueError("non-private cleanup evidence mismatch")
     digest = value["receipt"]["canonical_sha256"]
     if not SHA256_RE.fullmatch(digest) or digest != receipt_digest(value):
         raise ValueError("receipt digest mismatch")
@@ -595,14 +752,118 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
     )
     private_values = [typed_int(latest, key) for key in private_residue_keys]
     private_required = receipt_mode == "private-netns-probe"
+    startup_substage = typed_enum(
+        latest,
+        "diagnostic.private_netns.startup.terminal_substage",
+        STARTUP_SUBSTAGES,
+    )
+    startup_boolean_names = (
+        "proof_complete",
+        "process_started",
+        "process_exit_observed",
+        "socket_observed",
+        "socket_wait_timeout",
+        "namespace_readback_attempted",
+        "namespace_readback_succeeded",
+    )
+    startup_count_names = (
+        "namespace_create_attempted_count",
+        "namespace_create_succeeded_count",
+        "namespace_expected_count",
+        "namespace_observed_count",
+    )
+    startup_booleans = {
+        name: typed_bool(latest, f"diagnostic.private_netns.startup.{name}")
+        for name in startup_boolean_names
+    }
+    startup_counts = {
+        name: typed_int(latest, f"diagnostic.private_netns.startup.{name}")
+        for name in startup_count_names
+    }
+    startup_complete = (
+        not private_required
+        or (
+            startup_substage is not None
+            and all(value is not None for value in startup_booleans.values())
+            and all(value is not None for value in startup_counts.values())
+        )
+    )
+    startup_evidence_trusted = private_required and private_complete and startup_complete
+    safe_startup_substage = startup_substage if startup_evidence_trusted else "UNKNOWN_SANITIZED"
+    safe_startup_booleans = {
+        name: value if startup_evidence_trusted and value is not None else False
+        for name, value in startup_booleans.items()
+    }
+    safe_startup_counts = {
+        name: value if startup_evidence_trusted and value is not None else 0
+        for name, value in startup_counts.items()
+    }
     private_cleanup_ok = typed_bool(latest, "diagnostic.private_netns.cleanup.succeeded")
+    private_cleanup_count_names = (
+        "query_required_count",
+        "query_attempted_count",
+        "query_succeeded_count",
+        "query_failure_count",
+        "action_required_count",
+        "action_attempted_count",
+        "action_succeeded_count",
+        "action_failure_count",
+    )
+    private_cleanup_boolean_names = (
+        "query_complete",
+        "action_complete",
+        "completeness_finalized",
+        "proof_complete",
+    )
+    private_cleanup_counts = {
+        name: typed_int(latest, f"diagnostic.private_netns.cleanup.{name}")
+        for name in private_cleanup_count_names
+    }
+    private_cleanup_booleans = {
+        name: typed_bool(latest, f"diagnostic.private_netns.cleanup.{name}")
+        for name in private_cleanup_boolean_names
+    }
+    private_cleanup_telemetry_complete = (
+        not private_required
+        or (
+            all(value is not None for value in private_cleanup_counts.values())
+            and all(value is not None for value in private_cleanup_booleans.values())
+        )
+    )
+    private_cleanup_evidence_trusted = (
+        private_required and private_complete and private_cleanup_telemetry_complete
+    )
+    safe_private_cleanup_counts = {
+        name: value if private_cleanup_evidence_trusted and value is not None else 0
+        for name, value in private_cleanup_counts.items()
+    }
+    safe_private_cleanup_booleans = {
+        name: value if private_cleanup_evidence_trusted and value is not None else False
+        for name, value in private_cleanup_booleans.items()
+    }
+    private_diagnostic_valid = (
+        not private_required
+        or (private_complete and startup_complete and private_cleanup_telemetry_complete)
+    )
+    if private_required and not private_diagnostic_valid and writer_rc == "0":
+        code = "UNKNOWN_SANITIZED"
     outer_complete = all(item is not None for item in outer_values)
     private_complete_cleanup = not private_required or (
-        private_complete and private_cleanup_ok is True and all(item is not None for item in private_values)
+        private_complete
+        and private_cleanup_ok is True
+        and private_cleanup_telemetry_complete
+        and private_cleanup_booleans["proof_complete"] is True
+        and private_cleanup_booleans["query_complete"] is True
+        and private_cleanup_booleans["action_complete"] is True
+        and private_cleanup_booleans["completeness_finalized"] is True
+        and all(item is not None for item in private_values)
     )
     cleanup_complete = outer_complete and scratch_status == "PASS" and scratch_remaining_value is not None and private_complete_cleanup
     safe_outer = [item if item is not None else 0 for item in outer_values]
-    safe_private = [item if item is not None else 0 for item in private_values]
+    safe_private = [
+        item if private_required and private_complete and item is not None else 0
+        for item in private_values
+    ]
     all_zero = not any((*safe_outer, *safe_private, scratch_remaining))
     cleanup_status = "EXACT_ZERO" if cleanup_complete and all_zero else "RESIDUE" if any((*safe_outer, *safe_private, scratch_remaining)) else "UNVERIFIED"
 
@@ -611,6 +872,14 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
     pass_admitted = (
         pass_requested and writer_rc == "0" and source_exact and state_safe and cleanup_status == "EXACT_ZERO"
         and state_status == expected_status
+        and (
+            not private_required
+            or (
+                startup_complete
+                and startup_substage == "READY"
+                and startup_booleans["proof_complete"] is True
+            )
+        )
     )
     status = expected_status if pass_admitted else "BLOCKED"
     if status == "BLOCKED" and code in {None, "NONE", "PASS"}:
@@ -621,7 +890,11 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
     else:
         stage, failure_class, invariant = classify_failure(code)
 
-    diagnostic_complete = private_complete if private_required else True
+    diagnostic_complete = (
+        private_complete and startup_complete and private_cleanup_telemetry_complete
+        if private_required
+        else True
+    )
     evidence_status = "COMPLETE" if source_exact and state_safe and diagnostic_complete and cleanup_complete else "PARTIAL" if state_safe else "UNKNOWN_SANITIZED"
     safe_evidence = {
         "cleanup_complete": cleanup_complete,
@@ -632,6 +905,25 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
         "failure_stage": stage,
         "mode": receipt_mode,
         "private_receipt_sha256": private_digest or ZERO_SHA256,
+        "private_runtime_startup_substage": safe_startup_substage,
+        "private_runtime_startup_proof_complete": safe_startup_booleans["proof_complete"],
+        **{
+            f"private_runtime_{name}": value
+            for name, value in safe_startup_booleans.items()
+            if name != "proof_complete"
+        },
+        **{
+            f"private_runtime_{name}": value
+            for name, value in safe_startup_counts.items()
+        },
+        **{
+            f"private_cleanup_{name}": value
+            for name, value in safe_private_cleanup_counts.items()
+        },
+        **{
+            f"private_cleanup_{name}": value
+            for name, value in safe_private_cleanup_booleans.items()
+        },
         "source_commit_git_oid": commit_oid,
         "source_tree_git_oid": tree_oid,
         "status": status,
@@ -658,6 +950,17 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
             "safe_scalar_count": len(safe_evidence),
             "manifest_sha256": hashlib.sha256(canonical(safe_evidence)).hexdigest(),
             "raw_details_withheld": True,
+            "private_runtime_startup_substage": safe_startup_substage,
+            "private_runtime_startup_proof_complete": safe_startup_booleans["proof_complete"],
+            **{
+                f"private_runtime_{name}": value
+                for name, value in safe_startup_booleans.items()
+                if name != "proof_complete"
+            },
+            **{
+                f"private_runtime_{name}": value
+                for name, value in safe_startup_counts.items()
+            },
         },
         "cleanup": {
             "status": cleanup_status,
@@ -668,6 +971,14 @@ def build(path, expected_status, writer_rc, mode, root, state_path):
             "listeners_remaining": safe_outer[3],
             "private_residue_remaining": sum(safe_private),
             "scratch_remaining": scratch_remaining,
+            **{
+                f"private_{name}": value
+                for name, value in safe_private_cleanup_counts.items()
+            },
+            **{
+                f"private_{name}": value
+                for name, value in safe_private_cleanup_booleans.items()
+            },
         },
         "receipt": {"canonical_sha256": ZERO_SHA256},
     }
