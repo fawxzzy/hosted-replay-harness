@@ -1339,15 +1339,17 @@ cleanup_only
 
     def test_result_receipt_publication_is_staged_validated_and_fail_closed(self) -> None:
         publisher = self.runner_functions(
-            "validate_result_receipt",
-            "result_receipt_status",
             "publish_result_receipt",
         )
         self.assertIn('RESULT_STAGE_FILE="$ROOT/artifacts/.containment-smoke.json.stage"', self.runner)
-        self.assertIn('validate_result_receipt "$RESULT_STAGE_FILE" "$expected_status"', publisher)
+        self.assertIn('sanitize_public_result_receipt "$RESULT_STAGE_FILE" "$expected_status" "$writer_rc"', publisher)
+        self.assertIn('published_status="$(public_receipt_tool status "$RESULT_STAGE_FILE")"', publisher)
+        self.assertIn('validate_result_receipt "$RESULT_STAGE_FILE" "$published_status"', publisher)
         self.assertIn('mv -f -- "$RESULT_STAGE_FILE" "$RESULT_FILE"', publisher)
-        self.assertIn('validate_result_receipt "$RESULT_FILE" "$expected_status"', publisher)
+        self.assertIn('validate_result_receipt "$RESULT_FILE" "$published_status"', publisher)
         self.assertIn('rm -f -- "$RESULT_FILE"', publisher)
+        self.assertIn("# BEGIN PUBLIC_RECEIPT_TOOL", self.runner)
+        self.assertIn("mandatory leak scan rejected", self.runner)
         finalize = self.runner_functions("finalize")
         self.assertLess(
             finalize.index('publish_result_receipt "$final_status" replace'),
@@ -1446,65 +1448,462 @@ exit "$rc"
         self.assertIn("scratch.primary.allowlist_mismatch_count\tint\t1", state)
         self.assertIn("scratch.primary.proof_status\tstr\tALLOWLIST_REJECTED", state)
 
-    def test_result_receipt_validator_rejects_duplicate_ambiguous_or_contradictory_json(self) -> None:
-        start = self.runner.index("validate_result_receipt() {")
-        end = self.runner.index("\nresult_receipt_status() {", start)
-        validator = self.runner[start:end]
+    def test_public_receipt_is_closed_canonical_and_safely_diagnostic(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixtures = {
-                "pass.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "CONTAINMENT_SMOKE_PASS",
-                    "failure": None,
-                },
-                "direct.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.direct-port-result.v1",
-                    "status": "DIRECT_DOCKER_PORT_PATH_PASS",
-                    "failure": None,
-                },
-                "blocked.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "BLOCKED",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "contradictory.json": {
-                    "schema": "fawxzzy.hosted-replay-harness.result.v1",
-                    "status": "CONTAINMENT_SMOKE_PASS",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "wrong-schema.json": {
-                    "schema": "unknown",
-                    "status": "BLOCKED",
-                    "failure": {"code": "DATABASE_HEALTH_FAILED"},
-                },
-                "top-level.json": [],
-            }
-            for name, payload in fixtures.items():
-                (root / name).write_text(json.dumps(payload), encoding="utf-8")
-            (root / "duplicate.json").write_text(
-                '{"schema":"fawxzzy.hosted-replay-harness.result.v1",'
-                '"status":"BLOCKED","status":"BLOCKED",'
-                '"failure":{"code":"DATABASE_HEALTH_FAILED"}}',
-                encoding="utf-8",
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes((
+                "status\tstr\tBLOCKED\n"
+                "failure.code\tstr\tPACKET_SCRATCH_PROOF_FAILED\n"
+                "failure.detail\tstr\tprivate detail never published\n"
+                "cleanup.containers_remaining\tint\t0\n"
+                "cleanup.volumes_remaining\tint\t0\n"
+                "cleanup.networks_remaining\tint\t0\n"
+                "cleanup.listeners_remaining\tint\t0\n"
+                "scratch.primary.proof_status\tstr\tPASS\n"
+                "scratch.primary.remaining_entry_count\tint\t0\n"
+            ).encode("utf-8"))
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                    "run", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            q = shlex.quote
-            script = f"""set -Eeuo pipefail
-PYTHON={q(Path(sys.executable).as_posix())}
-python3() {{ "$PYTHON" "$@"; }}
-{validator}
-validate_result_receipt {q((root / 'pass.json').as_posix())} CONTAINMENT_SMOKE_PASS
-validate_result_receipt {q((root / 'direct.json').as_posix())} DIRECT_DOCKER_PORT_PATH_PASS
-validate_result_receipt {q((root / 'blocked.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'contradictory.json').as_posix())} CONTAINMENT_SMOKE_PASS
-! validate_result_receipt {q((root / 'wrong-schema.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'top-level.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'duplicate.json').as_posix())} BLOCKED
-! validate_result_receipt {q((root / 'pass.json').as_posix())} BLOCKED
-"""
-            completed = self.run_bash(script)
+            serialized = result.read_text(encoding="utf-8") if result.exists() else ""
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
+        receipt = json.loads(serialized) if serialized else None
+        self.assertIsNotNone(receipt)
+        self.assertEqual(
+            set(receipt),
+            {"schema", "status", "binding", "failure", "evidence", "cleanup", "receipt"},
+        )
+        self.assertEqual(receipt["failure"]["stage"], "CLEANUP")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "SCRATCH_CLEANUP")
+        self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+        self.assertTrue(receipt["evidence"]["raw_details_withheld"])
+        self.assertNotIn("private detail", serialized)
+
+    def test_public_receipt_redacts_raw_failures_and_missing_pass_evidence(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        injections = (
+            "198.51.100.9",
+            "2001:db8::9",
+            "https://example.invalid/path",
+            r"C:\\Users\\runner\\secret.txt",
+            "postgresql://user:pass@example.invalid/db",
+            "project_ref_abcdefghijklmnopqrst",
+            "Bearer abcdefghijklmnop",
+            "eyJhbGciOiJIUzI1NiJ9.abcdefghijklm.signature",
+            "HOME=/home/runner TOKEN=value",
+            "docker inspect --format raw-output",
+            "RuntimeError: arbitrary exception text",
+            "free form detail with spaces",
+            "MALFORMED-enum",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, injected in enumerate(injections):
+                state = root / f"state-{index}.tsv"
+                result = root / f"result-{index}.json"
+                state.write_bytes((
+                    "status\tstr\tBLOCKED\n"
+                    f"failure.code\tstr\t{injected}\n"
+                    f"failure.detail\tstr\t{injected}\n"
+                    f"failure.extra.nested\tstr\t{injected}\n"
+                    "cleanup.containers_remaining\tint\t0\n"
+                    "cleanup.volumes_remaining\tint\t0\n"
+                    "cleanup.networks_remaining\tint\t0\n"
+                    "cleanup.listeners_remaining\tint\t0\n"
+                    "scratch.primary.proof_status\tstr\tPASS\n"
+                    "scratch.primary.remaining_entry_count\tint\t0\n"
+                ).encode("utf-8"))
+                completed = subprocess.run(
+                    [
+                        sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                        "run", str(ROOT), str(state),
+                    ],
+                    input=public_python,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, (injected, completed.stderr))
+                serialized = result.read_text(encoding="utf-8")
+                receipt = json.loads(serialized)
+                self.assertEqual(receipt["failure"]["code"], "UNKNOWN_SANITIZED")
+                self.assertNotIn(injected, serialized)
+
+            missing_state = root / "missing-pass.tsv"
+            missing_result = root / "missing-pass.json"
+            missing_state.write_bytes(b"status\tstr\tCONTAINMENT_SMOKE_PASS\n")
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(missing_result),
+                    "CONTAINMENT_SMOKE_PASS", "0", "run", str(ROOT), str(missing_state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads(missing_result.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "BLOCKED")
+            self.assertEqual(receipt["cleanup"]["status"], "UNVERIFIED")
+
+    def test_public_receipt_pass_requires_exact_private_terminal_status(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        exact_cleanup = (
+            "cleanup.containers_remaining\tint\t0\n"
+            "cleanup.volumes_remaining\tint\t0\n"
+            "cleanup.networks_remaining\tint\t0\n"
+            "cleanup.listeners_remaining\tint\t0\n"
+            "scratch.primary.proof_status\tstr\tPASS\n"
+            "scratch.primary.remaining_entry_count\tint\t0\n"
+        )
+        invalid_status_rows = {
+            "missing": "",
+            "null": "status\tjson\tnull\n",
+            "malformed": "status\tbool\ttrue\n",
+            "unknown": "status\tstr\tNOT_A_STATUS\n",
+            "mismatched": "status\tstr\tBLOCKED\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case, status_row in invalid_status_rows.items():
+                with self.subTest(case=case):
+                    state = root / f"{case}.tsv"
+                    result = root / f"{case}.json"
+                    state.write_bytes((status_row + exact_cleanup).encode("utf-8"))
+                    completed = subprocess.run(
+                        [
+                            sys.executable, "-B", "-", "build", str(result),
+                            "CONTAINMENT_SMOKE_PASS", "0", "run", str(ROOT), str(state),
+                        ],
+                        input=public_python,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, (case, completed.stderr))
+                    receipt = json.loads(result.read_text(encoding="utf-8"))
+                    self.assertEqual(receipt["status"], "BLOCKED")
+                    self.assertEqual(receipt["failure"]["code"], "UNKNOWN_SANITIZED")
+                    self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+                    self.assertTrue(receipt["cleanup"]["proof_complete"])
+
+    def test_public_receipt_validator_rejects_unknown_nested_and_noncanonical_data(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_tool = marker.group("source")
+        public_python = public_tool.split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "unsafe.json"
+            path.write_text(
+                '{"schema":"fawxzzy.hosted-replay-harness.public-receipt.v1",'
+                '"status":"BLOCKED","unknown":{"raw":"https://example.invalid"}}\n',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, "-B", "-", "validate", str(path), "BLOCKED"],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+
+    def test_private_probe_public_receipt_preserves_only_closed_failure_and_cleanup_evidence(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        private = private_netns_probe.default_receipt()
+        private["diagnostic.private_netns.failure_code"] = "PRIVATE_CONTAINERD_START_FAILED"
+        private["diagnostic.private_netns.startup.terminal_substage"] = "SOCKET_READINESS_TIMEOUT"
+        private["diagnostic.private_netns.startup.proof_complete"] = True
+        private["diagnostic.private_netns.startup.process_started"] = True
+        private["diagnostic.private_netns.startup.socket_wait_timeout"] = True
+        private["diagnostic.private_netns.cleanup.attempted"] = True
+        private["diagnostic.private_netns.cleanup.succeeded"] = True
+        private["diagnostic.private_netns.cleanup.proof_complete"] = True
+        private["diagnostic.private_netns.cleanup.completeness_finalized"] = True
+        for category in ("query", "action"):
+            private[f"diagnostic.private_netns.cleanup.{category}_required_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_attempted_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_succeeded_count"] = 1
+            private[f"diagnostic.private_netns.cleanup.{category}_complete"] = True
+        private["diagnostic.private_netns.host_firewall.semantic_restored"] = True
+        private["diagnostic.private_netns.host_firewall.canonical_restored"] = True
+        private["diagnostic.private_netns.host_links.restored"] = True
+        private_netns_probe.finalize_receipt(private)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes(
+                (
+                    "status\tstr\tBLOCKED\n"
+                    "failure.code\tstr\tSTANDARD_RUNNER_REJECTED_JIT_REQUIRED\n"
+                    "failure.detail\tstr\tprivate runtime details withheld\n"
+                    + private_netns_probe.format_receipt(private)
+                    + "cleanup.containers_remaining\tint\t0\n"
+                    "cleanup.volumes_remaining\tint\t0\n"
+                    "cleanup.networks_remaining\tint\t0\n"
+                    "cleanup.listeners_remaining\tint\t0\n"
+                    "scratch.primary.proof_status\tstr\tPASS\n"
+                    "scratch.primary.remaining_entry_count\tint\t0\n"
+                ).encode("utf-8")
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result), "BLOCKED", "0",
+                    "private-netns-probe", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            serialized = result.read_text(encoding="utf-8")
+            receipt = json.loads(serialized)
+        self.assertEqual(receipt["failure"]["code"], "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(receipt["failure"]["stage"], "PRIVATE_RUNTIME")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "PRIVATE_DAEMON_ISOLATION")
+        self.assertEqual(receipt["evidence"]["status"], "COMPLETE")
+        self.assertEqual(receipt["cleanup"]["status"], "EXACT_ZERO")
+        self.assertEqual(receipt["cleanup"]["private_residue_remaining"], 0)
+        self.assertEqual(
+            receipt["evidence"]["private_runtime_startup_substage"],
+            "SOCKET_READINESS_TIMEOUT",
+        )
+        self.assertTrue(receipt["evidence"]["private_runtime_socket_wait_timeout"])
+        self.assertTrue(receipt["cleanup"]["private_query_complete"])
+        self.assertTrue(receipt["cleanup"]["private_action_complete"])
+        self.assertTrue(receipt["cleanup"]["private_proof_complete"])
+        self.assertNotIn("private runtime details withheld", serialized)
+
+    def test_zero_residue_never_overrides_incomplete_or_malformed_private_proof(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        private = private_netns_probe.default_receipt()
+        private["diagnostic.private_netns.failure_code"] = "PRIVATE_CONTAINERD_START_FAILED"
+        private["diagnostic.private_netns.startup.terminal_substage"] = "SOCKET_READINESS_TIMEOUT"
+        private["diagnostic.private_netns.startup.proof_complete"] = True
+        private["diagnostic.private_netns.startup.process_started"] = True
+        private["diagnostic.private_netns.startup.socket_wait_timeout"] = True
+        private["diagnostic.private_netns.cleanup.attempted"] = True
+        private["diagnostic.private_netns.cleanup.completeness_finalized"] = True
+        private["diagnostic.private_netns.cleanup.query_required_count"] = 1
+        private["diagnostic.private_netns.cleanup.query_attempted_count"] = 1
+        private["diagnostic.private_netns.cleanup.query_failure_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_required_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_attempted_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_succeeded_count"] = 1
+        private["diagnostic.private_netns.cleanup.action_complete"] = True
+        private["diagnostic.private_netns.cleanup.command_failure_count"] = 1
+        private_netns_probe.finalize_receipt(private)
+        rendered = private_netns_probe.format_receipt(private)
+        outer = (
+            "status\tstr\tBLOCKED\n"
+            "failure.code\tstr\tSTANDARD_RUNNER_REJECTED_JIT_REQUIRED\n"
+            "cleanup.containers_remaining\tint\t0\n"
+            "cleanup.volumes_remaining\tint\t0\n"
+            "cleanup.networks_remaining\tint\t0\n"
+            "cleanup.listeners_remaining\tint\t0\n"
+            "scratch.primary.proof_status\tstr\tPASS\n"
+            "scratch.primary.remaining_entry_count\tint\t0\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, private_rows, expected_code in (
+                ("incomplete", rendered, "PRIVATE_CONTAINERD_START_FAILED"),
+                (
+                    "malformed",
+                    "\n".join(
+                        line
+                        for line in rendered.splitlines()
+                        if not line.startswith(
+                            "diagnostic.private_netns.startup.terminal_substage\t"
+                        )
+                    )
+                    + "\n",
+                    "UNKNOWN_SANITIZED",
+                ),
+            ):
+                state = root / f"{name}.tsv"
+                result = root / f"{name}.json"
+                state.write_bytes((outer + private_rows).encode())
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-",
+                        "build",
+                        str(result),
+                        "BLOCKED",
+                        "0",
+                        "private-netns-probe",
+                        str(ROOT),
+                        str(state),
+                    ],
+                    input=public_python,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, (name, completed.stderr))
+                receipt = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["status"], "BLOCKED")
+                self.assertEqual(receipt["failure"]["code"], expected_code)
+                self.assertEqual(receipt["cleanup"]["status"], "UNVERIFIED")
+                self.assertFalse(receipt["cleanup"]["proof_complete"])
+                self.assertEqual(receipt["cleanup"]["private_residue_remaining"], 0)
+                if name == "incomplete":
+                    self.assertEqual(receipt["cleanup"]["private_query_failure_count"], 1)
+                    self.assertFalse(receipt["cleanup"]["private_query_complete"])
+                else:
+                    self.assertEqual(
+                        receipt["evidence"]["private_runtime_startup_substage"],
+                        "UNKNOWN_SANITIZED",
+                    )
+                    self.assertFalse(
+                        receipt["evidence"]["private_runtime_startup_proof_complete"]
+                    )
+
+    def test_public_receipt_writer_failure_publishes_safe_blocked_fallback(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        public_python = marker.group("source").split("<<'PY'\n", 1)[1].rsplit("\nPY\n}", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.tsv"
+            result = root / "result.json"
+            state.write_bytes(b"status\tstr\tCONTAINMENT_SMOKE_PASS\n")
+            completed = subprocess.run(
+                [
+                    sys.executable, "-B", "-", "build", str(result),
+                    "CONTAINMENT_SMOKE_PASS", "1", "run", str(ROOT), str(state),
+                ],
+                input=public_python,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipt = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "BLOCKED")
+        self.assertEqual(receipt["failure"]["code"], "RESULT_RECEIPT_PUBLICATION_FAILED")
+        self.assertEqual(receipt["failure"]["failed_invariant"], "RECEIPT_INTEGRITY")
+
+    def test_publication_pipeline_replaces_private_writer_output_before_atomic_publish(self) -> None:
+        marker = re.search(
+            r"(?ms)^# BEGIN PUBLIC_RECEIPT_TOOL\n(?P<source>.*?)^# END PUBLIC_RECEIPT_TOOL$",
+            self.runner,
+        )
+        self.assertIsNotNone(marker)
+        functions = "\n".join(
+            (
+                marker.group("source"),
+                self.runner_functions("sanitize_public_result_receipt"),
+                self.runner_functions("validate_result_receipt"),
+                self.runner_functions("result_receipt_status"),
+                self.runner_functions("publish_result_receipt"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            state = temp / "state.tsv"
+            audit = temp / "audit.jsonl"
+            result = temp / "result.json"
+            stage = temp / "result.stage"
+            state.write_bytes(
+                b"status\tstr\tBLOCKED\n"
+                b"failure.code\tstr\tPACKET_SCRATCH_PROOF_FAILED\n"
+                b"failure.detail\tstr\thttps://raw.invalid/private\n"
+                b"cleanup.containers_remaining\tint\t0\n"
+                b"cleanup.volumes_remaining\tint\t0\n"
+                b"cleanup.networks_remaining\tint\t0\n"
+                b"cleanup.listeners_remaining\tint\t0\n"
+                b"scratch.primary.proof_status\tstr\tPASS\n"
+                b"scratch.primary.remaining_entry_count\tint\t0\n"
+            )
+            audit.write_bytes(
+                b'{"role":"database","container_id":"raw-id","command":["raw-command"]}\n'
+            )
+            python_path = Path(sys.executable).as_posix()
+            if re.match(r"^[A-Za-z]:/", python_path):
+                python_path = f"/{python_path[0].lower()}{python_path[2:]}"
+            script = temp / "pipeline.sh"
+            script.write_text(
+                "set -Eeuo pipefail\n"
+                f"PYTHON={shlex.quote(python_path)}\n"
+                "python3() { \"$PYTHON\" \"$@\"; }\n"
+                f"ROOT={shlex.quote(ROOT.as_posix())}\n"
+                f"STATE_FILE={shlex.quote(state.as_posix())}\n"
+                f"AUDIT_FILE={shlex.quote(audit.as_posix())}\n"
+                f"RESULT_FILE={shlex.quote(result.as_posix())}\n"
+                f"RESULT_STAGE_FILE={shlex.quote(stage.as_posix())}\n"
+                f"SCRATCH_AUDIT_STAGE_FILE={shlex.quote((temp / 'audit.stage').as_posix())}\n"
+                f"SCRATCH_PROOF_STAGE_FILE={shlex.quote((temp / 'proof.stage').as_posix())}\n"
+                "MODE=run\n"
+                f"{functions}\n"
+                "publish_result_receipt BLOCKED replace\n"
+                "validate_result_receipt \"$RESULT_FILE\" BLOCKED\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            completed = subprocess.run(
+                [BASH, str(script)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            serialized = result.read_text(encoding="utf-8")
+            receipt = json.loads(serialized)
+        self.assertEqual(receipt["failure"]["code"], "PACKET_SCRATCH_PROOF_FAILED")
+        self.assertNotIn("raw.invalid", serialized)
+        self.assertNotIn("raw-command", serialized)
+        self.assertNotIn("raw-id", serialized)
 
     def test_loader_output_is_sanitized_classified_and_deleted(self) -> None:
         self.assertIn("umask 077", self.runner)
@@ -5071,6 +5470,138 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                     receipt["diagnostic.private_netns.receipt_sha256"], "f" * 64
                 ).encode()
             )
+        contradictory_cleanup = private_netns_probe.default_receipt()
+        contradictory_cleanup[
+            "diagnostic.private_netns.cleanup.query_required_count"
+        ] = 1
+        private_netns_probe.finalize_receipt(contradictory_cleanup)
+        with self.assertRaises(ValueError):
+            private_netns_probe.format_receipt(contradictory_cleanup)
+        contradictory_startup = private_netns_probe.default_receipt()
+        contradictory_startup[
+            "diagnostic.private_netns.startup.terminal_substage"
+        ] = "READY"
+        contradictory_startup[
+            "diagnostic.private_netns.startup.proof_complete"
+        ] = True
+        private_netns_probe.finalize_receipt(contradictory_startup)
+        with self.assertRaises(ValueError):
+            private_netns_probe.format_receipt(contradictory_startup)
+
+    def test_startup_substages_are_closed_deterministic_and_raw_output_free(self) -> None:
+        class ExitedProcess:
+            def poll(self) -> int:
+                return 1
+
+        probe = self.probe_fixture()
+        probe.containerd_process = ExitedProcess()
+        probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+        with mock.patch.object(Path, "is_socket", return_value=False):
+            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                probe.wait_for_containerd_socket()
+        self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(
+            probe.receipt["diagnostic.private_netns.startup.terminal_substage"],
+            "PROCESS_EXIT_BEFORE_SOCKET",
+        )
+
+        class RunningProcess:
+            def poll(self) -> None:
+                return None
+
+        timeout_probe = self.probe_fixture()
+        timeout_probe.containerd_process = RunningProcess()
+        timeout_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+        with mock.patch.object(Path, "is_socket", return_value=False):
+            with mock.patch.object(
+                private_netns_probe.time, "monotonic", side_effect=(0.0, 31.0)
+            ):
+                with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                    timeout_probe.wait_for_containerd_socket()
+        self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+        self.assertEqual(
+            timeout_probe.receipt["diagnostic.private_netns.startup.terminal_substage"],
+            "SOCKET_READINESS_TIMEOUT",
+        )
+
+        for results, expected in (
+            (
+                [subprocess.CompletedProcess([], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL")],
+                "NAMESPACE_CREATE_INITIAL_FAILED",
+            ),
+            (
+                [
+                    subprocess.CompletedProcess([], 0, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"),
+                    subprocess.CompletedProcess([], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"),
+                ],
+                "NAMESPACE_CREATE_RETRY_FAILED",
+            ),
+        ):
+            with self.subTest(substage=expected):
+                namespace_probe = self.probe_fixture()
+                namespace_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+                namespace_probe.receipt["diagnostic.private_netns.startup.socket_observed"] = True
+                with mock.patch.object(
+                    private_netns_probe, "run_command", side_effect=results
+                ):
+                    with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                        namespace_probe.create_private_containerd_namespaces()
+                self.assertEqual(raised.exception.code, "PRIVATE_CONTAINERD_START_FAILED")
+                self.assertEqual(
+                    namespace_probe.receipt[
+                        "diagnostic.private_netns.startup.terminal_substage"
+                    ],
+                    expected,
+                )
+                namespace_probe.receipt["diagnostic.private_netns.failure_code"] = raised.exception.code
+                private_netns_probe.finalize_receipt(namespace_probe.receipt)
+                rendered = private_netns_probe.format_receipt(namespace_probe.receipt)
+                self.assertNotIn("RAW_STARTUP_SENTINEL", rendered)
+
+        for result, expected in (
+            (
+                subprocess.CompletedProcess(
+                    [], 1, b"RAW_STARTUP_SENTINEL", b"RAW_STARTUP_SENTINEL"
+                ),
+                "NAMESPACE_READBACK_FAILED",
+            ),
+            (
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    (
+                        private_netns_probe.CONTAINERD_NAMESPACE
+                        + "\n"
+                        + private_netns_probe.CONTAINERD_PLUGINS_NAMESPACE
+                        + "\n"
+                    ).encode(),
+                    b"RAW_STARTUP_SENTINEL",
+                ),
+                "READY",
+            ),
+        ):
+            with self.subTest(readback=expected):
+                readback_probe = self.probe_fixture()
+                readback_probe.receipt["diagnostic.private_netns.startup.process_started"] = True
+                readback_probe.receipt["diagnostic.private_netns.startup.socket_observed"] = True
+                readback_probe.receipt[
+                    "diagnostic.private_netns.startup.namespace_create_attempted_count"
+                ] = 2
+                readback_probe.receipt[
+                    "diagnostic.private_netns.startup.namespace_create_succeeded_count"
+                ] = 2
+                with mock.patch.object(private_netns_probe, "run_command", return_value=result):
+                    if expected == "READY":
+                        readback_probe.verify_private_containerd_namespaces()
+                    else:
+                        with self.assertRaises(private_netns_probe.ProbeFailure):
+                            readback_probe.verify_private_containerd_namespaces()
+                self.assertEqual(
+                    readback_probe.receipt[
+                        "diagnostic.private_netns.startup.terminal_substage"
+                    ],
+                    expected,
+                )
 
     def test_multiple_daemon_commands_are_fully_distinct_and_unix_only(self) -> None:
         runtime = Path("/packet/private-netns")
@@ -5101,7 +5632,7 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
         self.assertNotIn("tcp://", rendered)
         self.assertNotIn("/run/containerd/containerd.sock", rendered)
         self.assertIn('disabled_plugins = ["io.containerd.grpc.v1.cri"]', self.source)
-        self.assertIn('"namespaces",\n                    "create"', self.source)
+        self.assertRegex(self.source, r'"namespaces",\n\s+"create"')
 
     def test_private_firewall_is_namespace_local_and_same_bridge_only(self) -> None:
         batch = private_netns_probe.build_private_firewall_batch().decode()
@@ -5235,6 +5766,8 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
             workspace_root=Path("/packet"),
             packet="FP-TEST-PACKET",
             listen_port=59422,
+            image="postgres@sha256:" + "d" * 64,
+            expected_image_id="sha256:" + "c" * 64,
         )
         probe = private_netns_probe.Probe(args)
         probe.service_id = "a" * 64
@@ -5352,19 +5885,37 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                             return subprocess.CompletedProcess(command, 0, b"", b"")
 
                         with mock.patch.object(Path, "is_socket", lambda path: path.name == "docker.sock"):
-                            with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
-                                with mock.patch.object(
-                                    probe,
-                                    "host_firewall_snapshot",
-                                    return_value=probe.host_firewall_pre,
-                                ):
-                                    with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
-                                        cleanup_ok = probe.cleanup()
+                            with mock.patch.object(probe, "private_docker_target_present", return_value=True):
+                                with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
+                                    with mock.patch.object(
+                                        probe,
+                                        "host_firewall_snapshot",
+                                        return_value=probe.host_firewall_pre,
+                                    ):
+                                        with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                                            cleanup_ok = probe.cleanup()
                         self.assertFalse(cleanup_ok)
                         self.assertEqual(len(calls), len(actions))
                         self.assertEqual(probe.cleanup_failures, [expected_action])
                         self.assertEqual(
                             probe.receipt["diagnostic.private_netns.cleanup.command_failure_count"], 1
+                        )
+                        self.assertTrue(
+                            probe.receipt[
+                                "diagnostic.private_netns.cleanup.completeness_finalized"
+                            ]
+                        )
+                        self.assertFalse(
+                            probe.receipt["diagnostic.private_netns.cleanup.proof_complete"]
+                        )
+                        self.assertEqual(
+                            probe.receipt[
+                                "diagnostic.private_netns.cleanup.query_failure_count"
+                            ]
+                            + probe.receipt[
+                                "diagnostic.private_netns.cleanup.action_failure_count"
+                            ],
+                            1,
                         )
                         self.assertEqual(
                             probe.receipt["diagnostic.private_netns.cleanup.namespaces_remaining"],
@@ -5375,6 +5926,344 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
                             probe.receipt["diagnostic.private_netns.host_links.final_sha256"],
                             probe.host_link_pre,
                         )
+
+    def test_resource_creation_ambiguity_prelatches_exact_cleanup_targets(self) -> None:
+        cases = (
+            ("image", "REMOVE_IMAGE", "PRIVATE_IMAGE_LOAD_FAILED"),
+            ("network", "REMOVE_NETWORK", "PRIVATE_NETWORK_CREATE_FAILED"),
+            ("service", "REMOVE_SERVICE", "PRIVATE_CONTAINER_CREATE_FAILED"),
+            ("client", "REMOVE_CLIENT", "PRIVATE_CONTAINER_CREATE_FAILED"),
+        )
+        expected_targets = {
+            "REMOVE_IMAGE": "sha256:" + "c" * 64,
+            "REMOVE_NETWORK": private_netns_probe.NETWORK_NAME,
+            "REMOVE_SERVICE": private_netns_probe.SERVICE_NAME,
+            "REMOVE_CLIENT": private_netns_probe.CLIENT_NAME,
+        }
+        for failure_kind in ("timeout", "error"):
+            for operation, action, expected_code in cases:
+                with self.subTest(kind=failure_kind, operation=operation):
+                    probe = self.probe_fixture()
+                    failed = (
+                        subprocess.TimeoutExpired(["docker"], 45)
+                        if failure_kind == "timeout"
+                        else subprocess.CompletedProcess([], 1, b"", b"")
+                    )
+                    responses: list[object]
+                    if operation == "client":
+                        responses = [
+                            subprocess.CompletedProcess([], 0, ("a" * 64).encode(), b""),
+                            failed,
+                        ]
+                    else:
+                        responses = [failed]
+                    with mock.patch.object(
+                        private_netns_probe, "run_command", side_effect=responses
+                    ):
+                        if failure_kind == "timeout":
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                if operation == "image":
+                                    probe.load_image()
+                                elif operation == "network":
+                                    probe.create_private_network()
+                                else:
+                                    probe.start_containers()
+                        else:
+                            with self.assertRaises(private_netns_probe.ProbeFailure) as raised:
+                                if operation == "image":
+                                    probe.load_image()
+                                elif operation == "network":
+                                    probe.create_private_network()
+                                else:
+                                    probe.start_containers()
+                            self.assertEqual(raised.exception.code, expected_code)
+                    self.assertIn(action, probe.private_docker_action_obligations)
+                    self.assertEqual(
+                        probe.private_docker_action_target(action),
+                        expected_targets[action],
+                    )
+                    with mock.patch.object(
+                        probe, "private_docker_target_present", return_value=True
+                    ):
+                        with mock.patch.object(
+                            private_netns_probe,
+                            "run_command",
+                            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                        ) as remover:
+                            self.assertTrue(probe.cleanup_private_docker_action(action))
+                    remove_command = remover.call_args.args[0]
+                    self.assertEqual(remove_command, probe.private_docker_action_command(action))
+                    self.assertEqual(probe.cleanup_action_required, [action])
+                    self.assertEqual(probe.cleanup_action_attempted, [action])
+                    self.assertEqual(probe.cleanup_action_succeeded, [action])
+                    probe.receipt["diagnostic.private_netns.cleanup.attempted"] = True
+                    probe.finalize_cleanup_failures()
+                    probe.finalize_cleanup_completeness()
+                    probe.receipt["diagnostic.private_netns.failure_code"] = expected_code
+                    private_netns_probe.finalize_receipt(probe.receipt)
+                    first = private_netns_probe.format_receipt(probe.receipt)
+                    second = private_netns_probe.format_receipt(probe.receipt)
+                    self.assertEqual(first, second)
+
+    def test_prelatched_cleanup_is_idempotent_when_target_is_absent(self) -> None:
+        for action in private_netns_probe.DOCKER_CLEANUP_ACTION_ORDER:
+            with self.subTest(action=action):
+                probe = self.probe_fixture()
+                probe.latch_private_docker_action(action)
+                with mock.patch.object(
+                    probe, "private_docker_target_present", return_value=False
+                ):
+                    with mock.patch.object(private_netns_probe, "run_command") as runner:
+                        self.assertTrue(probe.cleanup_private_docker_action(action))
+                runner.assert_not_called()
+                self.assertEqual(probe.cleanup_failures, [])
+                self.assertEqual(probe.cleanup_action_required, [action])
+                self.assertEqual(probe.cleanup_action_attempted, [action])
+                self.assertEqual(probe.cleanup_action_succeeded, [action])
+
+    def test_cleanup_target_presence_is_closed_and_fail_closed(self) -> None:
+        probe = self.probe_fixture()
+        present_outputs = {
+            "REMOVE_CLIENT": (private_netns_probe.CLIENT_NAME + "\n").encode(),
+            "REMOVE_SERVICE": (private_netns_probe.SERVICE_NAME + "\n").encode(),
+            "REMOVE_NETWORK": ("bridge\n" + private_netns_probe.NETWORK_NAME + "\n").encode(),
+            "REMOVE_IMAGE": ("sha256:" + "c" * 64 + "\n").encode(),
+        }
+        for action, output in present_outputs.items():
+            with self.subTest(action=action, state="present"):
+                with mock.patch.object(
+                    private_netns_probe,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, output, b""),
+                ):
+                    self.assertIs(probe.private_docker_target_present(action), True)
+            with self.subTest(action=action, state="absent"):
+                with mock.patch.object(
+                    private_netns_probe,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                ):
+                    self.assertIs(probe.private_docker_target_present(action), False)
+        for result in (
+            subprocess.CompletedProcess([], 1, b"", b""),
+            subprocess.CompletedProcess([], 0, b"invalid value\n", b""),
+        ):
+            with mock.patch.object(private_netns_probe, "run_command", return_value=result):
+                self.assertIs(
+                    probe.private_docker_target_present("REMOVE_NETWORK"), None
+                )
+        with mock.patch.object(
+            private_netns_probe,
+            "run_command",
+            side_effect=subprocess.TimeoutExpired(["docker"], 10),
+        ):
+            self.assertIs(probe.private_docker_target_present("REMOVE_IMAGE"), None)
+
+    def test_successful_cleanup_proves_every_query_action_and_zero_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "private-netns"
+            runtime.mkdir()
+            probe = self.probe_fixture(runtime)
+            probe.netns_created = True
+            probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+            probe.host_link_pre = "f" * 64
+            success = subprocess.CompletedProcess([], 0, b"", b"")
+            with mock.patch.object(Path, "is_socket", lambda path: path.name == "docker.sock"):
+                with mock.patch.object(private_netns_probe, "run_command", return_value=success):
+                    with mock.patch.object(
+                        probe, "host_firewall_snapshot", return_value=probe.host_firewall_pre
+                    ):
+                        with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                            self.assertTrue(probe.cleanup())
+        cleanup = "diagnostic.private_netns.cleanup."
+        self.assertTrue(probe.receipt[f"{cleanup}completeness_finalized"])
+        self.assertTrue(probe.receipt[f"{cleanup}query_complete"])
+        self.assertTrue(probe.receipt[f"{cleanup}action_complete"])
+        self.assertTrue(probe.receipt[f"{cleanup}proof_complete"])
+        self.assertGreater(probe.receipt[f"{cleanup}query_required_count"], 0)
+        self.assertGreater(probe.receipt[f"{cleanup}action_required_count"], 0)
+        for category in ("query", "action"):
+            self.assertEqual(
+                probe.receipt[f"{cleanup}{category}_required_count"],
+                probe.receipt[f"{cleanup}{category}_attempted_count"],
+            )
+            self.assertEqual(
+                probe.receipt[f"{cleanup}{category}_attempted_count"],
+                probe.receipt[f"{cleanup}{category}_succeeded_count"],
+            )
+            self.assertEqual(probe.receipt[f"{cleanup}{category}_failure_count"], 0)
+        private_netns_probe.finalize_receipt(probe.receipt)
+        first = private_netns_probe.format_receipt(probe.receipt)
+        second = private_netns_probe.format_receipt(probe.receipt)
+        self.assertEqual(first, second)
+
+    def test_host_cleanup_query_failure_is_counted_and_never_hidden_by_zero_residue(self) -> None:
+        for failing_method, expected_failure in (
+            ("host_firewall_snapshot", "QUERY_HOST_FIREWALL"),
+            ("host_links", "QUERY_HOST_LINKS"),
+        ):
+            with self.subTest(query=failing_method):
+                probe = self.probe_fixture()
+                probe.service_id = ""
+                probe.client_id = ""
+                probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+                probe.host_link_pre = "f" * 64
+                success = subprocess.CompletedProcess([], 0, b"", b"")
+                with mock.patch.object(private_netns_probe, "run_command", return_value=success):
+                    with mock.patch.object(
+                        probe,
+                        "host_firewall_snapshot",
+                        side_effect=(
+                            OSError("withheld")
+                            if failing_method == "host_firewall_snapshot"
+                            else None
+                        ),
+                        return_value=probe.host_firewall_pre,
+                    ):
+                        with mock.patch.object(
+                            probe,
+                            "host_links",
+                            side_effect=(
+                                OSError("withheld") if failing_method == "host_links" else None
+                            ),
+                            return_value=probe.host_link_pre,
+                        ):
+                            self.assertFalse(probe.cleanup())
+                cleanup = "diagnostic.private_netns.cleanup."
+                self.assertEqual(probe.cleanup_failures, [expected_failure])
+                self.assertEqual(probe.receipt[f"{cleanup}query_failure_count"], 1)
+                self.assertFalse(probe.receipt[f"{cleanup}query_complete"])
+                self.assertFalse(probe.receipt[f"{cleanup}proof_complete"])
+                self.assertTrue(probe.receipt[f"{cleanup}action_complete"])
+
+    def test_latched_docker_cleanup_obligations_survive_missing_or_wrong_socket(self) -> None:
+        class CleanupProcess:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def poll(self) -> int | None:
+                return 0 if self.stopped else None
+
+            def send_signal(self, _signal: int) -> None:
+                return None
+
+            def wait(self, timeout: int) -> int:
+                self.stopped = True
+                return 0
+
+        unavailable_actions = list(private_netns_probe.DOCKER_CLEANUP_ACTION_ORDER)
+        unavailable_queries = [item[0] for item in private_netns_probe.DOCKER_CLEANUP_QUERY_SPECS]
+        for socket_state in ("missing", "wrong_type"):
+            with self.subTest(socket_state=socket_state):
+                with tempfile.TemporaryDirectory() as temporary:
+                    runtime = Path(temporary) / "private-netns"
+                    runtime.mkdir()
+                    if socket_state == "wrong_type":
+                        (runtime / "docker.sock").write_bytes(b"not-a-socket")
+                    probe = self.probe_fixture(runtime)
+                    probe.receipt[
+                        "diagnostic.private_netns.isolation.private_dockerd_socket"
+                    ] = True
+                    probe.receipt[
+                        "diagnostic.private_netns.network.private_network_count"
+                    ] = 1
+                    probe.private_image_id = "c" * 64
+                    probe.service_id = "a" * 64
+                    probe.client_id = "b" * 64
+                    dockerd_process = CleanupProcess()
+                    containerd_process = CleanupProcess()
+                    probe.dockerd_process = dockerd_process
+                    probe.containerd_process = containerd_process
+                    probe.processes = [dockerd_process, containerd_process]
+                    probe.netns_created = True
+                    probe.host_firewall_pre = ("d" * 64, "e" * 64, {"table": 1})
+                    probe.host_link_pre = "f" * 64
+                    calls: list[list[str]] = []
+
+                    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                        calls.append(command)
+                        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                    with mock.patch.object(private_netns_probe, "run_command", side_effect=fake_run):
+                        with mock.patch.object(
+                            probe, "host_firewall_snapshot", return_value=probe.host_firewall_pre
+                        ):
+                            with mock.patch.object(probe, "host_links", return_value=probe.host_link_pre):
+                                self.assertFalse(probe.cleanup())
+
+                cleanup = "diagnostic.private_netns.cleanup."
+                self.assertEqual(
+                    probe.cleanup_failures,
+                    [*unavailable_actions, *unavailable_queries],
+                )
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}query_required_count"],
+                    len(unavailable_queries) + 4,
+                )
+                self.assertEqual(probe.receipt[f"{cleanup}query_attempted_count"], 4)
+                self.assertEqual(probe.receipt[f"{cleanup}query_succeeded_count"], 4)
+                self.assertFalse(probe.receipt[f"{cleanup}query_complete"])
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}action_required_count"],
+                    len(unavailable_actions) + 4,
+                )
+                self.assertEqual(probe.receipt[f"{cleanup}action_attempted_count"], 4)
+                self.assertEqual(probe.receipt[f"{cleanup}action_succeeded_count"], 4)
+                self.assertFalse(probe.receipt[f"{cleanup}action_complete"])
+                self.assertEqual(
+                    probe.receipt[f"{cleanup}command_failure_count"],
+                    len(unavailable_actions) + len(unavailable_queries),
+                )
+                self.assertFalse(probe.receipt[f"{cleanup}proof_complete"])
+                self.assertFalse(probe.receipt[f"{cleanup}succeeded"])
+                self.assertEqual(
+                    [
+                        probe.receipt[f"{cleanup}{receipt_name}"]
+                        for _, receipt_name, _ in private_netns_probe.DOCKER_CLEANUP_QUERY_SPECS
+                    ],
+                    [0, 0, 0, 0],
+                )
+                self.assertFalse(runtime.exists())
+                self.assertTrue(dockerd_process.stopped)
+                self.assertTrue(containerd_process.stopped)
+                self.assertTrue(
+                    any(
+                        command[:4]
+                        == ["ip", "netns", "delete", private_netns_probe.NS_NAME]
+                        for command in calls
+                    )
+                )
+                self.assertFalse(any(command and command[0] == "docker" for command in calls))
+                probe.receipt["diagnostic.private_netns.failure_code"] = "PRIVATE_CLEANUP_FAILED"
+                private_netns_probe.finalize_receipt(probe.receipt)
+                first = private_netns_probe.format_receipt(probe.receipt)
+                second = private_netns_probe.format_receipt(probe.receipt)
+                self.assertEqual(first, second)
+
+    def test_startup_and_cleanup_public_vocabulary_is_closed_and_documented(self) -> None:
+        contract = (ROOT / "docs/CONTAINMENT_CONTRACT.md").read_text(encoding="utf-8")
+        for substage in sorted(private_netns_probe.STARTUP_SUBSTAGES):
+            self.assertIn(substage, self.source)
+            self.assertIn(substage, self.runner)
+            self.assertIn(substage, contract)
+        for field in (
+            "startup.terminal_substage",
+            "cleanup.query_required_count",
+            "cleanup.query_attempted_count",
+            "cleanup.query_succeeded_count",
+            "cleanup.query_failure_count",
+            "cleanup.query_complete",
+            "cleanup.action_required_count",
+            "cleanup.action_attempted_count",
+            "cleanup.action_succeeded_count",
+            "cleanup.action_failure_count",
+            "cleanup.action_complete",
+            "cleanup.completeness_finalized",
+            "cleanup.proof_complete",
+        ):
+            self.assertIn(field, self.source)
+        self.assertIn("required, attempted, succeeded, and failed cleanup queries", contract)
+        self.assertIn("Containerd stdout and stderr remain discarded", contract)
 
     def test_unexpected_cleanup_timeout_still_publishes_blocked_receipt(self) -> None:
         class TimeoutCleanupProbe(private_netns_probe.Probe):
@@ -5565,8 +6454,12 @@ class PrivateDockerNetnsProbeTests(unittest.TestCase):
             private_netns_probe.REJECT_CLASS,
         )
         self.assertEqual(
-            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_RESIDUE"
+            receipt["diagnostic.private_netns.failure_code"], "PRIVATE_CLEANUP_FAILED"
         )
+        self.assertFalse(
+            receipt["diagnostic.private_netns.cleanup.completeness_finalized"]
+        )
+        self.assertFalse(receipt["diagnostic.private_netns.cleanup.proof_complete"])
 
     def test_runner_cleanup_contract_includes_private_packet_and_scratch(self) -> None:
         self.assertIn('"label=io.fawxzzy.packet=${PRIVATE_NETNS_PACKET}"', self.runner)
