@@ -9,10 +9,12 @@ application replay. The workflow is intentionally routed only to the unique
 reviewed JIT packet provisions that boundary, the workflow has no eligible
 runner.
 
-The adapter is stacked on the reviewed containment foundation at commit
-`6901855ab62ec3d2751491558825d9270666c934`. It does not modify the generic
-containment workflow, private-network-namespace probe, observer, pins, or
-Supabase configuration.
+The adapter is stacked on canonical harness `main` at commit
+`82cbd3b195dd5a07c3b437946f4404041f749508` (tree
+`ce102658e55387d7b6abcaebd8a16947095174b9`). That identity contains the
+accepted containment head `d0183a131b263904e43173a720a5b76948320e81` and
+does not modify the generic containment workflow, private-network-namespace
+probe, observer, pins, or Supabase configuration.
 
 ## Immutable source denominator
 

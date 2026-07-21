@@ -97,7 +97,7 @@ private_netns_probe = load_module(
 
 
 class FitnessStackIsolationContractTests(unittest.TestCase):
-    FOUNDATION = "6901855ab62ec3d2751491558825d9270666c934"
+    FOUNDATION = "82cbd3b195dd5a07c3b437946f4404041f749508"
     ALLOWLIST = {
         ".github/workflows/fitness-full-chain-replay.yml",
         "docs/FITNESS_FULL_CHAIN_REPLAY_CONTRACT.md",
@@ -114,8 +114,8 @@ class FitnessStackIsolationContractTests(unittest.TestCase):
     }
     IMMUTABLE = {
         ".github/workflows/containment-smoke.yml": "e0440e1748c4655c559fc82f5882e73b11c37b9cfd3e389bdbddf4ddecc7db99",
-        "scripts/run-containment-smoke.sh": "81cb185b6a2ab626498e1de3eb4069b2dedcacc0089d424be60a23a2703a97cb",
-        "scripts/private_docker_netns_probe.py": "3d1a4266febf3952c50093894668f162935e88d05dacb9c71b9f085e278a9dbc",
+        "scripts/run-containment-smoke.sh": "d295d7964d05af58bf27c8cb9fc9caf36d83a69ee1e3a1a7fad2b09042b0317d",
+        "scripts/private_docker_netns_probe.py": "83deb14241b170a1040fcf6e2582a0d252e1dd0aa29808b14d6cd3fa86b9cdbe",
         "scripts/docker_api_boundary.py": "cf6e7cca0ded8c4aeca16837f454a948a68058d35602dbb923a991ee70b32f82",
         "scripts/write_result.py": "883c2a6b4ecb9cc26b5bd025d1c6e0637d844a76f1dfb58947e6bee79fd8d6d6",
         "pins.json": "fe6105e121af3347a2de2494330d1e793a7bc3634f9d3d95964f6593ea990f50",

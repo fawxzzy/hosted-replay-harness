@@ -4,9 +4,9 @@
   "packet": "FP-HOSTED-REPLAY-FITNESS-FULL-CHAIN-SOURCE-001",
   "foundation": {
     "repository": "fawxzzy/hosted-replay-harness",
-    "base_branch": "agent/hosted-replay-containment-smoke",
-    "commit": "6901855ab62ec3d2751491558825d9270666c934",
-    "tree": "16f1598cd5f4985059753e4768bb94b238e1e8d4",
+    "base_branch": "main",
+    "commit": "82cbd3b195dd5a07c3b437946f4404041f749508",
+    "tree": "ce102658e55387d7b6abcaebd8a16947095174b9",
     "private_runtime_label": "fp-hosted-replay-jit-v1",
     "docker_host": "unix:///run/fp-hosted-replay-jit-v1/docker.sock",
     "cli_observer_host": "unix:///run/fp-hosted-replay-jit-v1/observer.sock",
