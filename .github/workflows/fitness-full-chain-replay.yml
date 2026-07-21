@@ -1,0 +1,58 @@
+name: Fitness full-chain replay source adapter
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fp-hosted-replay-fitness-full-chain-v1
+  cancel-in-progress: false
+
+jobs:
+  fitness-full-chain-replay:
+    runs-on: [self-hosted, linux, x64, fp-hosted-replay-jit-v1]
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact reviewed adapter
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+
+      - name: Run secret-free replay through private JIT runtime
+        run: >-
+          env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME="$(pwd)/.fitness-replay-runtime/home"
+          DO_NOT_TRACK=1
+          python3 -B ./scripts/fitness_full_chain_replay.py run
+          --expected-adapter-head "${GITHUB_SHA}"
+
+      - name: Recover exact packet resources
+        if: always()
+        run: >-
+          env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME="$(pwd)/.fitness-replay-runtime/home"
+          DO_NOT_TRACK=1
+          python3 -B ./scripts/fitness_full_chain_replay.py cleanup-only
+          --expected-adapter-head "${GITHUB_SHA}"
+
+      - name: Validate sanitized receipt
+        if: always()
+        run: >-
+          env -i
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          HOME="$(pwd)"
+          python3 -B ./scripts/verify_fitness_replay_receipt.py
+          --input ./artifacts/fitness-full-chain-replay.json
+
+      - name: Upload sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fp-fitness-full-chain-replay-${{ github.run_id }}
+          path: artifacts/fitness-full-chain-replay.json
+          if-no-files-found: error
+          retention-days: 7

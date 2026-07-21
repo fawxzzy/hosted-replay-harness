@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fawxzzy.hosted-replay.fitness.receipt.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "status", "failure_class", "adapter", "source", "migrations",
+    "fixtures", "security", "containment", "cleanup", "timings", "receipt_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "fawxzzy.hosted-replay.fitness.receipt.v1"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "failure_class": {
+      "enum": [
+        "NONE", "ADAPTER_IDENTITY_MISMATCH", "SOURCE_STAGE_FAILED",
+        "SOURCE_IDENTITY_MISMATCH", "SOURCE_MANIFEST_REJECTED",
+        "PRIVATE_RUNTIME_UNAVAILABLE", "PRIVATE_RUNTIME_ATTESTATION_REJECTED",
+        "LOCAL_DATABASE_START_FAILED", "MIGRATION_REPLAY_FAILED",
+        "FIXTURE_PROOF_FAILED", "IMMUTABILITY_PROOF_FAILED",
+        "PRIVILEGE_PROOF_FAILED", "IDEMPOTENCY_PROOF_FAILED",
+        "CONTAINMENT_PROOF_FAILED", "CLEANUP_RESIDUE", "RECEIPT_REJECTED",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "adapter": {"$ref": "#/$defs/adapter"},
+    "source": {"$ref": "#/$defs/source"},
+    "migrations": {"$ref": "#/$defs/migrations"},
+    "fixtures": {"$ref": "#/$defs/fixtures"},
+    "security": {"$ref": "#/$defs/security"},
+    "containment": {"$ref": "#/$defs/containment"},
+    "cleanup": {"$ref": "#/$defs/cleanup"},
+    "timings": {"$ref": "#/$defs/timings"},
+    "receipt_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegative": {"type": "integer", "minimum": 0},
+    "adapter": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "head", "tree", "workflow", "private_runtime_label"],
+      "properties": {
+        "repository": {"const": "fawxzzy/hosted-replay-harness"},
+        "head": {"$ref": "#/$defs/sha1"},
+        "tree": {"$ref": "#/$defs/sha1"},
+        "workflow": {"const": ".github/workflows/fitness-full-chain-replay.yml"},
+        "private_runtime_label": {"const": "fp-hosted-replay-jit-v1"}
+      }
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "repository", "base_commit", "base_tree", "candidate_commit", "candidate_tree",
+        "base_count", "candidate_count", "base_chain_sha256", "candidate_chain_sha256",
+        "candidate_delta_count", "historical_edit_count", "source_manifest_sha256",
+        "staged_before_isolation", "network_closed_during_replay"
+      ],
+      "properties": {
+        "repository": {"const": "fawxzzy/fawxzzy-fitness"},
+        "base_commit": {"$ref": "#/$defs/sha1"},
+        "base_tree": {"$ref": "#/$defs/sha1"},
+        "candidate_commit": {"$ref": "#/$defs/sha1"},
+        "candidate_tree": {"$ref": "#/$defs/sha1"},
+        "base_count": {"const": 101},
+        "candidate_count": {"const": 102},
+        "base_chain_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_chain_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_delta_count": {"const": 1},
+        "historical_edit_count": {"const": 0},
+        "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "staged_before_isolation": {"type": "boolean"},
+        "network_closed_during_replay": {"type": "boolean"}
+      }
+    },
+    "migration_record": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ordinal", "path", "sha256", "applied", "duration_ms"],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 1, "maximum": 102},
+        "path": {"type": "string", "pattern": "^supabase/migrations/[0-9A-Za-z_]+\\.sql$", "maxLength": 180},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "applied": {"type": "boolean"},
+        "duration_ms": {"type": "integer", "minimum": 0, "maximum": 120000}
+      }
+    },
+    "migrations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ordered_count", "candidate_applied_count", "idempotency_rerun", "records_digest", "records"],
+      "properties": {
+        "ordered_count": {"type": "integer", "minimum": 0, "maximum": 102},
+        "candidate_applied_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "idempotency_rerun": {"type": "boolean"},
+        "records_digest": {"$ref": "#/$defs/sha256"},
+        "records": {"type": "array", "maxItems": 102, "items": {"$ref": "#/$defs/migration_record"}}
+      }
+    },
+    "fixtures": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "initial_humans", "initial_automations", "deleted_label", "deleted_gap_preserved",
+        "concurrent_requested", "concurrent_succeeded", "concurrent_distinct",
+        "concurrent_min", "concurrent_max", "prior_high_water", "post_high_water",
+        "effective_next", "automation_null", "mapping_before_sha256",
+        "mapping_after_delete_sha256", "mapping_final_sha256"
+      ],
+      "properties": {
+        "initial_humans": {"const": 6},
+        "initial_automations": {"const": 1},
+        "deleted_label": {"const": "human-003"},
+        "deleted_gap_preserved": {"type": "boolean"},
+        "concurrent_requested": {"const": 8},
+        "concurrent_succeeded": {"type": "integer", "minimum": 0, "maximum": 8},
+        "concurrent_distinct": {"type": "boolean"},
+        "concurrent_min": {"$ref": "#/$defs/nonnegative"},
+        "concurrent_max": {"$ref": "#/$defs/nonnegative"},
+        "prior_high_water": {"$ref": "#/$defs/nonnegative"},
+        "post_high_water": {"$ref": "#/$defs/nonnegative"},
+        "effective_next": {"$ref": "#/$defs/nonnegative"},
+        "automation_null": {"type": "boolean"},
+        "mapping_before_sha256": {"$ref": "#/$defs/sha256"},
+        "mapping_after_delete_sha256": {"$ref": "#/$defs/sha256"},
+        "mapping_final_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "security": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "same_value_update", "user_number_update_rejected", "user_kind_update_rejected",
+        "assignment_timestamp_update_rejected", "public_sequence_privileges",
+        "anon_sequence_privileges", "authenticated_sequence_privileges",
+        "service_role_sequence_select_only", "allocate_attempt_rejected", "reset_attempt_rejected",
+        "object_state_before_sha256", "object_state_after_sha256"
+      ],
+      "properties": {
+        "same_value_update": {"type": "boolean"},
+        "user_number_update_rejected": {"type": "boolean"},
+        "user_kind_update_rejected": {"type": "boolean"},
+        "assignment_timestamp_update_rejected": {"type": "boolean"},
+        "public_sequence_privileges": {"const": 0},
+        "anon_sequence_privileges": {"const": 0},
+        "authenticated_sequence_privileges": {"const": 0},
+        "service_role_sequence_select_only": {"type": "boolean"},
+        "allocate_attempt_rejected": {"type": "boolean"},
+        "reset_attempt_rejected": {"type": "boolean"},
+        "object_state_before_sha256": {"$ref": "#/$defs/sha256"},
+        "object_state_after_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "containment": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "runtime_attested", "private_docker_socket", "no_default_route", "same_network",
+        "external_dns_failed", "literal_ip_failed", "metadata_failed", "host_failed",
+        "registry_failed", "host_publication_count", "provider_contact_count"
+      ],
+      "properties": {
+        "runtime_attested": {"type": "boolean"},
+        "private_docker_socket": {"type": "boolean"},
+        "no_default_route": {"type": "boolean"},
+        "same_network": {"type": "boolean"},
+        "external_dns_failed": {"type": "boolean"},
+        "literal_ip_failed": {"type": "boolean"},
+        "metadata_failed": {"type": "boolean"},
+        "host_failed": {"type": "boolean"},
+        "registry_failed": {"type": "boolean"},
+        "host_publication_count": {"const": 0},
+        "provider_contact_count": {"const": 0}
+      }
+    },
+    "cleanup": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "attempted", "succeeded", "containers_remaining", "volumes_remaining",
+        "networks_remaining", "listeners_remaining", "source_entries_remaining",
+        "runtime_residue_count", "foreign_objects_touched"
+      ],
+      "properties": {
+        "attempted": {"type": "boolean"},
+        "succeeded": {"type": "boolean"},
+        "containers_remaining": {"$ref": "#/$defs/nonnegative"},
+        "volumes_remaining": {"$ref": "#/$defs/nonnegative"},
+        "networks_remaining": {"$ref": "#/$defs/nonnegative"},
+        "listeners_remaining": {"$ref": "#/$defs/nonnegative"},
+        "source_entries_remaining": {"$ref": "#/$defs/nonnegative"},
+        "runtime_residue_count": {"$ref": "#/$defs/nonnegative"},
+        "foreign_objects_touched": {"const": 0}
+      }
+    },
+    "timings": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_stage_ms", "migration_ms", "proof_ms", "cleanup_ms", "total_ms"],
+      "properties": {
+        "source_stage_ms": {"$ref": "#/$defs/nonnegative"},
+        "migration_ms": {"$ref": "#/$defs/nonnegative"},
+        "proof_ms": {"$ref": "#/$defs/nonnegative"},
+        "cleanup_ms": {"$ref": "#/$defs/nonnegative"},
+        "total_ms": {"$ref": "#/$defs/nonnegative"}
+      }
+    }
+  }
+}

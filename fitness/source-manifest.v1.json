@@ -1,0 +1,843 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fawxzzy.hosted-replay.fitness.source-manifest.v1",
+  "repository": "fawxzzy/fawxzzy-fitness",
+  "base": {
+    "commit": "317568f9dcbc7d6c9dcf2ad30ef1cd80022ce8b3",
+    "tree": "bd4b2809a2a613a4bc67a4cc8166bee56d64a30f",
+    "migration_count": 101,
+    "chain_sha256": "236ded2d260b2787838219f6e54fa63cbed80a8581930f165ca6025bca91db3a"
+  },
+  "candidate": {
+    "commit": "4ff406c92c1d9b9e7ab23a4ebdaa01820b9b5c01",
+    "tree": "e8314980790dd9c711f63f4b38ad61e59ec6f409",
+    "migration_count": 102,
+    "chain_sha256": "711445d03b3d98466c278c4dfcbaa7cda326f188427b6dbcd55065fae1a2bbb5"
+  },
+  "delta": {
+    "added_count": 1,
+    "historical_edit_count": 0,
+    "path": "supabase/migrations/20260718015422_retire_human_member_number_compaction.sql",
+    "git_blob": "007eca9503dfd10a6910a27b02a46def30583d18",
+    "bytes": 15431,
+    "sha256": "ca502e3bcef4532ce4de336d33334c5620efaf3863286db51f6440bb9224662d"
+  },
+  "migrations": [
+    {
+      "ordinal": 1,
+      "phase": "base",
+      "path": "supabase/migrations/001_init.sql",
+      "git_blob": "ea2be3c4175e5878ff364956120172712cd732fe",
+      "bytes": 2464,
+      "sha256": "d4b0fd3f945a6caa979d280709af9138e384e67c27f3c37ae0307af111e5a88d"
+    },
+    {
+      "ordinal": 2,
+      "phase": "base",
+      "path": "supabase/migrations/002_routines.sql",
+      "git_blob": "b415a6d7bd44501b3daaf97db9afd336edc79940",
+      "bytes": 5310,
+      "sha256": "7eed5d0745a7d43618daf118e6e5d352f89f900e7125b96a5751587e51c74cef"
+    },
+    {
+      "ordinal": 3,
+      "phase": "base",
+      "path": "supabase/migrations/003_sets_reps_history.sql",
+      "git_blob": "7053eec1766223b74defc52acc348ff52252d7aa",
+      "bytes": 483,
+      "sha256": "d0cd5463502aebb400a4419b16e76d00bae98b328159a260b2d4ec84e6ab70d2"
+    },
+    {
+      "ordinal": 4,
+      "phase": "base",
+      "path": "supabase/migrations/004_timers.sql",
+      "git_blob": "4752f813c322ab1131e749216f8860027777bab6",
+      "bytes": 180,
+      "sha256": "6e4b2dea73d4634a09ed59b10a8ce4c71fd377b7bdab8326323ed481e50e02a8"
+    },
+    {
+      "ordinal": 5,
+      "phase": "base",
+      "path": "supabase/migrations/005_ui_core_fix_pack.sql",
+      "git_blob": "236152389ab757d0a3d85f73968b8bd2b9f6eb72",
+      "bytes": 4668,
+      "sha256": "cbe4a50db76cde4386c9d57105addddc1c4301977cb8ec88f62459fb8b46bb44"
+    },
+    {
+      "ordinal": 6,
+      "phase": "base",
+      "path": "supabase/migrations/006_session_status.sql",
+      "git_blob": "9be6b8ef66ef0ff0387f0964f0002755ff18c0b9",
+      "bytes": 720,
+      "sha256": "6ef3c574c34e349ad3a5c367ab159e1004f15165b100341f2db32b2a656f69c1"
+    },
+    {
+      "ordinal": 7,
+      "phase": "base",
+      "path": "supabase/migrations/007_relax_rep_range_constraint.sql",
+      "git_blob": "abb4d26d6dbeee3023b8e00867008d07ab5f6d60",
+      "bytes": 1021,
+      "sha256": "602443c368bbd4e2ba5990bfd35dbdfdd596814ff774ae43ce20be4f3bb66c8e"
+    },
+    {
+      "ordinal": 8,
+      "phase": "base",
+      "path": "supabase/migrations/008_exercises_table_and_rls.sql",
+      "git_blob": "369431a8775f8102b9b725be81bb2b864eb6831e",
+      "bytes": 5140,
+      "sha256": "10b80cac3fc490c3060969ddfc72e23cebf92ecc343b5312621f6a151dae93fa"
+    },
+    {
+      "ordinal": 9,
+      "phase": "base",
+      "path": "supabase/migrations/009_seed_global_exercises.sql",
+      "git_blob": "f58f18fb504e2fe57599cc20258dfdfa81f63748",
+      "bytes": 9213,
+      "sha256": "db4b6e19fad38769d17c3ad330cca946023b784d80200aeff710a6c5d1d5fdc2"
+    },
+    {
+      "ordinal": 10,
+      "phase": "base",
+      "path": "supabase/migrations/010_routine_targets_weight_duration.sql",
+      "git_blob": "d9cb007b97855c937edb99ae184213b542d89d5c",
+      "bytes": 677,
+      "sha256": "cbb358e2939e845ac37f01823d7efc53257627911c31221614db82bb0ed6634b"
+    },
+    {
+      "ordinal": 11,
+      "phase": "base",
+      "path": "supabase/migrations/011_exercises_id_uuid_backfill.sql",
+      "git_blob": "8353782d01a79c9c57fcd0760efff24e31577f91",
+      "bytes": 5923,
+      "sha256": "938d7c1011518c003b1843a852ea2823375de1145b52645db605602aba1a5908"
+    },
+    {
+      "ordinal": 12,
+      "phase": "base",
+      "path": "supabase/migrations/012_fix_exercises_id_nulls_constraints.sql",
+      "git_blob": "4c1a7c477d617ffede97e670049e3c459399f1fe",
+      "bytes": 4305,
+      "sha256": "a20592afb339f6bf768929e009ec00cc64a256029afebc7be54885e79e6402d1"
+    },
+    {
+      "ordinal": 13,
+      "phase": "base",
+      "path": "supabase/migrations/013_sets_session_exercise_set_index_unique.sql",
+      "git_blob": "b71514db062e1945ee2eb3494e8af75d91bf2acb",
+      "bytes": 212,
+      "sha256": "337b497a7b309298ea6db168cae0857094b9125e5d4a7cf3f91fad7ce9777a61"
+    },
+    {
+      "ordinal": 14,
+      "phase": "base",
+      "path": "supabase/migrations/014_sets_client_log_id_unique.sql",
+      "git_blob": "cfada0735ed33aeefda0542ae9c5de56e36f2636",
+      "bytes": 218,
+      "sha256": "de8c46fc23efc77d94aeb678e7559f7f67f483347e5a7b71be055667c93071db"
+    },
+    {
+      "ordinal": 15,
+      "phase": "base",
+      "path": "supabase/migrations/015_history_log_audit_notes.sql",
+      "git_blob": "3d19c47a78a56bd83ef80c33024fc4cb87aaee59",
+      "bytes": 1587,
+      "sha256": "9d0552194e500faa47300756794f821fb6f18162d55371f0550884133fdf3058"
+    },
+    {
+      "ordinal": 16,
+      "phase": "base",
+      "path": "supabase/migrations/016_weight_unit_overrides.sql",
+      "git_blob": "ddca4c784fc3d124182c7d622662d89530d0d00d",
+      "bytes": 669,
+      "sha256": "ce5e69601a85a25d0eb8375b108af392d57da0b556c4b9a6490c40de70b5aee7"
+    },
+    {
+      "ordinal": 17,
+      "phase": "base",
+      "path": "supabase/migrations/017_exercise_media_and_metadata.sql",
+      "git_blob": "8823cfe8ac656a6d28dc3cd8e7339b057e50f890",
+      "bytes": 3524,
+      "sha256": "f9b6345b02b9ce2e08b7fac5ba69a0e38262587c54ff1247c6e510d027e6f28f"
+    },
+    {
+      "ordinal": 18,
+      "phase": "base",
+      "path": "supabase/migrations/018_chest_press_seed_variants.sql",
+      "git_blob": "6d9e31f882661ef84d2b8b77e13eb310fd2aa551",
+      "bytes": 3852,
+      "sha256": "d4d6a743f4f10f54f7a6fdcbc4397780b39fdadba2207b9bee87e6f8a60964d8"
+    },
+    {
+      "ordinal": 19,
+      "phase": "base",
+      "path": "supabase/migrations/019_exercise_metadata_defaults_and_constraints.sql",
+      "git_blob": "d0d0a9cc84634e6af15ff80955c448db3f9a5d4d",
+      "bytes": 4344,
+      "sha256": "46eb40949a5deb1227a370cd87b6b2a85d171b88daf5cd3c5f4cf0fe5deb00fd"
+    },
+    {
+      "ordinal": 20,
+      "phase": "base",
+      "path": "supabase/migrations/020_global_exercises_metadata_backfill.sql",
+      "git_blob": "83b7f99fc7224500f938fdeefd8b84f00fc89244",
+      "bytes": 74547,
+      "sha256": "e51a9af684cc2047392b5aa0986be269a2707162094800a0e29a3113601bcb46"
+    },
+    {
+      "ordinal": 21,
+      "phase": "base",
+      "path": "supabase/migrations/021_exercise_measurement_and_set_distance.sql",
+      "git_blob": "43541315914b08068b18b9c60127432d3e2da4dc",
+      "bytes": 2297,
+      "sha256": "16881d2eff85c401ba6b821a0ecc489cbf02312a50dd810d3efcbd588352c521"
+    },
+    {
+      "ordinal": 22,
+      "phase": "base",
+      "path": "supabase/migrations/0221_routine_day_exercise_cardio_targets.sql",
+      "git_blob": "887e139c109c2a4dea185eac4ac4b06350b1f60e",
+      "bytes": 610,
+      "sha256": "2fc9499be218c26564802cc94717f0e32efe6379311cef8d3baba20c1b638ab1"
+    },
+    {
+      "ordinal": 23,
+      "phase": "base",
+      "path": "supabase/migrations/0222_profile_unit_preferences.sql",
+      "git_blob": "a50d7de4955d4320e3b914e3b8aa63e5120175f1",
+      "bytes": 584,
+      "sha256": "4c9012eb90a4f7853188e067e64d53b94f3104c35a066a59f60d6b6ef34cc6a8"
+    },
+    {
+      "ordinal": 24,
+      "phase": "base",
+      "path": "supabase/migrations/023_routine_session_exercise_measurement_overrides.sql",
+      "git_blob": "38adcae9c9da864d4d2a9f1480eb6008d2a5df2a",
+      "bytes": 1370,
+      "sha256": "68d69fd3212e06f258a8891a6f7e869bc907a8edc1433833e45a06a1cabfb9a0"
+    },
+    {
+      "ordinal": 25,
+      "phase": "base",
+      "path": "supabase/migrations/024_session_exercises_routine_day_exercise_fk.sql",
+      "git_blob": "d95ac0aac9c07978a85959d70023572c1f0ccb78",
+      "bytes": 1174,
+      "sha256": "b4c396146231e5a408ce4ea5f958a3c77e22a8aacfcab3a6ab800c3d04f59e76"
+    },
+    {
+      "ordinal": 26,
+      "phase": "base",
+      "path": "supabase/migrations/025_session_exercises_performed_index.sql",
+      "git_blob": "71db66f141ad1aaed364e78655583829f23003ac",
+      "bytes": 398,
+      "sha256": "2069fc9544799e4d2d876a5b929ab3195622297e123a192d7efc39a10f72c3b7"
+    },
+    {
+      "ordinal": 27,
+      "phase": "base",
+      "path": "supabase/migrations/026_exercise_stats_cache.sql",
+      "git_blob": "22da38067b19794be28feba5056942713954d852",
+      "bytes": 1420,
+      "sha256": "3a932ce660894c73e75e5534f3090088ad9f2343bf831ecf3cdaecae91c5e534"
+    },
+    {
+      "ordinal": 28,
+      "phase": "base",
+      "path": "supabase/migrations/027_session_exercises_target_calories.sql",
+      "git_blob": "117f784016f5af19cf8d0d1483cff7ffe4f8baad",
+      "bytes": 518,
+      "sha256": "62353e5c7dec6de57ad425343159afbf0169334b0cd1dcda3f2421aa3013a45c"
+    },
+    {
+      "ordinal": 29,
+      "phase": "base",
+      "path": "supabase/migrations/028_session_exercises_goal_targets_consistency.sql",
+      "git_blob": "4e9c5deb560a941c7660d7e3e76738d49beca219",
+      "bytes": 2106,
+      "sha256": "f65e70e1cc1f6e27479a59f28c4a371060193cee129e2b6a375cbc74d16792b9"
+    },
+    {
+      "ordinal": 30,
+      "phase": "base",
+      "path": "supabase/migrations/029_session_exercises_range_goal_columns.sql",
+      "git_blob": "9c0944eb99f36e8728f31d1a69691d41f519590b",
+      "bytes": 4356,
+      "sha256": "3da9518f614be88e30ed87db82812c5605307e27949bf750c02f9c672c93fdca"
+    },
+    {
+      "ordinal": 31,
+      "phase": "base",
+      "path": "supabase/migrations/0301_session_exercises_target_sets_range_columns.sql",
+      "git_blob": "a31ca3ac6d1b1b8f4f83ff4536b0b85660c6dc61",
+      "bytes": 1019,
+      "sha256": "fc5150c341e11bdc637d2da54d2c23225ce0d365b4fc54e0ddb114ab41ee26ac"
+    },
+    {
+      "ordinal": 32,
+      "phase": "base",
+      "path": "supabase/migrations/0302_backfill_session_exercises_exercise_id.sql",
+      "git_blob": "bba40ba7085f5224292b2b3d135f701c3c47d1da",
+      "bytes": 449,
+      "sha256": "39422dd05feb383d2eb7f1502eec1ea7957c1c6aedc81dcb858725206d5df28c"
+    },
+    {
+      "ordinal": 33,
+      "phase": "base",
+      "path": "supabase/migrations/031_exercise_stats_actual_pr_columns.sql",
+      "git_blob": "6d5b804f1cb78be1811d31da51a9d6d69a521429",
+      "bytes": 202,
+      "sha256": "51305cd3bd9d32c9a9c5e9660d2cba5a018bd3fa50f0002e8a59cc5bb40129a5"
+    },
+    {
+      "ordinal": 34,
+      "phase": "base",
+      "path": "supabase/migrations/032_backfill_cardio_session_exercise_default_unit.sql",
+      "git_blob": "07a0ebd3690ad29635483611ef496655b797f7f7",
+      "bytes": 1090,
+      "sha256": "03e409de6f88bd431a71952d932162b3a7aecca63ba10dca7cbd5a59695c7f41"
+    },
+    {
+      "ordinal": 35,
+      "phase": "base",
+      "path": "supabase/migrations/033_normalize_cardio_measurement_units.sql",
+      "git_blob": "4759b9e72152a79cf11f30f1d5e1771c2a7c51ea",
+      "bytes": 1398,
+      "sha256": "eb00bff15461b6feb56a26ff86cf45cd10a63e615cecd211829ec45a7cb3ca81"
+    },
+    {
+      "ordinal": 36,
+      "phase": "base",
+      "path": "supabase/migrations/034_normalize_cardio_units_values_only.sql",
+      "git_blob": "83d630047dac76d4d41adc0859b423f740bd13df",
+      "bytes": 1382,
+      "sha256": "7997b2656d9dd58c581f11fd703d87dc16517cbc284131d092a9c00772b83b7d"
+    },
+    {
+      "ordinal": 37,
+      "phase": "base",
+      "path": "supabase/migrations/035_session_and_routine_ordering_hardening.sql",
+      "git_blob": "336f69efdfe2f3db992fe591d4bf15787a26e11b",
+      "bytes": 3334,
+      "sha256": "7a91f9c4b4825245a3b788d34f20eabb54abdbd787370fb0a7cb1f311b87aea4"
+    },
+    {
+      "ordinal": 38,
+      "phase": "base",
+      "path": "supabase/migrations/036_session_follow_up_jobs.sql",
+      "git_blob": "d3a24e822255cdb0479c248e7c6a02661bb70884",
+      "bytes": 1511,
+      "sha256": "658954be54e71ae49b18163aeeb7ad43c489dda2b66b287239f36f257c8eae2a"
+    },
+    {
+      "ordinal": 39,
+      "phase": "base",
+      "path": "supabase/migrations/037_follow_up_job_leases_and_safe_repack.sql",
+      "git_blob": "4fa5cbd13a151f5f39aadcc41ef3d6eb5515cb36",
+      "bytes": 1892,
+      "sha256": "f2352133da51ca9e6c7b5016e2c5c7c9144369d4eeebf0d5394594921df976dd"
+    },
+    {
+      "ordinal": 40,
+      "phase": "base",
+      "path": "supabase/migrations/038_fix_strength_exercise_measurement_labels.sql",
+      "git_blob": "7172d5d2ffc30026a40c52dbb30a527fbdca42e0",
+      "bytes": 1068,
+      "sha256": "16331d8a18764401394d475d11abb6c1b351990df50b354ae966ba9b69527c06"
+    },
+    {
+      "ordinal": 41,
+      "phase": "base",
+      "path": "supabase/migrations/039_seed_global_stretch.sql",
+      "git_blob": "374ec98d77c026b53a67301a553db041c32aaa21",
+      "bytes": 1404,
+      "sha256": "9b2d8f5a0648364f868cf39eb301cc7d5aa3f6429ba21ee0b72d7d60ddbca0ba"
+    },
+    {
+      "ordinal": 42,
+      "phase": "base",
+      "path": "supabase/migrations/040_exercise_curation_tags_and_howto_refresh.sql",
+      "git_blob": "279d931f79600301b23429a943f0e5dfc1907b40",
+      "bytes": 143072,
+      "sha256": "2ab298bac9dedfa782742854fc2ab4c4659b46a3f2d3775b107d5593e23acb9c"
+    },
+    {
+      "ordinal": 43,
+      "phase": "base",
+      "path": "supabase/migrations/041_allow_measurement_optional_session_and_routine_goals.sql",
+      "git_blob": "5e787b1819d13b6edc031466bd741004e17d5e12",
+      "bytes": 649,
+      "sha256": "0bbdab1dc5d457b6db25d2c4f33a355a3d0a0e2cecc240e53b64344b9de7ae0e"
+    },
+    {
+      "ordinal": 44,
+      "phase": "base",
+      "path": "supabase/migrations/042_global_exercises_canonical_upsert.sql",
+      "git_blob": "e173a06c9025e04d8662a21deb671173417a7dde",
+      "bytes": 147188,
+      "sha256": "7d8a39573487ffd478f7cc397913f7c81411c49820f6033c9ecbcc2a59b405e9"
+    },
+    {
+      "ordinal": 45,
+      "phase": "base",
+      "path": "supabase/migrations/043_hide_standalone_stretch_catalog_rows.sql",
+      "git_blob": "42a8bd9aef05ad8aeb5efd8db644bc70a711a78f",
+      "bytes": 376,
+      "sha256": "f5231385f72b80ecac0c5f92616e2d1a692ee61b88cdca738386a1ddee077346"
+    },
+    {
+      "ordinal": 46,
+      "phase": "base",
+      "path": "supabase/migrations/044_real_user_numbers.sql",
+      "git_blob": "e0c681bb84e311025b57ec8ead83b17392582206",
+      "bytes": 3481,
+      "sha256": "2350c5c2841b8e049fa098c26492ba4033baf70f04bb5b93f505cab85637809b"
+    },
+    {
+      "ordinal": 47,
+      "phase": "base",
+      "path": "supabase/migrations/20260505065000_exercise_optional_metadata_columns.sql",
+      "git_blob": "ee811872c0d2911e87e9f36335393bbbf5164546",
+      "bytes": 587,
+      "sha256": "86e2ae304c1d4e0f7517c686f1679ea21568f67ddc0ffa9ead731c5aa9b4b793"
+    },
+    {
+      "ordinal": 48,
+      "phase": "base",
+      "path": "supabase/migrations/20260505070020_045_progression_playbooks.sql",
+      "git_blob": "458f7cb0716d675dc26421c8f018e7550654d97c",
+      "bytes": 905,
+      "sha256": "91ed6ebab1fa392a8fec17b1873e210549a7e1ab4346c8f52466751b619bc313"
+    },
+    {
+      "ordinal": 49,
+      "phase": "base",
+      "path": "supabase/migrations/20260505070028_046_routine_progression_defaults.sql",
+      "git_blob": "c2372b4dfa6b69b07d5d1b003060598ddb9882e6",
+      "bytes": 868,
+      "sha256": "789952d974bd2bf2758cb9b4607ad4cc47c3e1a02db3d80e638ff5956b1d41b0"
+    },
+    {
+      "ordinal": 50,
+      "phase": "base",
+      "path": "supabase/migrations/20260506090000_allow_routine_failure_rep_sentinel.sql",
+      "git_blob": "016162c37371eba2348ea67da2ab72002d44e623",
+      "bytes": 471,
+      "sha256": "12f0675310460d87a6180ec13ab2d6b7bbf7ee865fb335eda2dda104840a07d6"
+    },
+    {
+      "ordinal": 51,
+      "phase": "base",
+      "path": "supabase/migrations/20260506173000_047_function_search_path_hardening.sql",
+      "git_blob": "96c1c4c83e01c9231544a930894fbe9e56a5d94b",
+      "bytes": 2861,
+      "sha256": "d6a56a08e9778f194f993333dbe58eb4585826056854ed9b43f80d19e7fa2645"
+    },
+    {
+      "ordinal": 52,
+      "phase": "base",
+      "path": "supabase/migrations/20260506190000_048_security_definer_execute_revokes.sql",
+      "git_blob": "ae1aeea09273d9726e57d84980c7ee69f85d8f8b",
+      "bytes": 515,
+      "sha256": "1ad972c2e856c77cf17d62f753723f482c57a22e096f1f2b567d4618dec700d6"
+    },
+    {
+      "ordinal": 53,
+      "phase": "base",
+      "path": "supabase/migrations/20260507130000_049_fk_covering_indexes.sql",
+      "git_blob": "31bbfdbf2f22d9082a16dd18951eb55fca048974",
+      "bytes": 531,
+      "sha256": "0a74f57da9ad944bcb43db7083cbeff1a82e667305584b0188945f674445d002"
+    },
+    {
+      "ordinal": 54,
+      "phase": "base",
+      "path": "supabase/migrations/20260507162000_seed_global_pilates_exercises.sql",
+      "git_blob": "4088724b2251ed234c887ae81292832a4abf247a",
+      "bytes": 17019,
+      "sha256": "6129969f2982ccc85c1930453f16fea1379a89fc5f851be6e98139bf0df3c8c1"
+    },
+    {
+      "ordinal": 55,
+      "phase": "base",
+      "path": "supabase/migrations/20260508090000_remove_zone_2_cardio_catalog_exercise.sql",
+      "git_blob": "2232af1152e412fd8e4b5c2afcca777ba92af100",
+      "bytes": 413,
+      "sha256": "ed736148c316c0731a205667c6a4daf6f2ee7e38167b3785dd32c9c441e8b37d"
+    },
+    {
+      "ordinal": 56,
+      "phase": "base",
+      "path": "supabase/migrations/20260509100000_050_session_core_rls_initplan.sql",
+      "git_blob": "146ef7e103da4e620cdb0f54497ecc2b463b4d39",
+      "bytes": 2533,
+      "sha256": "04ca24f21610cd2eb8c166bb4413f1157ebe6d0368cedb58c8f071255cb40b24"
+    },
+    {
+      "ordinal": 57,
+      "phase": "base",
+      "path": "supabase/migrations/20260509103000_profile_qa_visibility.sql",
+      "git_blob": "94e2a657c93743128f487a41a77b152313b05f2f",
+      "bytes": 222,
+      "sha256": "ad8b95f2b962d5758c17b56948c975457d7cf906cc5f37d060e7ee52cd11797c"
+    },
+    {
+      "ordinal": 58,
+      "phase": "base",
+      "path": "supabase/migrations/20260509113000_051_progression_events.sql",
+      "git_blob": "f31bce280d9f2f4080e9ef757b9601a01c62b866",
+      "bytes": 2073,
+      "sha256": "0a778ca2183bddc07777b4a7600772b42359c4ca4d66d1a4bd7b3cb2d8c05b83"
+    },
+    {
+      "ordinal": 59,
+      "phase": "base",
+      "path": "supabase/migrations/20260510090000_052_routine_core_rls_initplan.sql",
+      "git_blob": "c77f26b71f3a8b742b99652f90eb2891bb2a8c67",
+      "bytes": 2737,
+      "sha256": "e3a6453bb5a1100d02cb22e8aab88dc00d37f61c3fa3883de383f52411fc680f"
+    },
+    {
+      "ordinal": 60,
+      "phase": "base",
+      "path": "supabase/migrations/20260510110000_053_profile_catalog_rls_initplan.sql",
+      "git_blob": "31be74fd985db676327efdae0ad07a69528dbf46",
+      "bytes": 2786,
+      "sha256": "31c42fdad8df22f900dc1c2395a55ffd5cbc7466a4d721fa69c02604cc2e39ff"
+    },
+    {
+      "ordinal": 61,
+      "phase": "base",
+      "path": "supabase/migrations/20260511093000_054_follow_up_jobs_rls_initplan.sql",
+      "git_blob": "b275da58c2514c3613c3cd4e3d456948ab98745d",
+      "bytes": 1157,
+      "sha256": "531407b35b91dfc94e34ae791304d999a2e75f8eda3440205d9bb744ef7ef942"
+    },
+    {
+      "ordinal": 62,
+      "phase": "base",
+      "path": "supabase/migrations/20260513113000_055_routine_schedule_mode.sql",
+      "git_blob": "58c73b40a638aaac5ba7cd62814e147b69149d21",
+      "bytes": 457,
+      "sha256": "815070276416fda72e23fa3b4e67088ea32fc32dd8da74bad448851a058c31bf"
+    },
+    {
+      "ordinal": 63,
+      "phase": "base",
+      "path": "supabase/migrations/20260514120000_054_discord_verification_tokens.sql",
+      "git_blob": "288c2f7cea46f0692ad2fd4ce9bdfb1107a6db29",
+      "bytes": 3015,
+      "sha256": "da0f0593b4426996a6c144be7ee3ceeaf0756a4dc191b184dc281c715bfa9f93"
+    },
+    {
+      "ordinal": 64,
+      "phase": "base",
+      "path": "supabase/migrations/20260515090309_055_discord_member_links.sql",
+      "git_blob": "0e0b4aa43a78a6fa25ef353c47772546a3446753",
+      "bytes": 4819,
+      "sha256": "cf648134f9df74e231605bf52c575b0e8053b86a6461d5f10f4b9bed4cef3467"
+    },
+    {
+      "ordinal": 65,
+      "phase": "base",
+      "path": "supabase/migrations/20260515090322_056_compact_public_member_numbers.sql",
+      "git_blob": "8b2f5bcb2e2e2033e790a7858bff087c0e446074",
+      "bytes": 2627,
+      "sha256": "a4e7f706604d356df9c72a83386f5f093eee9b6892b1b1b11fc7632aa153281b"
+    },
+    {
+      "ordinal": 66,
+      "phase": "base",
+      "path": "supabase/migrations/20260515130000_057_discord_bug_reports.sql",
+      "git_blob": "f1e89ec947c4b7ad4bc2c46aa37c5341b4f81975",
+      "bytes": 3650,
+      "sha256": "99f6529d580685bfe02373f9f0065b0084ffabca18e241c0bc1e7bb814511369"
+    },
+    {
+      "ordinal": 67,
+      "phase": "base",
+      "path": "supabase/migrations/20260515140000_058_discord_bug_report_forum_tags.sql",
+      "git_blob": "c006a378f542ca8c4c1ad9dc61847239f37f4ec7",
+      "bytes": 2498,
+      "sha256": "05f9ab6f05e5e294222d6bf5b0fc9a1504433f6ca3afb518fe038560b4d89704"
+    },
+    {
+      "ordinal": 68,
+      "phase": "base",
+      "path": "supabase/migrations/20260515150000_059_discord_feedback_reports.sql",
+      "git_blob": "987dfdba9fcad5dcee8577dd8775a79ca1245b67",
+      "bytes": 10686,
+      "sha256": "f3a5c65cd9aa8f2b06bee05ddc4095c79facbfa2dbf2f052f534bddd0d678e27"
+    },
+    {
+      "ordinal": 69,
+      "phase": "base",
+      "path": "supabase/migrations/20260515160000_060_discord_member_number_sync_queue.sql",
+      "git_blob": "d9a2b18735d5882ec3a6ac53cd675ebc8320fce5",
+      "bytes": 5539,
+      "sha256": "c9624c8c86acac9d605c80675ba0162d82cd3408a204052307b8e3a9f2701ab5"
+    },
+    {
+      "ordinal": 70,
+      "phase": "base",
+      "path": "supabase/migrations/20260515170000_061_discord_feedback_feature_report_type.sql",
+      "git_blob": "aab3af918b841da73f4b8e2d79013fc23ee12aa3",
+      "bytes": 1214,
+      "sha256": "c08d881884e04bc0c05524e3bfc947a2351105653b538648e3f1702085b8b467"
+    },
+    {
+      "ordinal": 71,
+      "phase": "base",
+      "path": "supabase/migrations/20260516063128_discord_update_drafts.sql",
+      "git_blob": "8279d7d9791c6124417abd050f16225f35a3a24a",
+      "bytes": 3249,
+      "sha256": "5fc1249e5ccfd48f05e7f7c584ebe16a8315a439ff6ba20c194493ae3de44a3e"
+    },
+    {
+      "ordinal": 72,
+      "phase": "base",
+      "path": "supabase/migrations/20260516174200_discord_feedback_attachments.sql",
+      "git_blob": "d4d5286334b7436c88ad450c378c8c6603304dbe",
+      "bytes": 1200,
+      "sha256": "6a2c821e74994b785a372fa44dca821e81c331fdf39fe2559102754272b212d8"
+    },
+    {
+      "ordinal": 73,
+      "phase": "base",
+      "path": "supabase/migrations/20260516220000_discord_moderation_cases.sql",
+      "git_blob": "d3a4cc339db731fed57122c87adcc96c38fca09a",
+      "bytes": 2632,
+      "sha256": "7d93bd00856667c3a50be488e801c6afec9fcf3902eb03fe08ae5a5e227b0784"
+    },
+    {
+      "ordinal": 74,
+      "phase": "base",
+      "path": "supabase/migrations/20260518103000_steps_distance_unit_support.sql",
+      "git_blob": "924536c08d02e58e2185ee6f44a87e5fbc05e2d1",
+      "bytes": 853,
+      "sha256": "264463f850bacc63d0ebb3e6f81609cc784948295775388da97be5c739faa120"
+    },
+    {
+      "ordinal": 75,
+      "phase": "base",
+      "path": "supabase/migrations/20260518110000_discord_feedback_fawxzzy_review_status.sql",
+      "git_blob": "dcebf9432e50c45a82ba8ed4cc3c95832ef15702",
+      "bytes": 359,
+      "sha256": "8c7323a567ba45ea53252b5d6d1211b36587cfbbd5ad7eb53f7ea2663974182c"
+    },
+    {
+      "ordinal": 76,
+      "phase": "base",
+      "path": "supabase/migrations/20260518163000_discord_feedback_completion_review.sql",
+      "git_blob": "30e44670ba1e5a386dcb1f73bd403b25610b0ef3",
+      "bytes": 975,
+      "sha256": "6030ee7214b1884054ff840d417360ef318273dff46758e07fc3514093b61f66"
+    },
+    {
+      "ordinal": 77,
+      "phase": "base",
+      "path": "supabase/migrations/20260518180000_backfill_discord_feedback_completion_review_pending.sql",
+      "git_blob": "4d9587bc38fe29f6fbc7e0a69f317d077ab81627",
+      "bytes": 582,
+      "sha256": "60687e8e93f29c4795776c9c479b9028f9a553c9be962b43bd6a326205d352cd"
+    },
+    {
+      "ordinal": 78,
+      "phase": "base",
+      "path": "supabase/migrations/20260518233447_discord_spotify_connections.sql",
+      "git_blob": "16cdd269429e753d1ca578640b39f9d63fc4e550",
+      "bytes": 1598,
+      "sha256": "4fa4a766d91adb1573ead0dfdc73ba6894561c248522b5ab34e4c4d42bde2092"
+    },
+    {
+      "ordinal": 79,
+      "phase": "base",
+      "path": "supabase/migrations/20260519000000_discord_spotify_lobbies.sql",
+      "git_blob": "3571b3da4f459317812463f8134b21b047d82dee",
+      "bytes": 2000,
+      "sha256": "44d39f919e428cc27871dbec5257efa08461be5ece6eef79e68c9c876369cc3b"
+    },
+    {
+      "ordinal": 80,
+      "phase": "base",
+      "path": "supabase/migrations/20260519013000_discord_spotify_queue_items.sql",
+      "git_blob": "6182b29bff4032332733f51e1f6380400e734df5",
+      "bytes": 3781,
+      "sha256": "bedf6d2d754d7586157bf9b5b72da3504f55f6409a92d149a8e9dcb9cd88ca9b"
+    },
+    {
+      "ordinal": 81,
+      "phase": "base",
+      "path": "supabase/migrations/20260519170000_discord_spotify_rooms_phase5.sql",
+      "git_blob": "6d3ffab515fee9a9dc4b93432f3d385442cf7088",
+      "bytes": 2819,
+      "sha256": "7dc47e4d46663dcb7e372876d5def428b17b2eeba15be4ac588627dff82e297f"
+    },
+    {
+      "ordinal": 82,
+      "phase": "base",
+      "path": "supabase/migrations/20260520120000_discord_spotify_phase6_queue_lifecycle.sql",
+      "git_blob": "1ffd22f8c5c3ca276839c078e05807ed4239ee36",
+      "bytes": 5464,
+      "sha256": "4979a23fc2d9c00d2e1a5ac81c50ae9f3f1ccfa6e05e70af249c4a0b3ee78bb7"
+    },
+    {
+      "ordinal": 83,
+      "phase": "base",
+      "path": "supabase/migrations/20260524100805_discord_feedback_effort_points.sql",
+      "git_blob": "0e2f730b088df1caea9e052d122e86ce99de55fe",
+      "bytes": 559,
+      "sha256": "53b05b8ee8a5dad7263d406daea45e059ac12ba5f24782dc794886cbf08ce0fb"
+    },
+    {
+      "ordinal": 84,
+      "phase": "base",
+      "path": "supabase/migrations/20260524164827_discord_message_command_claims.sql",
+      "git_blob": "bdd13f4c4b43ea041718be042a80c001b09df35a",
+      "bytes": 750,
+      "sha256": "8e8a4d8924f3814ab68b2d7abcbdaaaf1e6560184cb9ad9d09a5309589b30ddc"
+    },
+    {
+      "ordinal": 85,
+      "phase": "base",
+      "path": "supabase/migrations/20260610121500_discord_feedback_card_dependencies.sql",
+      "git_blob": "24d1ef87bf4af630497f6c60ab06940b1d6d4683",
+      "bytes": 2793,
+      "sha256": "8ed27f1af71d5cd0105b9077e63d1c978f2b1cc6195e3f527132939406659f39"
+    },
+    {
+      "ordinal": 86,
+      "phase": "base",
+      "path": "supabase/migrations/20260613051127_sessions_routine_delete_cascade.sql",
+      "git_blob": "6e71bc2909ea302abdd237081a49fed5bd992a41",
+      "bytes": 234,
+      "sha256": "3c40703bd92a2399cfea1e86babf0b5ab77fd6d90bef93d40c6d948252fa3ccf"
+    },
+    {
+      "ordinal": 87,
+      "phase": "base",
+      "path": "supabase/migrations/20260613124500_routine_day_reorder.sql",
+      "git_blob": "c670db8e9fa9f63e2464ada68f646912860ec6ef",
+      "bytes": 779,
+      "sha256": "8b8b4be74cc7c9ad1180f37d07c592170a54f7e0153a7b093077a6fe390b201f"
+    },
+    {
+      "ordinal": 88,
+      "phase": "base",
+      "path": "supabase/migrations/20260625072308_workout_plan_templates.sql",
+      "git_blob": "e417c6276fef8d62ee66deca51bd619ce1c85ff0",
+      "bytes": 5317,
+      "sha256": "2acf868df4b4ad813ea9c39385441e256d137951eea8855eba91e2c50ffe75c8"
+    },
+    {
+      "ordinal": 89,
+      "phase": "base",
+      "path": "supabase/migrations/20260625113000_routine_day_duplicate_source_linkage.sql",
+      "git_blob": "7455926c8ab474663a44327937cd7f8627fa4f4c",
+      "bytes": 278,
+      "sha256": "7476e3fd35240f420cd7ab95832f26b786ad709c75ff864b499beae34083daf5"
+    },
+    {
+      "ordinal": 90,
+      "phase": "base",
+      "path": "supabase/migrations/20260629011500_session_copilot_feedback.sql",
+      "git_blob": "6539d79a79519bb5ebc514cbdc1f4df6759920d1",
+      "bytes": 1547,
+      "sha256": "2d13d24ff927d7f12a22b7aa9f109f05d38ac5991dc0e8461dacda6984707c7a"
+    },
+    {
+      "ordinal": 91,
+      "phase": "base",
+      "path": "supabase/migrations/20260629193000_session_copilot_feedback_effort.sql",
+      "git_blob": "2056fdc8eb032bdaec0cbec6d36e57f8a9840060",
+      "bytes": 597,
+      "sha256": "3e8c9cf002d9a9fcba350b8207b521c8c8a8567e0b60080301e10f0b0cf2c26a"
+    },
+    {
+      "ordinal": 92,
+      "phase": "base",
+      "path": "supabase/migrations/20260701174902_billing_lifetime_pro.sql",
+      "git_blob": "476bb920fd284b73e3c9f213ab362a56a04658d4",
+      "bytes": 5040,
+      "sha256": "f6c158f4438244d73b77100360d5b0eeab56e89ae400d4b6176897f97e1aae9b"
+    },
+    {
+      "ordinal": 93,
+      "phase": "base",
+      "path": "supabase/migrations/20260701175406_billing_entitlement_fk_index.sql",
+      "git_blob": "ac541cb710941ea042dc62b9fcce476b991115a0",
+      "bytes": 128,
+      "sha256": "dfc68d6cf5382711c4bbeda57e3d74df44e98cb3886cef133eb3cf31a3080367"
+    },
+    {
+      "ordinal": 94,
+      "phase": "base",
+      "path": "supabase/migrations/20260701213803_billing_pro_subscription.sql",
+      "git_blob": "6ad81a0bfa0198d0263a9ead3f96663ee348f785",
+      "bytes": 2050,
+      "sha256": "31ecff28785122d03c19a3314c92734da3a9ccdc7cdbed76c0b8cf696c545961"
+    },
+    {
+      "ordinal": 95,
+      "phase": "base",
+      "path": "supabase/migrations/20260709072134_harden_discord_security_definer_execute.sql",
+      "git_blob": "155397074e69d6da30e9cf4fb5d081023fec5c62",
+      "bytes": 2369,
+      "sha256": "9c76a99c93d6166e36c36ff7b5b19c74f2c1d4fd58f2ad7557e0029d8e3e2587"
+    },
+    {
+      "ordinal": 96,
+      "phase": "base",
+      "path": "supabase/migrations/20260709073000_billing_subscription_receipt_dedupe.sql",
+      "git_blob": "5d15f5b7232f40e750c696b536d5b08145c64037",
+      "bytes": 4231,
+      "sha256": "2ba64e3725d014abca605528175f551826f43da433caf8c30c27b96d804569ea"
+    },
+    {
+      "ordinal": 97,
+      "phase": "base",
+      "path": "supabase/migrations/20260709073257_harden_discord_internal_table_access.sql",
+      "git_blob": "f44f63d74fded3f68e390c6c3361196350e7cfd4",
+      "bytes": 1709,
+      "sha256": "ae8b0850d7de478dc0a5c9eb205c15dadde43ca2ec5d4d1a2c0d75f5c74aa600"
+    },
+    {
+      "ordinal": 98,
+      "phase": "base",
+      "path": "supabase/migrations/20260709074946_supabase_performance_advisor_safe_indexes.sql",
+      "git_blob": "77c02f54092a9c34d267949401421af596eaddf3",
+      "bytes": 686,
+      "sha256": "26775bb3e9f933cbc862fbe68b7119473c0c8967a116b0628427eab27676a005"
+    },
+    {
+      "ordinal": 99,
+      "phase": "base",
+      "path": "supabase/migrations/20260713013116_exercise_timer_truth.sql",
+      "git_blob": "e9acdd4b24c17dfc254503254b570a52a79548bf",
+      "bytes": 1965,
+      "sha256": "388c4aa3bec9e7dd91d42bfe34fa0e8da2a4cc27652a7e9b9fca5c2bc8dedeb3"
+    },
+    {
+      "ordinal": 100,
+      "phase": "base",
+      "path": "supabase/migrations/20260713020801_set_timing_truth.sql",
+      "git_blob": "5e34f762a255dcf40087e605f8f009e3215f1dff",
+      "bytes": 217,
+      "sha256": "82ce3b62e60c0c729405ae1af487b382de44d8c618c6dd07232223acd0348bd2"
+    },
+    {
+      "ordinal": 101,
+      "phase": "base",
+      "path": "supabase/migrations/20260716033653_routine_day_optional.sql",
+      "git_blob": "f3fa17151024a57f9e62575f6dc4e8f5898fa5af",
+      "bytes": 330,
+      "sha256": "2b8d8b73e03f77b6034030a934a31b299529d852e406d4f74322d80866c45172"
+    },
+    {
+      "ordinal": 102,
+      "phase": "candidate",
+      "path": "supabase/migrations/20260718015422_retire_human_member_number_compaction.sql",
+      "git_blob": "007eca9503dfd10a6910a27b02a46def30583d18",
+      "bytes": 15431,
+      "sha256": "ca502e3bcef4532ce4de336d33334c5620efaf3863286db51f6440bb9224662d"
+    }
+  ]
+}
