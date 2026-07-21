@@ -478,6 +478,22 @@ def mapping_digest(rows: Iterable[tuple[str, str, int | None, bool]]) -> str:
     return sha256_bytes(canonical_bytes(normalized))
 
 
+def automation_assignment_is_null(rows: Iterable[tuple[str, str, int | None, bool]]) -> bool:
+    automation_rows = [
+        row for row in rows if row[0].startswith("automation-") or row[1] == "automation"
+    ]
+    return automation_rows == [("automation-000", "automation", None, False)]
+
+
+def loopback_listener_count() -> int:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))
+        return 0
+    except OSError:
+        return 1
+
+
 def default_receipt(contract: dict[str, Any], adapter_head: str, adapter_tree: str) -> dict[str, Any]:
     source = contract["source"]
     return {
@@ -721,10 +737,9 @@ class PrivateRuntime:
         before_candidate = self.fixture_mapping()
         if sorted(number for _, kind, number, _ in before_candidate if kind == "human") != list(range(6)):
             raise ReplayFailure("FIXTURE_PROOF_FAILED")
-        if [(kind, number) for _, kind, number, _ in before_candidate if kind == "automation"] != [("automation", None)]:
+        if not automation_assignment_is_null(before_candidate):
             raise ReplayFailure("FIXTURE_PROOF_FAILED")
         self.receipt["fixtures"]["mapping_before_sha256"] = mapping_digest(before_candidate)
-        self.receipt["fixtures"]["automation_null"] = True
         self.receipt["migrations"]["records"].append(self.apply_migration(candidate, project))
         self.receipt["migrations"]["candidate_applied_count"] = 1
         state_before = self.object_state_digest()
@@ -752,8 +767,9 @@ class PrivateRuntime:
         self.receipt["fixtures"]["mapping_final_sha256"] = mapping_digest(final_rows)
         if len(concurrent_numbers) != 8 or len(set(concurrent_numbers)) != 8 or min(concurrent_numbers) <= high:
             raise ReplayFailure("FIXTURE_PROOF_FAILED")
-        automation = [row for row in final_rows if row[0] == "automation-000"]
-        if len(automation) != 1 or automation[0][2] is not None:
+        automation_null = automation_assignment_is_null(final_rows)
+        self.receipt["fixtures"]["automation_null"] = automation_null
+        if not automation_null:
             raise ReplayFailure("FIXTURE_PROOF_FAILED")
         self.receipt["security"]["same_value_update"] = self.psql(
             b"UPDATE public.profiles SET user_number=user_number,user_kind=user_kind,user_number_assigned_at=user_number_assigned_at WHERE id='f1000000-0000-4000-8000-000000000001'::uuid;"
@@ -846,12 +862,7 @@ class PrivateRuntime:
                 counts[key] = len([line for line in listed.stdout.splitlines() if line])
                 ok = ok and counts[key] == 0
         self.receipt["cleanup"].update(counts)
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-                listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))
-            listener_count = 0
-        except OSError:
-            listener_count = 1
+        listener_count = loopback_listener_count()
         self.receipt["cleanup"]["listeners_remaining"] = listener_count
         all_containers = self.docker_command(["container", "ls", "-aq"], timeout=20)
         all_volumes = self.docker_command(["volume", "ls", "-q"], timeout=20)
@@ -934,6 +945,10 @@ def execute(expected_head: str) -> int:
     failure = "NONE"
     runtime: PrivateRuntime | None = None
     try:
+        initial_listener_count = loopback_listener_count()
+        if initial_listener_count != 0:
+            raise ReplayFailure("CONTAINMENT_PROOF_FAILED")
+        receipt["containment"]["host_publication_count"] = initial_listener_count
         stage_started = time.monotonic()
         project = stage_source(SOURCE_ROOT, manifest, contract)
         receipt["timings"]["source_stage_ms"] = int((time.monotonic() - stage_started) * 1000)

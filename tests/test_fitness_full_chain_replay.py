@@ -111,6 +111,20 @@ class FitnessFixtureContractTests(unittest.TestCase):
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 adapter.mapping_digest(rows)
 
+    def test_automation_assignment_requires_exact_null_row(self) -> None:
+        expected = [("automation-000", "automation", None, False)]
+        self.assertTrue(adapter.automation_assignment_is_null(expected))
+        rejected = [
+            [("automation-000", "automation", None, True)],
+            [("automation-000", "automation", 0, False)],
+            [("automation-000", "human", None, False)],
+            expected * 2,
+            expected + [("human-000", "automation", None, False)],
+        ]
+        for rows in rejected:
+            with self.subTest(rows=rows):
+                self.assertFalse(adapter.automation_assignment_is_null(rows))
+
     def test_concurrent_fixture_denominator_is_exact(self) -> None:
         statements = adapter.concurrent_insert_sql()
         self.assertEqual(len(statements), 8)
@@ -288,6 +302,49 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
         self.assertIn(
             'listener.bind(("127.0.0.1", int(PRIVATE_DATABASE_PORT)))',
             self.source,
+        )
+
+    def test_loopback_listener_probe_returns_exact_closed_count(self) -> None:
+        listener = mock.MagicMock()
+        listener.__enter__.return_value = listener
+        with mock.patch.object(adapter.socket, "socket", return_value=listener):
+            self.assertEqual(adapter.loopback_listener_count(), 0)
+        listener.bind.assert_called_once_with(("127.0.0.1", 56422))
+
+    def test_occupied_or_unprovable_listener_blocks_before_runtime_creation(self) -> None:
+        contract = adapter.read_json(ROOT / "fitness/contract.v1.json")
+        manifest = adapter.read_json(ROOT / "fitness/source-manifest.v1.json")
+        for error in (OSError("occupied"), PermissionError("unprovable")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                receipt = adapter.default_receipt(contract, "a" * 40, "b" * 40)
+                listener = mock.MagicMock()
+                listener.__enter__.return_value = listener
+                listener.bind.side_effect = error
+                with (
+                    mock.patch.object(adapter, "read_json", side_effect=[contract, manifest]),
+                    mock.patch.object(adapter, "adapter_identity", return_value=("a" * 40, "b" * 40)),
+                    mock.patch.object(adapter, "default_receipt", return_value=receipt),
+                    mock.patch.object(adapter.socket, "socket", return_value=listener),
+                    mock.patch.object(adapter, "stage_source") as stage_source,
+                    mock.patch.object(adapter, "PrivateRuntime") as private_runtime,
+                    mock.patch.object(adapter, "SOURCE_ROOT", Path(directory) / "source"),
+                    mock.patch.object(adapter, "ARTIFACT_PATH", Path(directory) / "receipt.json"),
+                ):
+                    self.assertEqual(adapter.execute("a" * 40), 1)
+                self.assertEqual(receipt["status"], "BLOCKED")
+                self.assertEqual(receipt["failure_class"], "CONTAINMENT_PROOF_FAILED")
+                self.assertEqual(receipt["containment"]["host_publication_count"], 0)
+                stage_source.assert_not_called()
+                private_runtime.assert_not_called()
+
+    def test_listener_proof_precedes_staging_and_runtime_creation(self) -> None:
+        execute = self.source[self.source.index("def execute(expected_head:") : self.source.index("def verify_receipt(path:")]
+        proof = "initial_listener_count = loopback_listener_count()"
+        self.assertLess(execute.index(proof), execute.index("stage_source(SOURCE_ROOT"))
+        self.assertLess(execute.index(proof), execute.index("runtime = PrivateRuntime"))
+        self.assertLess(
+            execute.index('if initial_listener_count != 0:'),
+            execute.index('receipt["containment"]["host_publication_count"] = initial_listener_count'),
         )
 
     def test_source_is_staged_before_runtime_attestation(self) -> None:
