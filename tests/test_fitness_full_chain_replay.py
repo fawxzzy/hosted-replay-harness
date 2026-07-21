@@ -292,6 +292,36 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
             with self.subTest(ports=ports), self.assertRaises(ValueError):
                 adapter.validate_private_database_publication(ports)
 
+    def test_private_network_create_options_are_exact_and_fail_closed(self) -> None:
+        expected = (
+            ("com.docker.network.bridge.host_binding_ipv4", "127.0.0.1"),
+            ("com.docker.network.bridge.gateway_mode_ipv4", "isolated"),
+        )
+        self.assertEqual(adapter.PRIVATE_NETWORK_OPTIONS, expected)
+        args = adapter.private_network_create_args("packet", "project", "network", expected)
+        self.assertEqual(args[:4], ["network", "create", "--internal", "--ipv6=false"])
+        self.assertEqual(
+            args[4:8],
+            [
+                "--opt", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1",
+                "--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+            ],
+        )
+        self.assertEqual(args[-1], "network")
+        rejected = [
+            expected[:1],
+            expected[1:],
+            ((expected[0][0], "0.0.0.0"), expected[1]),
+            (expected[0], (expected[1][0], "nat")),
+        ]
+        for options in rejected:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                adapter.private_network_create_args("packet", "project", "network", options)
+
+        start = self.source[self.source.index("def start_database(") : self.source.index("def apply_migration(")]
+        self.assertIn("private_network_create_args(", start)
+        self.assertIn("PRIVATE_NETWORK_OPTIONS", start)
+
     def test_private_namespace_publication_does_not_relax_host_listener_gate(self) -> None:
         self.assertEqual(self.contract["foundation"]["observer_policy"], "foundation-db-start-v1")
         self.assertEqual(adapter.PRIVATE_DATABASE_PORT, "56422")
@@ -367,6 +397,78 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
         self.assertIn('network_names - {"bridge", "host", "none"}', self.source)
         self.assertNotRegex(self.source, r"system\s+prune|volume\s+prune|network\s+prune|rm\s+-rf\s+/|container\s+prune")
         self.assertIn("cleanup_only(expected_head", self.source)
+
+    def test_cleanup_identity_rules_are_resource_specific_and_closed(self) -> None:
+        volume = "supabase_db_fp-hosted-replay-ro-001"
+        self.assertEqual(adapter.cleanup_identities(b"a" * 12 + b"\n", "container", volume), ["a" * 12])
+        self.assertEqual(adapter.cleanup_identities(b"b" * 64 + b"\n", "network", volume), ["b" * 64])
+        self.assertEqual(adapter.cleanup_identities((volume + "\n").encode(), "volume", volume), [volume])
+        rejected = [
+            (b"foreign-volume\n", "volume"),
+            ((volume + "-foreign\n").encode(), "volume"),
+            ((volume + "\n" + volume + "\n").encode(), "volume"),
+            (b"\n", "volume"),
+            ((" " + volume + "\n").encode(), "volume"),
+            (b"not-hex\n", "container"),
+            (b"not-hex\n", "network"),
+            (b"a" * 12 + b"\n", "unknown"),
+            (b"\xff\n", "volume"),
+        ]
+        for raw, object_type in rejected:
+            with self.subTest(raw=raw, object_type=object_type), self.assertRaises(ValueError):
+                adapter.cleanup_identities(raw, object_type, volume)
+
+    def test_cleanup_removes_exact_owned_volume_and_proves_zero_residue(self) -> None:
+        receipt = adapter.default_receipt(self.contract, "a" * 40, "b" * 40)
+        runtime = adapter.PrivateRuntime(self.contract, receipt)
+        completed = lambda stdout=b"": subprocess.CompletedProcess([], 0, stdout=stdout, stderr=b"")
+        container_id = b"a" * 12
+        network_id = b"b" * 12
+        volume = runtime.db_name
+        responses = [
+            completed(container_id + b"\n"), completed(),
+            completed((volume + "\n").encode()), completed(),
+            completed(network_id + b"\n"), completed(),
+            completed(), completed(), completed(),
+            completed(), completed(), completed(b"bridge\nhost\nnone\n"),
+        ]
+        with (
+            mock.patch.object(runtime, "docker_command", side_effect=responses) as docker_command,
+            mock.patch.object(adapter, "loopback_listener_count", return_value=0),
+        ):
+            self.assertTrue(runtime.cleanup())
+        self.assertIn(mock.call(["volume", "rm", volume], timeout=30), docker_command.call_args_list)
+        self.assertEqual(
+            {key: receipt["cleanup"][key] for key in (
+                "containers_remaining", "volumes_remaining", "networks_remaining",
+                "listeners_remaining", "runtime_residue_count",
+            )},
+            {
+                "containers_remaining": 0,
+                "volumes_remaining": 0,
+                "networks_remaining": 0,
+                "listeners_remaining": 0,
+                "runtime_residue_count": 0,
+            },
+        )
+
+    def test_cleanup_rejects_foreign_or_malformed_volume_without_removal(self) -> None:
+        for raw in (b"foreign-volume\n", b"\n", b"supabase_db_fp-hosted-replay-ro-001\n\n"):
+            with self.subTest(raw=raw):
+                receipt = adapter.default_receipt(self.contract, "a" * 40, "b" * 40)
+                runtime = adapter.PrivateRuntime(self.contract, receipt)
+                completed = lambda stdout=b"": subprocess.CompletedProcess([], 0, stdout=stdout, stderr=b"")
+                responses = [
+                    completed(), completed(raw), completed(),
+                    completed(), completed(), completed(),
+                    completed(), completed(), completed(b"bridge\nhost\nnone\n"),
+                ]
+                with (
+                    mock.patch.object(runtime, "docker_command", side_effect=responses) as docker_command,
+                    mock.patch.object(adapter, "loopback_listener_count", return_value=0),
+                ):
+                    self.assertFalse(runtime.cleanup())
+                self.assertFalse(any(call.args[0][:2] == ["volume", "rm"] for call in docker_command.call_args_list))
 
     def test_runtime_never_accepts_provider_or_remote_selectors(self) -> None:
         prohibited = ["--linked", "--db-url", "SUPABASE_ACCESS_TOKEN", "SUPABASE_PROJECT", "service_role_key"]

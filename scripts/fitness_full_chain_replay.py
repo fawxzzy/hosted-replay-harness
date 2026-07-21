@@ -37,6 +37,10 @@ SOURCE_ROOT = ROOT / ".fitness-replay-runtime"
 WORKFLOW_PATH = ".github/workflows/fitness-full-chain-replay.yml"
 ZERO_SHA256 = "0" * 64
 PRIVATE_DATABASE_PORT = "56422"
+PRIVATE_NETWORK_OPTIONS = (
+    ("com.docker.network.bridge.host_binding_ipv4", "127.0.0.1"),
+    ("com.docker.network.bridge.gateway_mode_ipv4", "isolated"),
+)
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MIGRATION_PATH = re.compile(r"^supabase/migrations/[0-9A-Za-z_]+\.sql$")
@@ -144,6 +148,49 @@ def validate_private_database_publication(ports: Any) -> None:
     }
     if ports != expected:
         raise ValueError("publication")
+
+
+def private_network_create_args(
+    packet: str,
+    project_id: str,
+    network_name: str,
+    options: Iterable[tuple[str, str]],
+) -> list[str]:
+    normalized = tuple(options)
+    if normalized != PRIVATE_NETWORK_OPTIONS:
+        raise ValueError("network options")
+    args = ["network", "create", "--internal", "--ipv6=false"]
+    for key, value in normalized:
+        args.extend(["--opt", f"{key}={value}"])
+    args.extend([
+        "--label", f"io.fawxzzy.packet={packet}",
+        "--label", f"com.supabase.cli.project={project_id}",
+        "--label", f"com.docker.compose.project={project_id}",
+        network_name,
+    ])
+    return args
+
+
+def cleanup_identities(raw: bytes, object_type: str, expected_volume: str) -> list[str]:
+    try:
+        text = raw.decode("ascii", "strict")
+    except UnicodeError:
+        raise ValueError("cleanup identity encoding") from None
+    if text == "":
+        return []
+    identities = text.splitlines()
+    if (not identities or len(identities) != len(set(identities))
+            or any(not identity or identity.strip() != identity for identity in identities)):
+        raise ValueError("cleanup identity framing")
+    if object_type in {"container", "network"}:
+        valid = all(re.fullmatch(r"[0-9a-f]{12,64}", identity) for identity in identities)
+    elif object_type == "volume":
+        valid = identities == [expected_volume]
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("cleanup identity")
+    return identities
 
 
 def chain_digest(rows: list[dict[str, Any]]) -> str:
@@ -642,13 +689,12 @@ class PrivateRuntime:
             raise ReplayFailure("PRIVATE_RUNTIME_UNAVAILABLE")
         if sha256_file(cli) != expected["supabase"] or sha256_file(sidecar) != expected["supabase-go"]:
             raise ReplayFailure("PRIVATE_RUNTIME_ATTESTATION_REJECTED")
-        created = self.docker_command([
-            "network", "create", "--internal", "--ipv6=false",
-            "--label", f"io.fawxzzy.packet={self.contract['replay']['packet_label']}",
-            "--label", f"com.supabase.cli.project={self.project_id}",
-            "--label", f"com.docker.compose.project={self.project_id}",
+        created = self.docker_command(private_network_create_args(
+            self.contract["replay"]["packet_label"],
+            self.project_id,
             self.network_name,
-        ], timeout=30)
+            PRIVATE_NETWORK_OPTIONS,
+        ), timeout=30)
         if created.returncode != 0:
             raise ReplayFailure("LOCAL_DATABASE_START_FAILED")
         cli_env = dict(self.env)
@@ -843,8 +889,9 @@ class PrivateRuntime:
             if listed.returncode != 0:
                 ok = False
                 continue
-            identities = [line.decode("ascii", "strict") for line in listed.stdout.splitlines() if line]
-            if len(identities) != len(set(identities)) or any(not re.fullmatch(r"[0-9a-f]{12,64}", item) for item in identities):
+            try:
+                identities = cleanup_identities(listed.stdout, object_type, self.db_name)
+            except ValueError:
                 ok = False
                 continue
             for identity in identities:
@@ -859,8 +906,13 @@ class PrivateRuntime:
                 counts[key] = 1
                 ok = False
             else:
-                counts[key] = len([line for line in listed.stdout.splitlines() if line])
-                ok = ok and counts[key] == 0
+                try:
+                    counts[key] = len(cleanup_identities(listed.stdout, object_type, self.db_name))
+                except ValueError:
+                    counts[key] = 1
+                    ok = False
+                else:
+                    ok = ok and counts[key] == 0
         self.receipt["cleanup"].update(counts)
         listener_count = loopback_listener_count()
         self.receipt["cleanup"]["listeners_remaining"] = listener_count
