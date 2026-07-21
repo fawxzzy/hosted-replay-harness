@@ -121,6 +121,20 @@ def remove_tree(path: Path) -> None:
         shutil.rmtree(path, onexc=make_writable)
 
 
+def cleanup_staged_source(path: Path) -> int:
+    """Remove only the exact packet source root and return a closed residue count."""
+    if path != SOURCE_ROOT:
+        return 1
+    try:
+        if os.path.lexists(path):
+            if path.is_symlink():
+                return 1
+            remove_tree(path)
+        return 1 if os.path.lexists(path) else 0
+    except OSError:
+        return 1
+
+
 def self_digest(value: dict[str, Any], field: str) -> str:
     payload = dict(value)
     payload.pop(field, None)
@@ -1027,12 +1041,7 @@ def execute(expected_head: str) -> int:
             cleanup_ok = runtime.cleanup()
         except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
             cleanup_ok = False
-    try:
-        if SOURCE_ROOT.exists() and not SOURCE_ROOT.is_symlink():
-            remove_tree(SOURCE_ROOT)
-        source_remaining = 1 if os.path.lexists(SOURCE_ROOT) else 0
-    except OSError:
-        source_remaining = 1
+    source_remaining = cleanup_staged_source(SOURCE_ROOT)
     receipt["cleanup"]["source_entries_remaining"] = source_remaining
     receipt["cleanup"]["succeeded"] = cleanup_ok and source_remaining == 0
     receipt["timings"]["cleanup_ms"] = int((time.monotonic() - cleanup_started) * 1000)
@@ -1073,40 +1082,39 @@ def cleanup_only(expected_head: str) -> int:
     validate_manifest(manifest, contract)
     head, tree = adapter_identity(expected_head)
     receipt = default_receipt(contract, head, tree)
+    runtime_cleanup_ok = False
+    failure: str | None = None
+    source_remaining = 1
     try:
         if ARTIFACT_PATH.is_file() and not ARTIFACT_PATH.is_symlink():
             receipt = read_json(ARTIFACT_PATH)
             validate_receipt(receipt, manifest, contract)
         runtime = PrivateRuntime(contract, receipt)
         runtime.attest()
-        cleanup_ok = runtime.cleanup()
-        if SOURCE_ROOT.is_symlink():
-            cleanup_ok = False
-        elif SOURCE_ROOT.exists():
-            remove_tree(SOURCE_ROOT)
-        receipt["cleanup"]["source_entries_remaining"] = 1 if os.path.lexists(SOURCE_ROOT) else 0
-        receipt["cleanup"]["succeeded"] = cleanup_ok and receipt["cleanup"]["source_entries_remaining"] == 0
-        if not receipt["cleanup"]["succeeded"] or receipt["status"] != "PASS":
-            receipt["status"] = "BLOCKED"
-            receipt["failure_class"] = "CLEANUP_RESIDUE" if not receipt["cleanup"]["succeeded"] else receipt["failure_class"]
-        close_receipt(receipt)
+        runtime_cleanup_ok = runtime.cleanup()
+    except (OSError, ValueError, UnicodeError, ReplayFailure, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        failure = exc.code if isinstance(exc, ReplayFailure) else "INTERNAL_ERROR"
+    finally:
+        source_remaining = cleanup_staged_source(SOURCE_ROOT)
+
+    receipt["cleanup"]["attempted"] = True
+    receipt["cleanup"]["source_entries_remaining"] = source_remaining
+    receipt["cleanup"]["succeeded"] = runtime_cleanup_ok and source_remaining == 0
+    if source_remaining != 0 or (failure is None and not runtime_cleanup_ok):
+        failure = "CLEANUP_RESIDUE"
+    if failure is not None:
+        receipt["status"] = "BLOCKED"
+        receipt["failure_class"] = failure
+    elif receipt["status"] != "PASS":
+        receipt["status"] = "BLOCKED"
+    close_receipt(receipt)
+    try:
         validate_receipt(receipt, manifest, contract)
         ARTIFACT_PATH.parent.mkdir(mode=0o700, exist_ok=True)
         ARTIFACT_PATH.write_bytes(json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n")
-        return 0 if receipt["cleanup"]["succeeded"] else 1
-    except (OSError, ValueError, UnicodeError, ReplayFailure, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-        receipt["status"] = "BLOCKED"
-        receipt["failure_class"] = exc.code if isinstance(exc, ReplayFailure) else "INTERNAL_ERROR"
-        receipt["cleanup"]["attempted"] = True
-        receipt["cleanup"]["succeeded"] = False
-        close_receipt(receipt)
-        try:
-            validate_receipt(receipt, manifest, contract)
-            ARTIFACT_PATH.parent.mkdir(mode=0o700, exist_ok=True)
-            ARTIFACT_PATH.write_bytes(json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n")
-        except (OSError, ValueError, UnicodeError):
-            pass
+    except (OSError, ValueError, UnicodeError):
         return 1
+    return 0 if receipt["cleanup"]["succeeded"] else 1
 
 
 def main() -> int:

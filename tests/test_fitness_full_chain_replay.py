@@ -470,6 +470,83 @@ class FitnessRuntimeSourceTests(unittest.TestCase):
                     self.assertFalse(runtime.cleanup())
                 self.assertFalse(any(call.args[0][:2] == ["volume", "rm"] for call in docker_command.call_args_list))
 
+    def test_staged_source_cleanup_is_exact_symlink_safe_and_error_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owned = root / "owned"
+            foreign = root / "foreign"
+            foreign.mkdir()
+            (foreign / "sentinel").write_text("foreign", encoding="utf-8")
+            with mock.patch.object(adapter, "SOURCE_ROOT", owned):
+                self.assertEqual(adapter.cleanup_staged_source(foreign), 1)
+                self.assertTrue((foreign / "sentinel").is_file())
+
+                owned.mkdir()
+                (owned / "staged").write_text("packet", encoding="utf-8")
+                with mock.patch.object(adapter.Path, "is_symlink", autospec=True, side_effect=lambda path: path == owned):
+                    self.assertEqual(adapter.cleanup_staged_source(owned), 1)
+                self.assertTrue((owned / "staged").is_file())
+
+                with mock.patch.object(adapter, "remove_tree", side_effect=OSError("blocked")):
+                    self.assertEqual(adapter.cleanup_staged_source(owned), 1)
+                self.assertTrue(owned.exists())
+
+                self.assertEqual(adapter.cleanup_staged_source(owned), 0)
+                self.assertFalse(os.path.lexists(owned))
+
+    def test_cleanup_only_removes_staged_source_after_attestation_failure(self) -> None:
+        contract = adapter.read_json(ROOT / "fitness/contract.v1.json")
+        manifest = adapter.read_json(ROOT / "fitness/source-manifest.v1.json")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source_root.mkdir()
+            (source_root / "staged-object").write_text("synthetic", encoding="utf-8")
+            artifact = root / "artifacts" / "receipt.json"
+            runtime = mock.MagicMock()
+            runtime.attest.side_effect = adapter.ReplayFailure("PRIVATE_RUNTIME_ATTESTATION_REJECTED")
+            with (
+                mock.patch.object(adapter, "read_json", side_effect=[contract, manifest]),
+                mock.patch.object(adapter, "adapter_identity", return_value=("a" * 40, "b" * 40)),
+                mock.patch.object(adapter, "PrivateRuntime", return_value=runtime),
+                mock.patch.object(adapter, "SOURCE_ROOT", source_root),
+                mock.patch.object(adapter, "ARTIFACT_PATH", artifact),
+            ):
+                self.assertEqual(adapter.cleanup_only("a" * 40), 1)
+            published = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertFalse(os.path.lexists(source_root))
+            self.assertEqual(published["status"], "BLOCKED")
+            self.assertEqual(published["failure_class"], "PRIVATE_RUNTIME_ATTESTATION_REJECTED")
+            self.assertEqual(published["cleanup"]["source_entries_remaining"], 0)
+            self.assertFalse(published["cleanup"]["succeeded"])
+            runtime.cleanup.assert_not_called()
+
+    def test_cleanup_only_recomputes_source_residue_and_remains_blocked(self) -> None:
+        contract = adapter.read_json(ROOT / "fitness/contract.v1.json")
+        manifest = adapter.read_json(ROOT / "fitness/source-manifest.v1.json")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source_root.mkdir()
+            artifact = root / "artifacts" / "receipt.json"
+            runtime = mock.MagicMock()
+            runtime.cleanup.return_value = True
+            with (
+                mock.patch.object(adapter, "read_json", side_effect=[contract, manifest]),
+                mock.patch.object(adapter, "adapter_identity", return_value=("a" * 40, "b" * 40)),
+                mock.patch.object(adapter, "PrivateRuntime", return_value=runtime),
+                mock.patch.object(adapter, "SOURCE_ROOT", source_root),
+                mock.patch.object(adapter, "ARTIFACT_PATH", artifact),
+                mock.patch.object(adapter, "cleanup_staged_source", return_value=1) as cleanup_source,
+            ):
+                self.assertEqual(adapter.cleanup_only("a" * 40), 1)
+            published = json.loads(artifact.read_text(encoding="utf-8"))
+            cleanup_source.assert_called_once_with(source_root)
+            self.assertEqual(published["status"], "BLOCKED")
+            self.assertEqual(published["failure_class"], "CLEANUP_RESIDUE")
+            self.assertEqual(published["cleanup"]["source_entries_remaining"], 1)
+            self.assertFalse(published["cleanup"]["succeeded"])
+
     def test_runtime_never_accepts_provider_or_remote_selectors(self) -> None:
         prohibited = ["--linked", "--db-url", "SUPABASE_ACCESS_TOKEN", "SUPABASE_PROJECT", "service_role_key"]
         for value in prohibited:
